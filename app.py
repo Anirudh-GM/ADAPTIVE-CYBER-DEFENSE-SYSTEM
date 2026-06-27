@@ -421,12 +421,111 @@ def assign_role(i):
         return "Workstation"
 
 
-def scan_network(base_ip="192.168.93.", limit=254):
+def get_local_ip():
+    """
+    Automatically detect the local machine's IP address and subnet.
+    Returns the base IP (e.g., "192.168.1.") for network scanning.
+    Prioritizes active network adapters with default gateways.
+    """
+    system = platform.system()
+    
+    if system == "Windows":
+        try:
+            result = subprocess.run(
+                ["ipconfig", "/all"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            output = result.stdout
+            lines = output.split('\n')
+            
+            adapters = {}
+            current_adapter = None
+            
+            # Parse ipconfig output to group by adapter
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if 'adapter' in line and ':' in line:
+                    current_adapter = line
+                    adapters[current_adapter] = {'ipv4': None, 'gateway': False}
+                elif current_adapter:
+                    # Mark as disconnected if explicitly stated
+                    if 'Media State' in line and 'disconnected' in line.lower():
+                        adapters[current_adapter]['ipv4'] = None
+                        adapters[current_adapter]['gateway'] = False
+                    elif 'IPv4 Address' in line or 'ipv4' in line:
+                        parts = line.split(':')
+                        if len(parts) > 1:
+                            ip = parts[-1].strip().split('(')[0].strip()
+                            adapters[current_adapter]['ipv4'] = ip
+                    elif 'Default Gateway' in line:
+                        gateway = line.split(':')[-1].strip()
+                        if gateway and gateway != '' and gateway != '(none)':
+                            adapters[current_adapter]['gateway'] = True
+            
+            # Collect all IPs from adapters that have IPv4
+            all_ips = []
+            for adapter, data in adapters.items():
+                if data['ipv4']:
+                    all_ips.append((data['ipv4'], data['gateway'], adapter))
+            
+            # Prioritize: gateway > no gateway
+            all_ips.sort(key=lambda x: x[1], reverse=True)
+            
+            # Skip VMware adapters if possible (prioritize real network)
+            for ip, has_gateway, adapter in all_ips:
+                if not any(vm in ip for vm in ['192.168.93.', '192.168.193.', '10.0.0.']):
+                    octets = ip.split('.')
+                    if len(octets) == 4:
+                        return f"{octets[0]}.{octets[1]}.{octets[2]}."
+            
+            # Fallback to first available IP
+            if all_ips:
+                octets = all_ips[0][0].split('.')
+                if len(octets) == 4:
+                    return f"{octets[0]}.{octets[1]}.{octets[2]}."
+                    
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"Error detecting IP: {e}")
+            pass
+    else:
+        try:
+            result = subprocess.run(
+                ["ifconfig" if system == "Darwin" else "ip", "addr", "show"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            output = result.stdout
+            # Parse IPv4 address from ifconfig/ip output
+            for line in output.split('\n'):
+                if 'inet ' in line and '127.0.0.1' not in line:
+                    # Extract IP address
+                    parts = line.split()
+                    for part in parts:
+                        if '.' in part and part.count('.') == 3:
+                            ip = part
+                            octets = ip.split('.')
+                            if len(octets) == 4:
+                                return f"{octets[0]}.{octets[1]}.{octets[2]}."
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    
+    # Fallback to common private network ranges
+    return "192.168.1."
+
+
+def scan_network(base_ip=None, limit=254):
     """
     Ping IPs from base_ip+1 to base_ip+limit.
     Returns a list of reachable IP addresses.
     Uses correct ping flags per OS: Windows (-n/-w), macOS (-c/-t), Linux (-c/-W).
+    Automatically detects base IP if not provided.
     """
+    if base_ip is None:
+        base_ip = get_local_ip()
+    
     active = []
     system = platform.system()
     if system == "Windows":
@@ -1013,7 +1112,13 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
 
-        base_ip = st.text_input("Base IP Prefix", value="192.168.93.", help="e.g. 192.168.93.  — your VMnet8 subnet")
+        auto_detect = st.checkbox("🔍 Auto-detect Base IP", value=True, help="Automatically detect your local network subnet")
+        if auto_detect:
+            detected_ip = get_local_ip()
+            st.info(f"Detected Base IP: **{detected_ip}**")
+            base_ip = None
+        else:
+            base_ip = st.text_input("Base IP Prefix", value="192.168.93.", help="e.g. 192.168.93.  — your VMnet8 subnet")
         scan_limit = st.slider("Scan Range (last octet up to...)", 10, 254, 200, 10)
 
         st.markdown("""
@@ -1230,27 +1335,10 @@ with col_details:
             vuln_bar_color = "#ff3355" if vuln_pct > 60 else "#ff8c00" if vuln_pct > 40 else "#00ff88"
             node_color = "#ff3355" if is_comp else "#ffd700" if is_honey else "#00d4ff"
 
-            html += f"""
-            <div class="node-card {card_class}">
-                <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px'>
-                    <span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span>
-                    <span style='font-size:0.65rem;opacity:0.8'>{status_icon}</span>
-                </div>
-                <div style='color:#3d6a8a'>IP:</div> {data['ip']}<br>
-                <div style='color:#3d6a8a'>Role:</div> {data['role']}<br>
-                <div style='color:#3d6a8a'>Type:</div> {ntype.upper()}<br>
-                <div style='color:#3d6a8a'>Criticality:</div>
-                <span style='color:#ffd700'>{crit_stars}</span><br>
-                <div style='color:#3d6a8a'>Vulnerability:</div>
-                <div class='risk-bar-container'>
-                    <div class='risk-bar' style='width:{vuln_pct}%;background:{vuln_bar_color}'></div>
-                </div>
-                <span style='color:{vuln_bar_color}'>{vuln_pct}%</span>
-            </div>
-            """
+            html += f"<div class='node-card {card_class}'><div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px'><span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span><span style='font-size:0.65rem;opacity:0.8'>{status_icon}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>IP:</span><span style='color:#e0f4ff'>{data['ip']}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Role:</span><span style='color:#e0f4ff'>{data['role']}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Type:</span><span style='color:#e0f4ff'>{ntype.upper()}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Criticality:</span><span style='color:#ffd700'>{crit_stars}</span></div><div style='margin:8px 0'><div style='color:#3d6a8a;margin-bottom:4px'>Vulnerability:</div><div class='risk-bar-container'><div class='risk-bar' style='width:{vuln_pct}%;background:{vuln_bar_color}'></div></div><span style='color:{vuln_bar_color}'>{vuln_pct}%</span></div></div>"
         return html
 
-    node_panel.markdown(render_node_panel(), unsafe_allow_html=True)
+    st.components.v1.html(f"<div style='padding: 8px;'>{render_node_panel()}</div>", height=400, scrolling=False)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1305,7 +1393,7 @@ if run_btn:
                 st.components.v1.html(updated_html, height=500, scrolling=False)
 
             # Update node panel
-            node_panel.markdown(render_node_panel(active_node=node), unsafe_allow_html=True)
+            st.components.v1.html(f"<div style='padding: 8px;'>{render_node_panel(active_node=node)}</div>", height=400, scrolling=False)
 
             time.sleep(animation_speed)
 
@@ -1352,7 +1440,7 @@ if run_btn:
     )
     with graph_placeholder:
         st.components.v1.html(final_html, height=500, scrolling=False)
-    node_panel.markdown(render_node_panel(), unsafe_allow_html=True)
+    st.components.v1.html(f"<div style='padding: 8px;'>{render_node_panel()}</div>", height=400, scrolling=False)
 
     st.rerun()
 
