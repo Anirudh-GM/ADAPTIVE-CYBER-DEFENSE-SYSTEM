@@ -44,6 +44,7 @@ from collections import deque
 from pyvis.network import Network
 import tempfile
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─────────────────────────────────────────────────────────────────
 # PAGE CONFIGURATION
@@ -406,19 +407,51 @@ def build_network():
 # MODULE 1B: REAL NETWORK SCAN ENGINE
 # ─────────────────────────────────────────────────────────────────
 
-def assign_role(i):
+def assign_role(i, os_type='unknown'):
     """
-    Assign a logical role to a scanned device based on its discovery index.
-    0 → Entry Node, 1 → Server, 2 → Database, others → Workstation
+    Assign a logical role to a scanned device based on OS type and discovery index.
+    OS-based intelligent assignment:
+    - Linux: Likely server (Entry Node, Server, Database)
+    - Windows: Likely workstation or server
+    - macOS: Likely workstation
+    - Unknown: Fallback to index-based assignment
     """
-    if i == 0:
-        return "Entry Node"
-    elif i == 1:
-        return "Server"
-    elif i == 2:
-        return "Database"
+    if os_type == 'linux':
+        # Linux systems often run servers
+        if i == 0:
+            return "Entry Node"
+        elif i == 1:
+            return "Server"
+        elif i == 2:
+            return "Database"
+        else:
+            return "Server"
+    elif os_type == 'windows':
+        # Windows can be workstation or server
+        if i == 0:
+            return "Entry Node"
+        elif i == 1:
+            return "Workstation"
+        elif i == 2:
+            return "Server"
+        else:
+            return "Workstation"
+    elif os_type == 'macos':
+        # macOS is typically workstation
+        if i == 0:
+            return "Entry Node"
+        else:
+            return "Workstation"
     else:
-        return "Workstation"
+        # Unknown OS: fallback to index-based assignment
+        if i == 0:
+            return "Entry Node"
+        elif i == 1:
+            return "Server"
+        elif i == 2:
+            return "Database"
+        else:
+            return "Workstation"
 
 
 def get_local_ip():
@@ -516,45 +549,657 @@ def get_local_ip():
     return "192.168.1."
 
 
+def resolve_hostname(ip):
+    """
+    Resolve hostname from IP address using nslookup (Windows) or host/dig (Unix).
+    Returns hostname or None if resolution fails.
+    """
+    system = platform.system()
+    
+    try:
+        if system == "Windows":
+            result = subprocess.run(
+                ["nslookup", ip],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            output = result.stdout
+            # Parse nslookup output for hostname
+            for line in output.split('\n'):
+                if 'Name:' in line:
+                    hostname = line.split('Name:')[-1].strip()
+                    if hostname and hostname != ip:
+                        return hostname
+        else:
+            # Try dig first, fallback to host
+            try:
+                result = subprocess.run(
+                    ["dig", "+short", "-x", ip],
+                    capture_output=True,
+                    text=True,
+                    timeout=3
+                )
+                hostname = result.stdout.strip().rstrip('.')
+                if hostname and hostname != ip:
+                    return hostname
+            except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+                try:
+                    result = subprocess.run(
+                        ["host", ip],
+                        capture_output=True,
+                        text=True,
+                        timeout=3
+                    )
+                    output = result.stdout
+                    if 'pointer' in output.lower():
+                        hostname = output.split('pointer')[-1].strip().rstrip('.')
+                        if hostname and hostname != ip:
+                            return hostname
+                except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+                    pass
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    
+    return None
+
+
+def detect_os(ip, system):
+    """
+    Detect operating system using TTL analysis from ping response.
+    Returns: 'windows', 'linux', 'macos', or 'unknown'
+    TTL ranges: Windows (~128), Linux (~64), macOS (~255)
+    """
+    try:
+        if system == "Windows":
+            result = subprocess.run(
+                ["ping", "-n", "1", "-w", "500", ip],
+                capture_output=True,
+                text=True,
+                timeout=1
+            )
+        else:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "1", ip],
+                capture_output=True,
+                text=True,
+                timeout=1
+            )
+        
+        if result.returncode == 0:
+            output = result.stdout
+            # Extract TTL from ping output - more robust parsing
+            for line in output.split('\n'):
+                # Look for TTL in various formats
+                if 'TTL=' in line or 'ttl=' in line:
+                    # Format: "TTL=128" or "ttl=64"
+                    for part in line.split():
+                        if '=' in part and ('TTL' in part.upper() or 'ttl' in part.lower()):
+                            try:
+                                ttl_str = part.split('=')[1]
+                                ttl = int(ttl_str)
+                                # OS detection based on TTL with broader ranges
+                                if ttl >= 110 and ttl <= 130:
+                                    return 'windows'
+                                elif ttl >= 55 and ttl <= 75:
+                                    return 'linux'
+                                elif ttl >= 240 and ttl <= 260:
+                                    return 'macos'
+                            except (ValueError, IndexError):
+                                pass
+                # Also check for "TTL" followed by number
+                elif 'TTL' in line or 'ttl' in line:
+                    parts = line.split()
+                    for i, part in enumerate(parts):
+                        if 'TTL' in part.upper() or 'ttl' in part.lower():
+                            # Try to get next part as number
+                            if i + 1 < len(parts):
+                                try:
+                                    ttl = int(parts[i + 1])
+                                    if ttl >= 110 and ttl <= 130:
+                                        return 'windows'
+                                    elif ttl >= 55 and ttl <= 75:
+                                        return 'linux'
+                                    elif ttl >= 240 and ttl <= 260:
+                                        return 'macos'
+                                except ValueError:
+                                    pass
+                            # Try to extract number from same part if it contains TTL
+                            try:
+                                ttl = int(''.join(filter(str.isdigit, part)))
+                                if ttl >= 110 and ttl <= 130:
+                                    return 'windows'
+                                elif ttl >= 55 and ttl <= 75:
+                                    return 'linux'
+                                elif ttl >= 240 and ttl <= 260:
+                                    return 'macos'
+                            except ValueError:
+                                pass
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    
+    return 'unknown'
+
+
+def ping_ip(ip, system):
+    """Ping a single IP address and return (ip, is_alive, ttl)"""
+    try:
+        if system == "Windows":
+            result = subprocess.run(
+                ["ping", "-n", "1", "-w", "500", ip],
+                capture_output=True,
+                text=True,
+                timeout=1
+            )
+        elif system == "Darwin":
+            result = subprocess.run(
+                ["ping", "-c", "1", "-t", "1", ip],
+                capture_output=True,
+                text=True,
+                timeout=1
+            )
+        else:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "1", ip],
+                capture_output=True,
+                text=True,
+                timeout=1
+            )
+        
+        is_alive = result.returncode == 0
+        ttl = None
+        
+        if is_alive:
+            # Extract TTL from output
+            output = result.stdout
+            for line in output.split('\n'):
+                if 'TTL=' in line or 'ttl=' in line:
+                    for part in line.split():
+                        if '=' in part and ('TTL' in part.upper() or 'ttl' in part.lower()):
+                            try:
+                                ttl_str = part.split('=')[1]
+                                ttl = int(ttl_str)
+                                break
+                            except (ValueError, IndexError):
+                                pass
+                if ttl:
+                    break
+        
+        return (ip, is_alive, ttl)
+    except (subprocess.TimeoutExpired, OSError):
+        return (ip, False, None)
+
+
+def ttl_to_os(ttl):
+    """Convert TTL value to OS type"""
+    if ttl is None:
+        return 'unknown'
+    if ttl >= 110 and ttl <= 130:
+        return 'windows'
+    elif ttl >= 55 and ttl <= 75:
+        return 'linux'
+    elif ttl >= 240 and ttl <= 260:
+        return 'macos'
+    return 'unknown'
+
+
+def get_mac_vendor(mac):
+    """
+    Identify device vendor from MAC address OUI (Organizationally Unique Identifier).
+    Returns vendor name or 'Unknown'.
+    """
+    if not mac:
+        return 'Unknown'
+    
+    # Common OUI prefixes for major vendors
+    oui_map = {
+        # Apple
+        '00:0A:95': 'Apple',
+        '00:0B:96': 'Apple',
+        '00:0C:29': 'Apple',
+        '00:0D:93': 'Apple',
+        '00:0E:35': 'Apple',
+        '00:0F:F3': 'Apple',
+        '00:10:FA': 'Apple',
+        '00:11:24': 'Apple',
+        '00:14:51': 'Apple',
+        '00:16:CB': 'Apple',
+        '00:17:F2': 'Apple',
+        '00:19:E3': 'Apple',
+        '00:1A:11': 'Apple',
+        '00:1B:63': 'Apple',
+        '00:1C:B3': 'Apple',
+        '00:1D:4F': 'Apple',
+        '00:1E:C2': 'Apple',
+        '00:23:DF': 'Apple',
+        '00:25:4B': 'Apple',
+        '00:26:BB': 'Apple',
+        '00:28:6C': 'Apple',
+        '3C:15:C2': 'Apple',
+        '34:C7:31': 'Apple',
+        'F0:18:98': 'Apple',
+        'AC:87:A3': 'Apple',
+        'E4:CE:8F': 'Apple',
+        'E8:8D:28': 'Apple',
+        'F8:FF:C2': 'Apple',
+        'FC:E9:98': 'Apple',
+        # Samsung
+        '00:12:FB': 'Samsung',
+        '00:15:B9': 'Samsung',
+        '00:16:32': 'Samsung',
+        '00:17:C9': 'Samsung',
+        '00:21:19': 'Samsung',
+        '00:21:99': 'Samsung',
+        '00:22:68': 'Samsung',
+        '00:23:15': 'Samsung',
+        '00:24:54': 'Samsung',
+        '00:26:4A': 'Samsung',
+        '00:30:BD': 'Samsung',
+        '38:8C:50': 'Samsung',
+        '4C:32:75': 'Samsung',
+        '78:E4:00': 'Samsung',
+        '8C:F5:A3': 'Samsung',
+        'A4:C3:F0': 'Samsung',
+        'AC:5F:3E': 'Samsung',
+        'CC:3A:61': 'Samsung',
+        'D4:9A:20': 'Samsung',
+        # Google/Pixel
+        'F8:C3:9A': 'Google',
+        '44:48:C1': 'Google',
+        '48:51:B7': 'Google',
+        '7C:70:55': 'Google',
+        'AC:BC:32': 'Google',
+        'B4:CE:F6': 'Google',
+        'D4:28:B5': 'Google',
+        # Huawei
+        '00:E0:FC': 'Huawei',
+        '4C:54:99': 'Huawei',
+        '54:83:3A': 'Huawei',
+        '78:11:DC': 'Huawei',
+        '84:A8:E4': 'Huawei',
+        '8C:21:0A': 'Huawei',
+        'A0:62:AC': 'Huawei',
+        'AC:85:3D': 'Huawei',
+        'B4:8E:26': 'Huawei',
+        'C4:93:D9': 'Huawei',
+        # Xiaomi
+        '34:CE:00': 'Xiaomi',
+        '34:C7:31': 'Xiaomi',
+        '38:BC:1A': 'Xiaomi',
+        '40:4E:36': 'Xiaomi',
+        '44:DA:E7': 'Xiaomi',
+        '58:20:B1': 'Xiaomi',
+        '64:09:80': 'Xiaomi',
+        '78:11:DC': 'Xiaomi',
+        '7C:11:BE': 'Xiaomi',
+        '80:FA:5B': 'Xiaomi',
+        '88:25:93': 'Xiaomi',
+        '8C:34:FD': 'Xiaomi',
+        'AC:23:3F': 'Xiaomi',
+        'C4:0A:38': 'Xiaomi',
+        'CC:81:D9': 'Xiaomi',
+        'D4:6E:0E': 'Xiaomi',
+        'E8:50:8B': 'Xiaomi',
+        'F0:4E:36': 'Xiaomi',
+        'F4:8E:38': 'Xiaomi',
+        'FC:64:2B': 'Xiaomi',
+        # Cisco
+        '00:00:0C': 'Cisco',
+        '00:01:42': 'Cisco',
+        '00:02:BD': 'Cisco',
+        '00:05:5E': 'Cisco',
+        '00:06:D6': 'Cisco',
+        '00:07:EB': 'Cisco',
+        '00:0B:BE': 'Cisco',
+        '00:0C:CF': 'Cisco',
+        '00:0D:BD': 'Cisco',
+        '00:0E:83': 'Cisco',
+        '00:0F:24': 'Cisco',
+        '00:10:0D': 'Cisco',
+        '00:11:BB': 'Cisco',
+        '00:12:01': 'Cisco',
+        '00:13:80': 'Cisco',
+        '00:14:1B': 'Cisco',
+        '00:15:63': 'Cisco',
+        '00:16:47': 'Cisco',
+        '00:17:94': 'Cisco',
+        '00:18:74': 'Cisco',
+        '00:19:07': 'Cisco',
+        '00:1A:A1': 'Cisco',
+        '00:1B:D4': 'Cisco',
+        '00:1C:58': 'Cisco',
+        '00:1D:46': 'Cisco',
+        '00:1E:14': 'Cisco',
+        '00:1F:6A': 'Cisco',
+        '00:20:A6': 'Cisco',
+        '00:21:1B': 'Cisco',
+        '00:22:90': 'Cisco',
+        '00:23:AC': 'Cisco',
+        '00:24:C4': 'Cisco',
+        '00:25:B3': 'Cisco',
+        '00:26:98': 'Cisco',
+        '00:27:0E': 'Cisco',
+        '00:28:F1': 'Cisco',
+        '00:50:56': 'Cisco',
+        '00:E0:4C': 'Cisco',
+        'F4:EA:67': 'Cisco',
+        # Dell
+        '00:04:76': 'Dell',
+        '00:08:74': 'Dell',
+        '00:0B:DB': 'Dell',
+        '00:0C:29': 'Dell',
+        '00:0E:2C': 'Dell',
+        '00:11:43': 'Dell',
+        '00:14:22': 'Dell',
+        '00:15:C5': 'Dell',
+        '00:16:76': 'Dell',
+        '00:17:A4': 'Dell',
+        '00:18:8B': 'Dell',
+        '00:19:B9': 'Dell',
+        '00:1A:4B': 'Dell',
+        '00:1B:21': 'Dell',
+        '00:1C:23': 'Dell',
+        '00:1D:09': 'Dell',
+        '00:1E:67': 'Dell',
+        '00:1F:29': 'Dell',
+        '00:21:CC': 'Dell',
+        '00:23:AE': 'Dell',
+        '00:24:B8': 'Dell',
+        '00:26:B9': 'Dell',
+        '00:28:31': 'Dell',
+        '44:8A:5B': 'Dell',
+        # HP
+        '00:01:E6': 'HP',
+        '00:02:A5': 'HP',
+        '00:04:5A': 'HP',
+        '00:08:02': 'HP',
+        '00:0E:7C': 'HP',
+        '00:10:83': 'HP',
+        '00:11:85': 'HP',
+        '00:13:21': 'HP',
+        '00:14:38': 'HP',
+        '00:15:60': 'HP',
+        '00:16:35': 'HP',
+        '00:17:08': 'HP',
+        '00:18:FE': 'HP',
+        '00:19:B2': 'HP',
+        '00:1A:A0': 'HP',
+        '00:1B:78': 'HP',
+        '00:1C:C4': 'HP',
+        '00:1D:9F': 'HP',
+        '00:1E:68': 'HP',
+        '00:1F:3C': 'HP',
+        '00:21:08': 'HP',
+        '00:22:64': 'HP',
+        '00:23:7D': 'HP',
+        '00:24:B6': 'HP',
+        '00:25:B5': 'HP',
+        '00:26:22': 'HP',
+        '00:30:C1': 'HP',
+        '34:17:EB': 'HP',
+        '3C:D9:2B': 'HP',
+        '40:18:D1': 'HP',
+        'F0:1D:2A': 'HP',
+        # Microsoft
+        '00:0D:3A': 'Microsoft',
+        '00:0E:5C': 'Microsoft',
+        '00:0F:EA': 'Microsoft',
+        '00:12:41': 'Microsoft',
+        '00:15:5D': 'Microsoft',
+        '00:1B:44': 'Microsoft',
+        '00:1D:D8': 'Microsoft',
+        '00:21:CC': 'Microsoft',
+        '00:22:75': 'Microsoft',
+        '00:24:68': 'Microsoft',
+        '00:25:D3': 'Microsoft',
+        '00:26:08': 'Microsoft',
+        '00:27:13': 'Microsoft',
+        '00:50:F2': 'Microsoft',
+        'BC:5F:F4': 'Microsoft',
+        'E4:71:95': 'Microsoft',
+        'F4:8E:38': 'Microsoft',
+    }
+    
+    # Normalize MAC to uppercase and extract OUI (first 3 octets)
+    mac_upper = mac.upper()
+    oui = ':'.join(mac_upper.split(':')[:3])
+    
+    return oui_map.get(oui, 'Unknown')
+
+
+def is_mobile_device(hostname, ip, vendor):
+    """
+    Detect if device is mobile based on hostname patterns and vendor.
+    Returns True if likely a mobile device.
+    """
+    if not hostname:
+        # Check vendor for mobile manufacturers
+        mobile_vendors = ['Apple', 'Samsung', 'Google', 'Huawei', 'Xiaomi', 'OnePlus', 'Oppo', 'Vivo', 'Honor', 'Realme', 'Motorola', 'LG', 'Nokia', 'Sony', 'HTC', 'Blackberry']
+        if vendor in mobile_vendors:
+            return True
+        return False
+    
+    hostname_lower = hostname.lower()
+    
+    # Common mobile device hostname patterns
+    mobile_patterns = [
+        'iphone', 'ipad', 'android', 'mobile', 'phone', 'tablet',
+        'samsung', 'galaxy', 'pixel', 'oneplus', 'xiaomi', 'oppo',
+        'vivo', 'huawei', 'honor', 'realme', 'motorola', 'lg',
+        'nokia', 'sony', 'htc', 'blackberry', 'windows-phone'
+    ]
+    
+    # Check if hostname contains mobile patterns
+    for pattern in mobile_patterns:
+        if pattern in hostname_lower:
+            return True
+    
+    # Check for common mobile device naming conventions
+    # iOS devices often have names like "John's iPhone"
+    if "'s " in hostname_lower or "s iphone" in hostname_lower or "s ipad" in hostname_lower:
+        return True
+    
+    # Android devices often have model names
+    if any(model in hostname_lower for model in ['sm-', 'a series', 'm series', 'redmi', 'poco']):
+        return True
+    
+    # Check vendor for mobile manufacturers
+    mobile_vendors = ['Apple', 'Samsung', 'Google', 'Huawei', 'Xiaomi', 'OnePlus', 'Oppo', 'Vivo', 'Honor', 'Realme', 'Motorola', 'LG', 'Nokia', 'Sony', 'HTC', 'Blackberry']
+    if vendor in mobile_vendors:
+        return True
+    
+    return False
+
+
+def scan_ports(ip, ports):
+    """
+    Scan specific ports on an IP to detect services using parallel scanning.
+    Returns list of open ports.
+    """
+    open_ports = []
+    
+    def check_port(port):
+        try:
+            result = subprocess.run(
+                ["powershell", "-Command", f"Test-NetConnection -ComputerName {ip} -Port {port} -InformationLevel Quiet -WarningAction SilentlyContinue"],
+                capture_output=True,
+                text=True,
+                timeout=0.5
+            )
+            return port if result.stdout.strip() == 'True' else None
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+    
+    # Parallel port scanning with ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(check_port, port): port for port in ports}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                open_ports.append(result)
+    
+    return open_ports
+
+
+def detect_services(open_ports):
+    """
+    Identify services based on open ports.
+    Returns list of service names.
+    """
+    port_service_map = {
+        21: 'FTP',
+        22: 'SSH',
+        23: 'Telnet',
+        25: 'SMTP',
+        53: 'DNS',
+        80: 'HTTP',
+        110: 'POP3',
+        143: 'IMAP',
+        443: 'HTTPS',
+        445: 'SMB',
+        3306: 'MySQL',
+        3389: 'RDP',
+        5432: 'PostgreSQL',
+        5900: 'VNC',
+        6379: 'Redis',
+        8080: 'HTTP-Alt',
+        8443: 'HTTPS-Alt',
+        27017: 'MongoDB',
+    }
+    
+    services = []
+    for port in open_ports:
+        if port in port_service_map:
+            services.append(port_service_map[port])
+    
+    return services
+
+
+def assign_role_from_services(services, os_type, vendor):
+    """
+    Assign role based on detected services, OS, and vendor.
+    More realistic role assignment for real-world scenarios.
+    """
+    # Database servers
+    if any(db in services for db in ['MySQL', 'PostgreSQL', 'MongoDB', 'Redis']):
+        return 'Database'
+    
+    # Web servers
+    if any(web in services for web in ['HTTP', 'HTTPS', 'HTTP-Alt', 'HTTPS-Alt']):
+        return 'Server'
+    
+    # File/Print servers
+    if 'SMB' in services:
+        return 'Server'
+    
+    # Remote access servers
+    if any(remote in services for remote in ['SSH', 'RDP', 'VNC', 'Telnet']):
+        return 'Server'
+    
+    # Email servers
+    if any(email in services for email in ['SMTP', 'POP3', 'IMAP']):
+        return 'Server'
+    
+    # DNS server
+    if 'DNS' in services:
+        return 'Server'
+    
+    # Network infrastructure (Cisco, etc.)
+    if vendor == 'Cisco':
+        return 'Server'
+    
+    # Mobile devices
+    mobile_vendors = ['Apple', 'Samsung', 'Google', 'Huawei', 'Xiaomi', 'OnePlus', 'Oppo', 'Vivo', 'Honor', 'Realme', 'Motorola', 'LG', 'Nokia', 'Sony', 'HTC', 'Blackberry']
+    if vendor in mobile_vendors:
+        return 'Workstation'
+    
+    # Workstations (Windows/Linux desktops)
+    if os_type in ['windows', 'linux', 'macos']:
+        return 'Workstation'
+    
+    # Default fallback
+    return 'Workstation'
+
+
 def scan_network(base_ip=None, limit=254):
     """
-    Ping IPs from base_ip+1 to base_ip+limit.
-    Returns a list of reachable IP addresses.
-    Uses correct ping flags per OS: Windows (-n/-w), macOS (-c/-t), Linux (-c/-W).
-    Automatically detects base IP if not provided.
+    Advanced network discovery combining ARP scanning and ping for maximum device detection.
+    Returns a list of tuples (ip, hostname, os, is_mobile, vendor, mac, services) for reachable devices.
+    Uses ARP for MAC/vendor info + ping for comprehensive discovery.
+    Optimized for speed with reduced port scanning.
     """
     if base_ip is None:
         base_ip = get_local_ip()
     
-    active = []
     system = platform.system()
+    active = {}
+    
+    # Step 1: ARP scan for MAC/vendor info (Windows only)
     if system == "Windows":
-        # -w 500 = 500ms timeout in milliseconds
-        ping_cmd = lambda ip: ["ping", "-n", "1", "-w", "500", ip]
-    elif system == "Darwin":
-        ping_cmd = lambda ip: ["ping", "-c", "1", "-t", "1", ip]
-    else:
-        ping_cmd = lambda ip: ["ping", "-c", "1", "-W", "1", ip]
-
-    for i in range(1, limit + 1):
-        ip = f"{base_ip}{i}"
         try:
             result = subprocess.run(
-                ping_cmd(ip),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2
+                ["arp", "-a"],
+                capture_output=True,
+                text=True,
+                timeout=5
             )
-            if result.returncode == 0:
-                active.append(ip)
+            output = result.stdout
+            for line in output.split('\n'):
+                # Parse ARP table: "  192.168.1.1           00-11-22-33-44-55     dynamic"
+                parts = line.split()
+                if len(parts) >= 2 and '.' in parts[1]:
+                    ip = parts[1]
+                    # Check if IP matches our subnet
+                    if ip.startswith(base_ip[:-1]):
+                        mac = parts[2].replace('-', ':') if len(parts) >= 3 else None
+                        vendor = get_mac_vendor(mac)
+                        active[ip] = {'mac': mac, 'vendor': vendor}
         except (subprocess.TimeoutExpired, OSError):
             pass
-    return active
+    
+    # Step 2: Parallel ping scan to find all responsive devices
+    ips = [f"{base_ip}{i}" for i in range(0, limit + 1)]
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(ping_ip, ip, system): ip for ip in ips}
+        for future in as_completed(futures):
+            ip, is_alive, ttl = future.result()
+            if is_alive:
+                # Get MAC/vendor from ARP if available, otherwise unknown
+                if ip in active:
+                    mac = active[ip]['mac']
+                    vendor = active[ip]['vendor']
+                else:
+                    mac = None
+                    vendor = 'Unknown'
+                
+                hostname = resolve_hostname(ip)
+                os_type = ttl_to_os(ttl)
+                is_mobile = is_mobile_device(hostname, ip, vendor)
+                
+                # Scan only critical ports for faster detection
+                critical_ports = [80, 443, 22, 3306]  # HTTP, HTTPS, SSH, MySQL
+                open_ports = scan_ports(ip, critical_ports)
+                services = detect_services(open_ports)
+                
+                active[ip] = {
+                    'hostname': hostname,
+                    'os': os_type,
+                    'is_mobile': is_mobile,
+                    'vendor': vendor,
+                    'mac': mac,
+                    'services': services
+                }
+    
+    # Convert dict to list of tuples
+    result = [(ip, data['hostname'], data['os'], data['is_mobile'], data['vendor'], data['mac'], data['services']) 
+              for ip, data in active.items() if 'hostname' in data]
+    
+    return result
 
 
 def build_dynamic_graph(devices):
     """
-    Build a directed graph from a list of discovered IP addresses.
+    Build a directed graph from a list of discovered devices with full device information.
     Each device becomes a node with attributes matching the existing system structure.
     Edges form a simple chain for BFS compatibility.
     """
@@ -568,17 +1213,45 @@ def build_dynamic_graph(devices):
     }
 
     node_names = []
-    for i, ip in enumerate(devices):
-        role = assign_role(i)
+    for i, device in enumerate(devices):
+        # Handle different formats: ip string, (ip, hostname), (ip, hostname, os), 
+        # (ip, hostname, os, is_mobile), or (ip, hostname, os, is_mobile, vendor, mac, services)
+        if isinstance(device, tuple):
+            if len(device) == 7:
+                ip, hostname, os_type, is_mobile, vendor, mac, services = device
+            elif len(device) == 4:
+                ip, hostname, os_type, is_mobile = device
+                vendor, mac, services = 'Unknown', None, []
+            elif len(device) == 3:
+                ip, hostname, os_type = device
+                is_mobile, vendor, mac, services = False, 'Unknown', None, []
+            elif len(device) == 2:
+                ip, hostname = device
+                os_type, is_mobile, vendor, mac, services = 'unknown', False, 'Unknown', None, []
+            else:
+                ip, hostname, os_type, is_mobile, vendor, mac, services = device[0], None, 'unknown', False, 'Unknown', None, []
+        else:
+            ip, hostname, os_type, is_mobile, vendor, mac, services = device, None, 'unknown', False, 'Unknown', None, []
+        
+        # Use service-based role assignment for more realistic roles
+        role = assign_role_from_services(services, os_type, vendor) if i > 0 else 'Entry Node'
         ntype = node_type_map.get(role, "endpoint")
         criticality = (i % 5) + 1
         vulnerability = round(random.uniform(0.3, 0.8), 2)
-        # Node name is "Role\nIP" — displayed in graph label
-        node_name = f"{role}\n{ip}"
+        
+        # Node name includes hostname if available
+        display_name = hostname if hostname else ip
+        node_name = f"{role}\n{display_name}"
         node_names.append(node_name)
         G.add_node(
             node_name,
             ip=ip,
+            hostname=hostname,
+            os=os_type,
+            is_mobile=is_mobile,
+            vendor=vendor,
+            mac=mac,
+            services=services,
             role=role,
             criticality=criticality,
             vulnerability=vulnerability,
@@ -1335,10 +2008,26 @@ with col_details:
             vuln_bar_color = "#ff3355" if vuln_pct > 60 else "#ff8c00" if vuln_pct > 40 else "#00ff88"
             node_color = "#ff3355" if is_comp else "#ffd700" if is_honey else "#00d4ff"
 
-            html += f"<div class='node-card {card_class}'><div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px'><span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span><span style='font-size:0.65rem;opacity:0.8'>{status_icon}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>IP:</span><span style='color:#e0f4ff'>{data['ip']}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Role:</span><span style='color:#e0f4ff'>{data['role']}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Type:</span><span style='color:#e0f4ff'>{ntype.upper()}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Criticality:</span><span style='color:#ffd700'>{crit_stars}</span></div><div style='margin:8px 0'><div style='color:#3d6a8a;margin-bottom:4px'>Vulnerability:</div><div class='risk-bar-container'><div class='risk-bar' style='width:{vuln_pct}%;background:{vuln_bar_color}'></div></div><span style='color:{vuln_bar_color}'>{vuln_pct}%</span></div></div>"
+            hostname = data.get('hostname', '')
+            hostname_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Hostname:</span><span style='color:#e0f4ff'>{hostname}</span></div>" if hostname else ""
+            
+            os_type = data.get('os', 'unknown')
+            os_icon = {'windows': '🪟', 'linux': '🐧', 'macos': '🍎', 'unknown': '❓'}.get(os_type, '❓')
+            os_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>OS:</span><span style='color:#e0f4ff'>{os_icon} {os_type.upper()}</span></div>"
+            
+            vendor = data.get('vendor', 'Unknown')
+            vendor_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Vendor:</span><span style='color:#e0f4ff'>{vendor}</span></div>"
+            
+            is_mobile = data.get('is_mobile', False)
+            mobile_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Device:</span><span style='color:#e0f4ff'>📱 Mobile</span></div>" if is_mobile else ""
+            
+            services = data.get('services', [])
+            services_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Services:</span><span style='color:#e0f4ff'>{', '.join(services[:3])}{'...' if len(services) > 3 else ''}</span></div>" if services else ""
+            
+            html += f"<div class='node-card {card_class}'><div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px'><span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span><span style='font-size:0.65rem;opacity:0.8'>{status_icon}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>IP:</span><span style='color:#e0f4ff'>{data['ip']}</span></div>{hostname_html}{os_html}{vendor_html}{mobile_html}{services_html}<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Role:</span><span style='color:#e0f4ff'>{data['role']}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Type:</span><span style='color:#e0f4ff'>{ntype.upper()}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Criticality:</span><span style='color:#ffd700'>{crit_stars}</span></div><div style='margin:8px 0'><div style='color:#3d6a8a;margin-bottom:4px'>Vulnerability:</div><div class='risk-bar-container'><div class='risk-bar' style='width:{vuln_pct}%;background:{vuln_bar_color}'></div></div><span style='color:{vuln_bar_color}'>{vuln_pct}%</span></div></div>"
         return html
 
-    st.components.v1.html(f"<div style='padding: 8px;'>{render_node_panel()}</div>", height=400, scrolling=False)
+    node_panel.markdown(f"<div style='padding: 8px;'>{render_node_panel()}</div>", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1393,7 +2082,7 @@ if run_btn:
                 st.components.v1.html(updated_html, height=500, scrolling=False)
 
             # Update node panel
-            st.components.v1.html(f"<div style='padding: 8px;'>{render_node_panel(active_node=node)}</div>", height=400, scrolling=False)
+            node_panel.markdown(f"<div style='padding: 8px;'>{render_node_panel(active_node=node)}</div>", unsafe_allow_html=True)
 
             time.sleep(animation_speed)
 
@@ -1440,7 +2129,7 @@ if run_btn:
     )
     with graph_placeholder:
         st.components.v1.html(final_html, height=500, scrolling=False)
-    st.components.v1.html(f"<div style='padding: 8px;'>{render_node_panel()}</div>", height=400, scrolling=False)
+    node_panel.markdown(f"<div style='padding: 8px;'>{render_node_panel()}</div>", unsafe_allow_html=True)
 
     st.rerun()
 
