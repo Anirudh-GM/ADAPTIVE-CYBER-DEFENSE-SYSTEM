@@ -38,6 +38,8 @@ import networkx as nx
 import time
 import random
 import json
+import re
+import socket
 import subprocess
 import platform
 from collections import deque
@@ -45,6 +47,25 @@ from pyvis.network import Network
 import tempfile
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Exposed-service risk profiles (passive scan only — no exploitation)
+SERVICE_RISKS = {
+    21:   {'service': 'FTP',       'risk': 0.72, 'vector': 'FTP Anonymous/Credential Attack',  'mitre': ('T1021', 'Remote Services — FTP'),           'fix': 'Disable FTP or migrate to SFTP; block port 21 at firewall'},
+    22:   {'service': 'SSH',       'risk': 0.58, 'vector': 'SSH Brute Force / Key Reuse',      'mitre': ('T1021.004', 'Remote Services — SSH'),       'fix': 'Disable password auth; use SSH keys; restrict SSH to admin VLAN'},
+    23:   {'service': 'Telnet',    'risk': 0.85, 'vector': 'Telnet Cleartext Credential Theft','mitre': ('T1021', 'Remote Services — Telnet'),         'fix': 'Disable Telnet immediately; replace with SSH'},
+    80:   {'service': 'HTTP',      'risk': 0.52, 'vector': 'Web App Exploit / Credential Theft','mitre': ('T1190', 'Exploit Public-Facing Application'), 'fix': 'Patch web apps; enforce HTTPS; deploy WAF'},
+    135:  {'service': 'RPC',       'risk': 0.60, 'vector': 'RPC Enumeration / Lateral Movement','mitre': ('T1021', 'Remote Services — RPC'),            'fix': 'Block RPC from untrusted networks; restrict to domain controllers'},
+    139:  {'service': 'NetBIOS',   'risk': 0.55, 'vector': 'NetBIOS Name Enumeration',         'mitre': ('T1046', 'Network Service Discovery'),        'fix': 'Disable NetBIOS over TCP/IP; segment LAN traffic'},
+    443:  {'service': 'HTTPS',     'risk': 0.45, 'vector': 'Web Exploit / Session Hijack',     'mitre': ('T1190', 'Exploit Public-Facing Application'), 'fix': 'Keep TLS updated; enforce HSTS; patch web stack'},
+    445:  {'service': 'SMB',       'risk': 0.68, 'vector': 'SMB Relay / Pass-the-Hash',        'mitre': ('T1021.002', 'Remote Services — SMB'),        'fix': 'Disable SMBv1; require SMB signing; segment file servers'},
+    3306: {'service': 'MySQL',     'risk': 0.75, 'vector': 'Database Credential Attack',     'mitre': ('T1210', 'Exploitation of Remote Services'),  'fix': 'Bind MySQL to localhost; strong passwords; network ACLs'},
+    3389: {'service': 'RDP',       'risk': 0.78, 'vector': 'RDP Brute Force / BlueKeep-class', 'mitre': ('T1021.001', 'Remote Services — RDP'),        'fix': 'Enable NLA; use VPN before RDP; enforce MFA; limit to jump hosts'},
+    5432: {'service': 'PostgreSQL','risk': 0.72, 'vector': 'Database Credential Attack',     'mitre': ('T1210', 'Exploitation of Remote Services'),  'fix': 'Restrict pg_hba.conf; never expose DB to entire LAN'},
+    5900: {'service': 'VNC',       'risk': 0.70, 'vector': 'VNC Remote Control Hijack',        'mitre': ('T1021.005', 'Remote Services — VNC'),        'fix': 'Tunnel VNC over VPN; require strong passwords'},
+    8080: {'service': 'HTTP-Alt',  'risk': 0.55, 'vector': 'Admin Panel / Dev Server Exploit', 'mitre': ('T1190', 'Exploit Public-Facing Application'), 'fix': 'Remove dev services from production LAN; add auth'},
+}
+
+SCAN_PORTS = [21, 22, 23, 53, 80, 135, 139, 443, 445, 3306, 3389, 5432, 5900, 8080, 8443]
 
 # ─────────────────────────────────────────────────────────────────
 # PAGE CONFIGURATION
@@ -363,42 +384,62 @@ h1, h2, h3 {
 def build_network():
     G = nx.DiGraph()
 
-    # Node definitions: (name, ip, role, criticality 1-5, vulnerability 0-1, type)
-    nodes = [
-        ("Firewall",    "192.168.1.1",  "Perimeter Defense",    3, 0.25, "perimeter"),
-        ("User-PC",     "192.168.1.10", "Workstation",          2, 0.70, "endpoint"),
-        ("Admin-PC",    "192.168.1.11", "Admin Workstation",    4, 0.55, "endpoint"),
-        ("Server",      "192.168.1.20", "Web/App Server",       4, 0.60, "server"),
-        ("File-Server", "192.168.1.21", "File Server",          3, 0.45, "server"),
-        ("Database",    "192.168.1.30", "MySQL Database",       5, 0.50, "database"),
-        ("Honeypot",    "192.168.1.99", "Decoy System",         1, 0.95, "honeypot"),
+    lab_hosts = [
+        ("Firewall",    "192.168.1.1",  "Perimeter Defense",    "perimeter", [443],        ['HTTPS']),
+        ("User-PC",     "192.168.1.10", "Workstation",          "endpoint",  [22, 445],    ['SSH', 'SMB']),
+        ("Admin-PC",    "192.168.1.11", "Admin Workstation",    "endpoint",  [3389, 445],  ['RDP', 'SMB']),
+        ("Server",      "192.168.1.20", "Web/App Server",       "server",    [22, 80, 443],['SSH', 'HTTP', 'HTTPS']),
+        ("File-Server", "192.168.1.21", "File Server",          "server",    [445, 139],   ['SMB', 'NetBIOS']),
+        ("Database",    "192.168.1.30", "MySQL Database",       "database",  [3306],       ['MySQL']),
+        ("Honeypot",    "192.168.1.99", "Decoy System",         "honeypot",  [21],         ['FTP']),
     ]
 
-    for name, ip, role, criticality, vuln, ntype in nodes:
-        G.add_node(name,
-                   ip=ip,
-                   role=role,
-                   criticality=criticality,
-                   vulnerability=vuln,
-                   node_type=ntype,
-                   compromised=False)
+    node_names = []
+    for name, ip, role, ntype, open_ports, services in lab_hosts:
+        os_type = 'linux' if ntype in ('server', 'database') else 'windows' if ntype == 'endpoint' else 'unknown'
+        device_type = 'Server' if ntype == 'server' else 'Database Server' if ntype == 'database' else 'Computer'
+        sim_role = 'Database' if ntype == 'database' else 'Server' if ntype == 'server' else 'Workstation'
+        if name == 'Firewall':
+            sim_role = 'Entry Node'
+        security = assess_device_security(services, os_type, device_type, open_ports, sim_role)
+        node_names.append(name)
+        G.add_node(
+            name,
+            ip=ip,
+            role=role,
+            display_name=name,
+            hostname=name,
+            os=os_type,
+            open_ports=open_ports,
+            services=services,
+            device_type=device_type,
+            criticality=security['criticality'],
+            vulnerability=security['vulnerability'],
+            weaknesses=security['weaknesses'],
+            access_vectors=security['access_vectors'],
+            fixes=security['fixes'],
+            node_type=ntype,
+            compromised=False,
+            priv_escalated=False,
+        )
 
-    # Edge definitions: (src, dst, connection_type)
-    edges = [
-        ("Firewall",    "User-PC",      "filtered"),
-        ("Firewall",    "Admin-PC",     "filtered"),
-        ("User-PC",     "Server",       "http/ssh"),
-        ("User-PC",     "File-Server",  "smb"),
-        ("Admin-PC",    "Server",       "ssh/rdp"),
-        ("Admin-PC",    "File-Server",  "smb/admin"),
-        ("Server",      "Database",     "mysql"),
-        ("File-Server", "Database",     "db-backup"),
-        ("Server",      "Honeypot",     "snmp"),
-        ("Admin-PC",    "Honeypot",     "ftp"),
+    edge_pairs = [
+        ("Firewall", "User-PC"), ("Firewall", "Admin-PC"),
+        ("User-PC", "Server"), ("User-PC", "File-Server"),
+        ("Admin-PC", "Server"), ("Admin-PC", "File-Server"),
+        ("Server", "Database"), ("File-Server", "Database"),
+        ("Server", "Honeypot"), ("Admin-PC", "Honeypot"),
     ]
-
-    for src, dst, conn in edges:
-        G.add_edge(src, dst, connection=conn)
+    for src, dst in edge_pairs:
+        for edge_info in get_lateral_edges_for_target(G.nodes[dst]['open_ports']):
+            G.add_edge(src, dst, **{
+                'connection': edge_info['connection'],
+                'access_vector': edge_info['vector'],
+                'access_port': edge_info['port'],
+                'mitre_code': edge_info['mitre_code'],
+                'mitre_desc': edge_info['mitre_desc'],
+                'success_prob': edge_info['success_prob'],
+            })
 
     return G
 
@@ -549,58 +590,123 @@ def get_local_ip():
     return "192.168.1."
 
 
-def resolve_hostname(ip):
-    """
-    Resolve hostname from IP address using nslookup (Windows) or host/dig (Unix).
-    Returns hostname or None if resolution fails.
-    """
+def _clean_hostname(name, ip):
+    """Normalize a resolved hostname for display."""
+    if not name:
+        return None
+    name = name.strip().rstrip('.')
+    name = re.sub(r'\.local$', '', name, flags=re.IGNORECASE)
+    if not name or name == ip or name.replace('.', '') == ip.replace('.', ''):
+        return None
+    return name
+
+
+def resolve_hostname_ping(ip, system):
+    """Resolve friendly device name via ping -a (Windows) or ping output."""
+    try:
+        if system == "Windows":
+            result = subprocess.run(
+                ["ping", "-n", "1", "-w", "500", "-a", ip],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        else:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "1", ip],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        match = re.search(r'Pinging\s+(.+?)\s+\[', result.stdout, re.IGNORECASE)
+        if match:
+            return _clean_hostname(match.group(1), ip)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def resolve_hostname_netbios(ip):
+    """Resolve NetBIOS/mDNS-style name via nbtstat (Windows). Good for phones on LAN."""
+    try:
+        result = subprocess.run(
+            ["nbtstat", "-A", ip],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        for line in result.stdout.splitlines():
+            match = re.match(r'\s*([A-Za-z0-9\-_ ]+?)\s+<00>\s+UNIQUE', line)
+            if match:
+                name = _clean_hostname(match.group(1).strip(), ip)
+                if name and len(name) > 1:
+                    return name.replace(' ', '-')
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        pass
+    return None
+
+
+def resolve_hostname_dns(ip):
+    """Reverse DNS lookup via socket or dig/host."""
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        cleaned = _clean_hostname(hostname, ip)
+        if cleaned:
+            return cleaned
+    except (socket.herror, socket.gaierror, OSError):
+        pass
+
     system = platform.system()
-    
     try:
         if system == "Windows":
             result = subprocess.run(
                 ["nslookup", ip],
                 capture_output=True,
                 text=True,
-                timeout=3
+                timeout=3,
             )
-            output = result.stdout
-            # Parse nslookup output for hostname
-            for line in output.split('\n'):
+            for line in result.stdout.split('\n'):
                 if 'Name:' in line:
-                    hostname = line.split('Name:')[-1].strip()
-                    if hostname and hostname != ip:
-                        return hostname
+                    cleaned = _clean_hostname(line.split('Name:')[-1].strip(), ip)
+                    if cleaned:
+                        return cleaned
         else:
-            # Try dig first, fallback to host
-            try:
-                result = subprocess.run(
-                    ["dig", "+short", "-x", ip],
-                    capture_output=True,
-                    text=True,
-                    timeout=3
-                )
-                hostname = result.stdout.strip().rstrip('.')
-                if hostname and hostname != ip:
-                    return hostname
-            except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+            for cmd in (
+                ["dig", "+short", "-x", ip],
+                ["host", ip],
+            ):
                 try:
-                    result = subprocess.run(
-                        ["host", ip],
-                        capture_output=True,
-                        text=True,
-                        timeout=3
-                    )
-                    output = result.stdout
-                    if 'pointer' in output.lower():
-                        hostname = output.split('pointer')[-1].strip().rstrip('.')
-                        if hostname and hostname != ip:
-                            return hostname
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                    output = result.stdout.strip()
+                    if cmd[0] == "dig":
+                        cleaned = _clean_hostname(output.rstrip('.'), ip)
+                    elif 'pointer' in output.lower():
+                        cleaned = _clean_hostname(output.split('pointer')[-1].strip().rstrip('.'), ip)
+                    else:
+                        cleaned = None
+                    if cleaned:
+                        return cleaned
                 except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
-                    pass
+                    continue
     except (subprocess.TimeoutExpired, OSError):
         pass
-    
+    return None
+
+
+def resolve_hostname(ip):
+    """
+    Resolve hostname using multiple methods: ping name, NetBIOS, reverse DNS.
+    Returns the best available friendly device name or None.
+    """
+    system = platform.system()
+    for resolver in (
+        lambda: resolve_hostname_ping(ip, system),
+        lambda: resolve_hostname_netbios(ip) if system == "Windows" else None,
+        lambda: resolve_hostname_dns(ip),
+    ):
+        name = resolver()
+        if name:
+            return name
     return None
 
 
@@ -743,272 +849,258 @@ def ttl_to_os(ttl):
     return 'unknown'
 
 
-def get_mac_vendor(mac):
+def assess_device_security(services, os_type, device_type, open_ports, role):
     """
-    Identify device vendor from MAC address OUI (Organizationally Unique Identifier).
-    Returns vendor name or 'Unknown'.
+    Derive vulnerability score, access vectors, weaknesses, and fixes from scan data.
+    Passive assessment only — no exploitation performed.
     """
-    if not mac:
-        return 'Unknown'
-    
-    # Common OUI prefixes for major vendors
-    oui_map = {
-        # Apple
-        '00:0A:95': 'Apple',
-        '00:0B:96': 'Apple',
-        '00:0C:29': 'Apple',
-        '00:0D:93': 'Apple',
-        '00:0E:35': 'Apple',
-        '00:0F:F3': 'Apple',
-        '00:10:FA': 'Apple',
-        '00:11:24': 'Apple',
-        '00:14:51': 'Apple',
-        '00:16:CB': 'Apple',
-        '00:17:F2': 'Apple',
-        '00:19:E3': 'Apple',
-        '00:1A:11': 'Apple',
-        '00:1B:63': 'Apple',
-        '00:1C:B3': 'Apple',
-        '00:1D:4F': 'Apple',
-        '00:1E:C2': 'Apple',
-        '00:23:DF': 'Apple',
-        '00:25:4B': 'Apple',
-        '00:26:BB': 'Apple',
-        '00:28:6C': 'Apple',
-        '3C:15:C2': 'Apple',
-        '34:C7:31': 'Apple',
-        'F0:18:98': 'Apple',
-        'AC:87:A3': 'Apple',
-        'E4:CE:8F': 'Apple',
-        'E8:8D:28': 'Apple',
-        'F8:FF:C2': 'Apple',
-        'FC:E9:98': 'Apple',
-        # Samsung
-        '00:12:FB': 'Samsung',
-        '00:15:B9': 'Samsung',
-        '00:16:32': 'Samsung',
-        '00:17:C9': 'Samsung',
-        '00:21:19': 'Samsung',
-        '00:21:99': 'Samsung',
-        '00:22:68': 'Samsung',
-        '00:23:15': 'Samsung',
-        '00:24:54': 'Samsung',
-        '00:26:4A': 'Samsung',
-        '00:30:BD': 'Samsung',
-        '38:8C:50': 'Samsung',
-        '4C:32:75': 'Samsung',
-        '78:E4:00': 'Samsung',
-        '8C:F5:A3': 'Samsung',
-        'A4:C3:F0': 'Samsung',
-        'AC:5F:3E': 'Samsung',
-        'CC:3A:61': 'Samsung',
-        'D4:9A:20': 'Samsung',
-        # Google/Pixel
-        'F8:C3:9A': 'Google',
-        '44:48:C1': 'Google',
-        '48:51:B7': 'Google',
-        '7C:70:55': 'Google',
-        'AC:BC:32': 'Google',
-        'B4:CE:F6': 'Google',
-        'D4:28:B5': 'Google',
-        # Huawei
-        '00:E0:FC': 'Huawei',
-        '4C:54:99': 'Huawei',
-        '54:83:3A': 'Huawei',
-        '78:11:DC': 'Huawei',
-        '84:A8:E4': 'Huawei',
-        '8C:21:0A': 'Huawei',
-        'A0:62:AC': 'Huawei',
-        'AC:85:3D': 'Huawei',
-        'B4:8E:26': 'Huawei',
-        'C4:93:D9': 'Huawei',
-        # Xiaomi
-        '34:CE:00': 'Xiaomi',
-        '34:C7:31': 'Xiaomi',
-        '38:BC:1A': 'Xiaomi',
-        '40:4E:36': 'Xiaomi',
-        '44:DA:E7': 'Xiaomi',
-        '58:20:B1': 'Xiaomi',
-        '64:09:80': 'Xiaomi',
-        '78:11:DC': 'Xiaomi',
-        '7C:11:BE': 'Xiaomi',
-        '80:FA:5B': 'Xiaomi',
-        '88:25:93': 'Xiaomi',
-        '8C:34:FD': 'Xiaomi',
-        'AC:23:3F': 'Xiaomi',
-        'C4:0A:38': 'Xiaomi',
-        'CC:81:D9': 'Xiaomi',
-        'D4:6E:0E': 'Xiaomi',
-        'E8:50:8B': 'Xiaomi',
-        'F0:4E:36': 'Xiaomi',
-        'F4:8E:38': 'Xiaomi',
-        'FC:64:2B': 'Xiaomi',
-        # Cisco
-        '00:00:0C': 'Cisco',
-        '00:01:42': 'Cisco',
-        '00:02:BD': 'Cisco',
-        '00:05:5E': 'Cisco',
-        '00:06:D6': 'Cisco',
-        '00:07:EB': 'Cisco',
-        '00:0B:BE': 'Cisco',
-        '00:0C:CF': 'Cisco',
-        '00:0D:BD': 'Cisco',
-        '00:0E:83': 'Cisco',
-        '00:0F:24': 'Cisco',
-        '00:10:0D': 'Cisco',
-        '00:11:BB': 'Cisco',
-        '00:12:01': 'Cisco',
-        '00:13:80': 'Cisco',
-        '00:14:1B': 'Cisco',
-        '00:15:63': 'Cisco',
-        '00:16:47': 'Cisco',
-        '00:17:94': 'Cisco',
-        '00:18:74': 'Cisco',
-        '00:19:07': 'Cisco',
-        '00:1A:A1': 'Cisco',
-        '00:1B:D4': 'Cisco',
-        '00:1C:58': 'Cisco',
-        '00:1D:46': 'Cisco',
-        '00:1E:14': 'Cisco',
-        '00:1F:6A': 'Cisco',
-        '00:20:A6': 'Cisco',
-        '00:21:1B': 'Cisco',
-        '00:22:90': 'Cisco',
-        '00:23:AC': 'Cisco',
-        '00:24:C4': 'Cisco',
-        '00:25:B3': 'Cisco',
-        '00:26:98': 'Cisco',
-        '00:27:0E': 'Cisco',
-        '00:28:F1': 'Cisco',
-        '00:50:56': 'Cisco',
-        '00:E0:4C': 'Cisco',
-        'F4:EA:67': 'Cisco',
-        # Dell
-        '00:04:76': 'Dell',
-        '00:08:74': 'Dell',
-        '00:0B:DB': 'Dell',
-        '00:0C:29': 'Dell',
-        '00:0E:2C': 'Dell',
-        '00:11:43': 'Dell',
-        '00:14:22': 'Dell',
-        '00:15:C5': 'Dell',
-        '00:16:76': 'Dell',
-        '00:17:A4': 'Dell',
-        '00:18:8B': 'Dell',
-        '00:19:B9': 'Dell',
-        '00:1A:4B': 'Dell',
-        '00:1B:21': 'Dell',
-        '00:1C:23': 'Dell',
-        '00:1D:09': 'Dell',
-        '00:1E:67': 'Dell',
-        '00:1F:29': 'Dell',
-        '00:21:CC': 'Dell',
-        '00:23:AE': 'Dell',
-        '00:24:B8': 'Dell',
-        '00:26:B9': 'Dell',
-        '00:28:31': 'Dell',
-        '44:8A:5B': 'Dell',
-        # HP
-        '00:01:E6': 'HP',
-        '00:02:A5': 'HP',
-        '00:04:5A': 'HP',
-        '00:08:02': 'HP',
-        '00:0E:7C': 'HP',
-        '00:10:83': 'HP',
-        '00:11:85': 'HP',
-        '00:13:21': 'HP',
-        '00:14:38': 'HP',
-        '00:15:60': 'HP',
-        '00:16:35': 'HP',
-        '00:17:08': 'HP',
-        '00:18:FE': 'HP',
-        '00:19:B2': 'HP',
-        '00:1A:A0': 'HP',
-        '00:1B:78': 'HP',
-        '00:1C:C4': 'HP',
-        '00:1D:9F': 'HP',
-        '00:1E:68': 'HP',
-        '00:1F:3C': 'HP',
-        '00:21:08': 'HP',
-        '00:22:64': 'HP',
-        '00:23:7D': 'HP',
-        '00:24:B6': 'HP',
-        '00:25:B5': 'HP',
-        '00:26:22': 'HP',
-        '00:30:C1': 'HP',
-        '34:17:EB': 'HP',
-        '3C:D9:2B': 'HP',
-        '40:18:D1': 'HP',
-        'F0:1D:2A': 'HP',
-        # Microsoft
-        '00:0D:3A': 'Microsoft',
-        '00:0E:5C': 'Microsoft',
-        '00:0F:EA': 'Microsoft',
-        '00:12:41': 'Microsoft',
-        '00:15:5D': 'Microsoft',
-        '00:1B:44': 'Microsoft',
-        '00:1D:D8': 'Microsoft',
-        '00:21:CC': 'Microsoft',
-        '00:22:75': 'Microsoft',
-        '00:24:68': 'Microsoft',
-        '00:25:D3': 'Microsoft',
-        '00:26:08': 'Microsoft',
-        '00:27:13': 'Microsoft',
-        '00:50:F2': 'Microsoft',
-        'BC:5F:F4': 'Microsoft',
-        'E4:71:95': 'Microsoft',
-        'F4:8E:38': 'Microsoft',
+    weaknesses = []
+    access_vectors = []
+    fixes = []
+    base_vuln = 0.20
+
+    for port in open_ports:
+        info = SERVICE_RISKS.get(port)
+        if not info:
+            continue
+        label = f"Exposed {info['service']} (port {port}) — {info['vector']}"
+        if label not in weaknesses:
+            weaknesses.append(label)
+        if info['vector'] not in access_vectors:
+            access_vectors.append(info['vector'])
+        if info['fix'] not in fixes:
+            fixes.append(info['fix'])
+        base_vuln = max(base_vuln, info['risk'])
+
+    if device_type in ('Mobile Phone', 'Tablet'):
+        base_vuln = max(base_vuln, 0.38)
+        weaknesses.append('Mobile device on LAN — phishing / credential theft foothold')
+        fixes.append('Move mobile devices to guest VLAN; enforce MDM and screen lock')
+
+    if os_type == 'windows' and 'SMB' in services:
+        base_vuln = max(base_vuln, 0.62)
+        if 'Windows host with SMB exposed — domain credential relay risk' not in weaknesses:
+            weaknesses.append('Windows host with SMB exposed — domain credential relay risk')
+            fixes.append('Enable Windows Defender Firewall; restrict SMB to file-server subnet')
+
+    if role == 'Database':
+        base_vuln = max(base_vuln, 0.70)
+        weaknesses.append('Database tier reachable from LAN — high-value target')
+        fixes.append('Place database on isolated VLAN; allow only app-server IPs')
+
+    if not weaknesses:
+        weaknesses.append('Host reachable on network — baseline lateral movement target')
+        fixes.append('Apply OS patches; enable host firewall; remove unnecessary services')
+
+    criticality = 2
+    if role in ('Database', 'Server') or device_type in ('Database Server', 'Server'):
+        criticality = 5
+    elif role == 'Entry Node':
+        criticality = 3
+    elif device_type in ('Mobile Phone', 'Tablet'):
+        criticality = 2
+    elif any(s in services for s in ('RDP', 'SSH', 'SMB')):
+        criticality = 4
+    elif services:
+        criticality = 3
+
+    return {
+        'vulnerability': round(min(base_vuln, 0.95), 2),
+        'weaknesses': weaknesses,
+        'access_vectors': access_vectors,
+        'fixes': fixes,
+        'criticality': criticality,
     }
-    
-    # Normalize MAC to uppercase and extract OUI (first 3 octets)
-    mac_upper = mac.upper()
-    oui = ':'.join(mac_upper.split(':')[:3])
-    
-    return oui_map.get(oui, 'Unknown')
 
 
-def is_mobile_device(hostname, ip, vendor):
+def get_lateral_edges_for_target(open_ports):
+    """Return edge metadata for each exploitable access path to a target host."""
+    edges = []
+    for port in open_ports:
+        info = SERVICE_RISKS.get(port)
+        if info:
+            edges.append({
+                'port': port,
+                'service': info['service'],
+                'vector': info['vector'],
+                'mitre_code': info['mitre'][0],
+                'mitre_desc': info['mitre'][1],
+                'success_prob': info['risk'],
+                'connection': f"{info['service'].lower()}/{port}",
+            })
+    if not edges:
+        edges.append({
+            'port': 0,
+            'service': 'LAN',
+            'vector': 'Network Reachability / Credential Reuse',
+            'mitre_code': 'T1078',
+            'mitre_desc': 'Valid Accounts — LAN foothold spread',
+            'success_prob': 0.35,
+            'connection': 'lan/reachability',
+        })
+    return edges
+
+
+def ip_in_subnet(ip, base_ip):
+    """True when ip belongs to the /24 prefix implied by base_ip (e.g. 192.168.1.)."""
+    prefix = base_ip if base_ip.endswith('.') else f"{base_ip}."
+    return ip.startswith(prefix)
+
+
+def parse_arp_table(output, subnet_prefix):
     """
-    Detect if device is mobile based on hostname patterns and vendor.
-    Returns True if likely a mobile device.
+    Parse arp -a / ip neigh output into {ip: mac} for the local subnet.
     """
+    entries = {}
+    base_ip = subnet_prefix if subnet_prefix.endswith('.') else f"{subnet_prefix}."
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith('Interface') or 'Internet Address' in line:
+            continue
+
+        # Windows: 192.168.1.1  aa-bb-cc-dd-ee-ff  dynamic
+        win_match = re.match(
+            r'^(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F\-]{17})\s+',
+            line,
+        )
+        if win_match:
+            ip, mac = win_match.group(1), win_match.group(2).replace('-', ':').upper()
+            if ip_in_subnet(ip, base_ip) and mac != 'FF:FF:FF:FF:FF:FF':
+                entries[ip] = mac
+            continue
+
+        # Linux/macOS: ? (192.168.1.1) at aa:bb:cc:dd:ee:ff [ether] on eth0
+        unix_match = re.search(
+            r'(\d+\.\d+\.\d+\.\d+).*?([0-9a-fA-F:]{17})',
+            line,
+        )
+        if unix_match:
+            ip, mac = unix_match.group(1), unix_match.group(2).upper()
+            if ip_in_subnet(ip, base_ip) and mac != 'FF:FF:FF:FF:FF:FF':
+                entries[ip] = mac
+
+    return entries
+
+
+def read_arp_map(subnet_prefix):
+    """Read the system ARP/neighbor table for devices on the scanned subnet."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            result = subprocess.run(
+                ["arp", "-a"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        else:
+            try:
+                result = subprocess.run(
+                    ["ip", "neigh", "show"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except FileNotFoundError:
+                result = subprocess.run(
+                    ["arp", "-a"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+        return parse_arp_table(result.stdout, subnet_prefix)
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+
+
+def lookup_mac_windows(ip):
+    """Look up MAC for a single IP using Get-NetNeighbor (Windows)."""
+    try:
+        result = subprocess.run(
+            [
+                "powershell", "-Command",
+                f"(Get-NetNeighbor -IPAddress '{ip}' -ErrorAction SilentlyContinue | "
+                "Select-Object -First 1 -ExpandProperty LinkLayerAddress)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        mac = result.stdout.strip().replace('-', ':').upper()
+        if re.fullmatch(r'([0-9A-F]{2}:){5}[0-9A-F]{2}', mac):
+            return mac
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def is_tablet_device(hostname):
+    """Detect tablets (iPad, Galaxy Tab, etc.)."""
     if not hostname:
-        # Check vendor for mobile manufacturers
-        mobile_vendors = ['Apple', 'Samsung', 'Google', 'Huawei', 'Xiaomi', 'OnePlus', 'Oppo', 'Vivo', 'Honor', 'Realme', 'Motorola', 'LG', 'Nokia', 'Sony', 'HTC', 'Blackberry']
-        if vendor in mobile_vendors:
-            return True
         return False
-    
     hostname_lower = hostname.lower()
-    
-    # Common mobile device hostname patterns
+    tablet_patterns = ['ipad', 'tablet', 'tab-', 'tab_', 'sm-t', 'sm-x', 'lenovo tab', 'surface']
+    return any(pattern in hostname_lower for pattern in tablet_patterns)
+
+
+def is_mobile_device(hostname, ip):
+    """Detect if device is mobile based on hostname patterns."""
+    if is_tablet_device(hostname):
+        return True
+    if not hostname:
+        return False
+
+    hostname_lower = hostname.lower()
     mobile_patterns = [
         'iphone', 'ipad', 'android', 'mobile', 'phone', 'tablet',
         'samsung', 'galaxy', 'pixel', 'oneplus', 'xiaomi', 'oppo',
         'vivo', 'huawei', 'honor', 'realme', 'motorola', 'lg',
-        'nokia', 'sony', 'htc', 'blackberry', 'windows-phone'
+        'nokia', 'sony', 'htc', 'blackberry', 'windows-phone',
+        'redmi', 'poco', 'nothing-phone',
     ]
-    
-    # Check if hostname contains mobile patterns
-    for pattern in mobile_patterns:
-        if pattern in hostname_lower:
-            return True
-    
-    # Check for common mobile device naming conventions
-    # iOS devices often have names like "John's iPhone"
+    if any(pattern in hostname_lower for pattern in mobile_patterns):
+        return True
     if "'s " in hostname_lower or "s iphone" in hostname_lower or "s ipad" in hostname_lower:
         return True
-    
-    # Android devices often have model names
-    if any(model in hostname_lower for model in ['sm-', 'a series', 'm series', 'redmi', 'poco']):
+    if any(model in hostname_lower for model in ['sm-', 'rmx', 'cph', 'redmi', 'poco']):
         return True
-    
-    # Check vendor for mobile manufacturers
-    mobile_vendors = ['Apple', 'Samsung', 'Google', 'Huawei', 'Xiaomi', 'OnePlus', 'Oppo', 'Vivo', 'Honor', 'Realme', 'Motorola', 'LG', 'Nokia', 'Sony', 'HTC', 'Blackberry']
-    if vendor in mobile_vendors:
-        return True
-    
     return False
+
+
+def identify_device_type(hostname, os_type, is_mobile, services):
+    """Classify a discovered device into a human-readable category."""
+    if is_tablet_device(hostname):
+        return "Tablet"
+    if is_mobile:
+        return "Mobile Phone"
+
+    hostname_lower = (hostname or '').lower()
+    router_hints = ['router', 'gateway', 'modem', 'ap-', 'wifi', 'fritz', 'tplink', 'netgear', 'asus']
+    if any(h in hostname_lower for h in router_hints):
+        return "Router/Gateway"
+    if any(s in services for s in ['MySQL', 'PostgreSQL', 'MongoDB', 'Redis']):
+        return "Database Server"
+    if any(s in services for s in ['HTTP', 'HTTPS', 'HTTP-Alt', 'HTTPS-Alt', 'SSH', 'RDP', 'DNS', 'SMB']):
+        return "Server"
+    if os_type == 'macos':
+        return "Mac"
+    if os_type in ('windows', 'linux'):
+        return "Computer"
+    return "Network Device"
+
+
+def format_device_display_name(hostname, device_type, ip):
+    """Build a readable label such as \"John's iPhone (Mobile Phone)\"."""
+    if hostname and device_type:
+        if device_type.lower() in hostname.lower():
+            return hostname
+        return f"{hostname} ({device_type})"
+    if hostname:
+        return hostname
+    if device_type:
+        return f"{device_type} @ {ip}"
+    return ip
 
 
 def scan_ports(ip, ports):
@@ -1017,27 +1109,37 @@ def scan_ports(ip, ports):
     Returns list of open ports.
     """
     open_ports = []
-    
+    system = platform.system()
+
     def check_port(port):
         try:
-            result = subprocess.run(
-                ["powershell", "-Command", f"Test-NetConnection -ComputerName {ip} -Port {port} -InformationLevel Quiet -WarningAction SilentlyContinue"],
-                capture_output=True,
-                text=True,
-                timeout=0.5
-            )
-            return port if result.stdout.strip() == 'True' else None
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-    
-    # Parallel port scanning with ThreadPoolExecutor
+            if system == "Windows":
+                result = subprocess.run(
+                    [
+                        "powershell", "-Command",
+                        f"Test-NetConnection -ComputerName {ip} -Port {port} "
+                        "-InformationLevel Quiet -WarningAction SilentlyContinue",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                return port if result.stdout.strip() == 'True' else None
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.4)
+                if sock.connect_ex((ip, port)) == 0:
+                    return port
+        except (subprocess.TimeoutExpired, OSError, socket.error):
+            pass
+        return None
+
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(check_port, port): port for port in ports}
         for future in as_completed(futures):
             result = future.result()
             if result:
                 open_ports.append(result)
-    
+
     return open_ports
 
 
@@ -1057,6 +1159,8 @@ def detect_services(open_ports):
         143: 'IMAP',
         443: 'HTTPS',
         445: 'SMB',
+        135: 'RPC',
+        139: 'NetBIOS',
         3306: 'MySQL',
         3389: 'RDP',
         5432: 'PostgreSQL',
@@ -1075,136 +1179,147 @@ def detect_services(open_ports):
     return services
 
 
-def assign_role_from_services(services, os_type, vendor):
-    """
-    Assign role based on detected services, OS, and vendor.
-    More realistic role assignment for real-world scenarios.
-    """
-    # Database servers
+def assign_role_from_services(services, os_type, device_type):
+    """Assign simulation role from detected services and device type."""
     if any(db in services for db in ['MySQL', 'PostgreSQL', 'MongoDB', 'Redis']):
         return 'Database'
-    
-    # Web servers
     if any(web in services for web in ['HTTP', 'HTTPS', 'HTTP-Alt', 'HTTPS-Alt']):
         return 'Server'
-    
-    # File/Print servers
     if 'SMB' in services:
         return 'Server'
-    
-    # Remote access servers
     if any(remote in services for remote in ['SSH', 'RDP', 'VNC', 'Telnet']):
         return 'Server'
-    
-    # Email servers
     if any(email in services for email in ['SMTP', 'POP3', 'IMAP']):
         return 'Server'
-    
-    # DNS server
     if 'DNS' in services:
         return 'Server'
-    
-    # Network infrastructure (Cisco, etc.)
-    if vendor == 'Cisco':
-        return 'Server'
-    
-    # Mobile devices
-    mobile_vendors = ['Apple', 'Samsung', 'Google', 'Huawei', 'Xiaomi', 'OnePlus', 'Oppo', 'Vivo', 'Honor', 'Realme', 'Motorola', 'LG', 'Nokia', 'Sony', 'HTC', 'Blackberry']
-    if vendor in mobile_vendors:
+    if device_type in ('Mobile Phone', 'Tablet'):
         return 'Workstation'
-    
-    # Workstations (Windows/Linux desktops)
     if os_type in ['windows', 'linux', 'macos']:
         return 'Workstation'
-    
-    # Default fallback
     return 'Workstation'
 
 
 def scan_network(base_ip=None, limit=254):
     """
-    Advanced network discovery combining ARP scanning and ping for maximum device detection.
-    Returns a list of tuples (ip, hostname, os, is_mobile, vendor, mac, services) for reachable devices.
-    Uses ARP for MAC/vendor info + ping for comprehensive discovery.
-    Optimized for speed with reduced port scanning.
+    Network discovery: ping sweep, ARP/MAC lookup, hostname resolution, and device typing.
+    Returns list of tuples:
+    (ip, hostname, os, is_mobile, mac, open_ports, services, device_type, display_name)
     """
     if base_ip is None:
         base_ip = get_local_ip()
-    
+
     system = platform.system()
-    active = {}
-    
-    # Step 1: ARP scan for MAC/vendor info (Windows only)
-    if system == "Windows":
-        try:
-            result = subprocess.run(
-                ["arp", "-a"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            output = result.stdout
-            for line in output.split('\n'):
-                # Parse ARP table: "  192.168.1.1           00-11-22-33-44-55     dynamic"
-                parts = line.split()
-                if len(parts) >= 2 and '.' in parts[1]:
-                    ip = parts[1]
-                    # Check if IP matches our subnet
-                    if ip.startswith(base_ip[:-1]):
-                        mac = parts[2].replace('-', ':') if len(parts) >= 3 else None
-                        vendor = get_mac_vendor(mac)
-                        active[ip] = {'mac': mac, 'vendor': vendor}
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-    
-    # Step 2: Parallel ping scan to find all responsive devices
-    ips = [f"{base_ip}{i}" for i in range(0, limit + 1)]
+    subnet_prefix = base_ip.rstrip('.')
+    ips = [f"{base_ip}{i}" for i in range(1, limit + 1)]
+    ping_results = {}
     with ThreadPoolExecutor(max_workers=50) as executor:
         futures = {executor.submit(ping_ip, ip, system): ip for ip in ips}
         for future in as_completed(futures):
             ip, is_alive, ttl = future.result()
             if is_alive:
-                # Get MAC/vendor from ARP if available, otherwise unknown
-                if ip in active:
-                    mac = active[ip]['mac']
-                    vendor = active[ip]['vendor']
-                else:
-                    mac = None
-                    vendor = 'Unknown'
-                
-                hostname = resolve_hostname(ip)
-                os_type = ttl_to_os(ttl)
-                is_mobile = is_mobile_device(hostname, ip, vendor)
-                
-                # Scan only critical ports for faster detection
-                critical_ports = [80, 443, 22, 3306]  # HTTP, HTTPS, SSH, MySQL
-                open_ports = scan_ports(ip, critical_ports)
-                services = detect_services(open_ports)
-                
-                active[ip] = {
-                    'hostname': hostname,
-                    'os': os_type,
-                    'is_mobile': is_mobile,
-                    'vendor': vendor,
-                    'mac': mac,
-                    'services': services
-                }
-    
-    # Convert dict to list of tuples
-    result = [(ip, data['hostname'], data['os'], data['is_mobile'], data['vendor'], data['mac'], data['services']) 
-              for ip, data in active.items() if 'hostname' in data]
-    
-    return result
+                ping_results[ip] = ttl
+
+    # Step 2: Read ARP table after ping sweep (MAC addresses now cached)
+    arp_map = read_arp_map(subnet_prefix)
+
+    # Step 3: Merge ping-responsive hosts with ARP-only hosts on this subnet
+    candidate_ips = set(ping_results.keys()) | set(arp_map.keys())
+    candidate_ips = {ip for ip in candidate_ips if ip_in_subnet(ip, base_ip)}
+
+    def enrich_device(ip):
+        ttl = ping_results.get(ip)
+        mac = arp_map.get(ip)
+        if not mac and system == "Windows":
+            mac = lookup_mac_windows(ip)
+
+        hostname = resolve_hostname(ip)
+        os_type = ttl_to_os(ttl)
+        is_mobile = is_mobile_device(hostname, ip)
+        open_ports = scan_ports(ip, SCAN_PORTS) if ip in ping_results else []
+        services = detect_services(open_ports)
+        device_type = identify_device_type(hostname, os_type, is_mobile, services)
+        display_name = format_device_display_name(hostname, device_type, ip)
+
+        return {
+            'hostname': hostname,
+            'os': os_type,
+            'is_mobile': is_mobile,
+            'mac': mac,
+            'open_ports': open_ports,
+            'services': services,
+            'device_type': device_type,
+            'display_name': display_name,
+        }
+
+    devices = {}
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(enrich_device, ip): ip for ip in sorted(candidate_ips)}
+        for future in as_completed(futures):
+            ip = futures[future]
+            devices[ip] = future.result()
+
+    return [
+        (
+            ip,
+            data['hostname'],
+            data['os'],
+            data['is_mobile'],
+            data['mac'],
+            data['open_ports'],
+            data['services'],
+            data['device_type'],
+            data['display_name'],
+        )
+        for ip, data in sorted(devices.items(), key=lambda item: tuple(map(int, item[0].split('.'))))
+    ]
+
+
+def _parse_device_record(device):
+    """Normalize scan tuples into a consistent device dict."""
+    open_ports = []
+    device_type = 'Network Device'
+    display_name = None
+    if isinstance(device, tuple):
+        if len(device) >= 9:
+            ip, hostname, os_type, is_mobile, mac, open_ports, services, device_type, display_name = device[:9]
+        elif len(device) == 7:
+            ip, hostname, os_type, is_mobile, mac, services, device_type = device[:7]
+            open_ports = []
+        elif len(device) == 4:
+            ip, hostname, os_type, is_mobile = device
+            mac, services = None, []
+        elif len(device) == 2:
+            ip, hostname = device
+            os_type, is_mobile, mac, services = 'unknown', False, None, []
+        else:
+            ip = device[0]
+            hostname, os_type, is_mobile, mac, services = None, 'unknown', False, None, []
+    else:
+        ip = device
+        hostname, os_type, is_mobile, mac, services = None, 'unknown', False, None, []
+
+    if not display_name:
+        display_name = format_device_display_name(hostname, device_type, ip)
+    return {
+        'ip': ip,
+        'hostname': hostname,
+        'os': os_type,
+        'is_mobile': is_mobile,
+        'mac': mac,
+        'open_ports': open_ports or [],
+        'services': services or [],
+        'device_type': device_type,
+        'display_name': display_name,
+    }
 
 
 def build_dynamic_graph(devices):
     """
-    Build a directed graph from a list of discovered devices with full device information.
-    Each device becomes a node with attributes matching the existing system structure.
-    Edges form a simple chain for BFS compatibility.
+    Build attack graph from scanned devices.
+    Nodes carry assessed vulnerabilities; edges represent lateral movement via open services.
     """
     G = nx.DiGraph()
-
     node_type_map = {
         "Entry Node":  "endpoint",
         "Server":      "server",
@@ -1212,61 +1327,55 @@ def build_dynamic_graph(devices):
         "Workstation": "endpoint",
     }
 
+    parsed = [_parse_device_record(d) for d in devices]
     node_names = []
-    for i, device in enumerate(devices):
-        # Handle different formats: ip string, (ip, hostname), (ip, hostname, os), 
-        # (ip, hostname, os, is_mobile), or (ip, hostname, os, is_mobile, vendor, mac, services)
-        if isinstance(device, tuple):
-            if len(device) == 7:
-                ip, hostname, os_type, is_mobile, vendor, mac, services = device
-            elif len(device) == 4:
-                ip, hostname, os_type, is_mobile = device
-                vendor, mac, services = 'Unknown', None, []
-            elif len(device) == 3:
-                ip, hostname, os_type = device
-                is_mobile, vendor, mac, services = False, 'Unknown', None, []
-            elif len(device) == 2:
-                ip, hostname = device
-                os_type, is_mobile, vendor, mac, services = 'unknown', False, 'Unknown', None, []
-            else:
-                ip, hostname, os_type, is_mobile, vendor, mac, services = device[0], None, 'unknown', False, 'Unknown', None, []
-        else:
-            ip, hostname, os_type, is_mobile, vendor, mac, services = device, None, 'unknown', False, 'Unknown', None, []
-        
-        # Use service-based role assignment for more realistic roles
-        role = assign_role_from_services(services, os_type, vendor) if i > 0 else 'Entry Node'
+
+    for rec in parsed:
+        role = assign_role_from_services(rec['services'], rec['os'], rec['device_type'])
+        security = assess_device_security(
+            rec['services'], rec['os'], rec['device_type'], rec['open_ports'], role,
+        )
         ntype = node_type_map.get(role, "endpoint")
-        criticality = (i % 5) + 1
-        vulnerability = round(random.uniform(0.3, 0.8), 2)
-        
-        # Node name includes hostname if available
-        display_name = hostname if hostname else ip
-        node_name = f"{role}\n{display_name}"
+        node_name = f"{role}\n{rec['display_name']}"
         node_names.append(node_name)
         G.add_node(
             node_name,
-            ip=ip,
-            hostname=hostname,
-            os=os_type,
-            is_mobile=is_mobile,
-            vendor=vendor,
-            mac=mac,
-            services=services,
+            ip=rec['ip'],
+            hostname=rec['hostname'],
+            os=rec['os'],
+            is_mobile=rec['is_mobile'],
+            mac=rec['mac'],
+            open_ports=rec['open_ports'],
+            services=rec['services'],
+            device_type=rec['device_type'],
+            display_name=rec['display_name'],
             role=role,
-            criticality=criticality,
-            vulnerability=vulnerability,
+            criticality=security['criticality'],
+            vulnerability=security['vulnerability'],
+            weaknesses=security['weaknesses'],
+            access_vectors=security['access_vectors'],
+            fixes=security['fixes'],
             node_type=ntype,
             compromised=False,
+            priv_escalated=False,
         )
 
-    # Create a simple chain: node[0] → node[1] → node[2] → ...
-    # Also add cross-edges for richer connectivity where device count allows
-    for i in range(len(node_names) - 1):
-        G.add_edge(node_names[i], node_names[i + 1], connection="tcp/ip")
-
-    # Add a few shortcut edges for BFS reachability (skip-one hops)
-    for i in range(len(node_names) - 2):
-        G.add_edge(node_names[i], node_names[i + 2], connection="tcp/ip")
+    # Flat LAN: any compromised host can attempt lateral movement to any other host
+    for src in node_names:
+        for dst in node_names:
+            if src == dst:
+                continue
+            dst_ports = G.nodes[dst]['open_ports']
+            for edge_info in get_lateral_edges_for_target(dst_ports):
+                G.add_edge(
+                    src, dst,
+                    connection=edge_info['connection'],
+                    access_vector=edge_info['vector'],
+                    access_port=edge_info['port'],
+                    mitre_code=edge_info['mitre_code'],
+                    mitre_desc=edge_info['mitre_desc'],
+                    success_prob=edge_info['success_prob'],
+                )
 
     return G
 
@@ -1277,85 +1386,139 @@ def build_dynamic_graph(devices):
 
 def simulate_attack(G, entry_node, seed=42):
     """
-    BFS-based attack simulation.
-    Returns: timeline [(node, timestep, mitre_tag, success)]
+    BFS lateral movement simulation from a compromised entry point.
+    Uses service-based edges and assessed vulnerabilities — no real exploitation.
+    Returns timeline, compromised set, honeypot flag, and propagation stats.
     """
     random.seed(seed)
     timeline = []
     compromised = set()
-    visited = {entry_node}
-    queue = deque([(entry_node, 1)])
+    priv_escalated = set()
+    attack_paths = []
     honeypot_triggered = False
 
-    # MITRE ATT&CK technique mapping per node type
-    mitre_map = {
-        "perimeter":  ("T1190", "Exploit Public-Facing Application"),
-        "endpoint":   ("T1078", "Valid Accounts / Credential Reuse"),
-        "server":     ("T1021", "Remote Services / Lateral Movement"),
-        "database":   ("T1005", "Data from Local System"),
-        "honeypot":   ("T1003", "OS Credential Dumping [TRAP]"),
-    }
+    if entry_node not in G.nodes:
+        return timeline, compromised, honeypot_triggered, {}
+
+    # Compromise entry foothold
+    entry_data = G.nodes[entry_node]
+    compromised.add(entry_node)
+    G.nodes[entry_node]["compromised"] = True
+    timeline.append({
+        "node": entry_node,
+        "from_node": None,
+        "timestep": 1,
+        "mitre_code": "T1078",
+        "mitre_desc": "Initial Access — foothold on entry system",
+        "access_vector": "Initial compromise / phishing / stolen credentials",
+        "success": True,
+        "vuln": entry_data["vulnerability"],
+        "criticality": entry_data["criticality"],
+        "ntype": entry_data.get("node_type", "endpoint"),
+        "priv_esc": False,
+    })
+    attack_paths.append([entry_node])
+
+    visited = {entry_node}
+    queue = deque([(entry_node, 1, [entry_node])])
 
     while queue:
-        current_node, timestep = queue.popleft()
-        node_data = G.nodes[current_node]
-        vuln = node_data["vulnerability"]
-        criticality = node_data["criticality"]
-        ntype = node_data.get("node_type", "endpoint")
+        current_node, timestep, path = queue.popleft()
+        if current_node not in compromised:
+            continue
 
-        # Determine compromise probability
-        # Higher vulnerability → higher chance. Critical nodes have extra resistance.
-        base_prob = vuln
-        if criticality >= 4:
-            base_prob *= 0.8  # hardened systems are slightly more resistant
-        success = random.random() < base_prob
+        for neighbor in G.successors(current_node):
+            if neighbor in visited:
+                continue
 
-        mitre_code, mitre_desc = mitre_map.get(ntype, ("T1059", "Command Execution"))
+            edge = G.edges[current_node, neighbor]
+            nd = G.nodes[neighbor]
+            ntype = nd.get("node_type", "endpoint")
 
-        # Check honeypot
-        if ntype == "honeypot" and success:
-            honeypot_triggered = True
+            if ntype == "honeypot":
+                prob = nd["vulnerability"]
+                mitre_code, mitre_desc = "T1003", "OS Credential Dumping [TRAP]"
+                access_vector = edge.get("access_vector", "Honeypot probe")
+            else:
+                prob = min(0.95, edge.get("success_prob", 0.4) * nd["vulnerability"])
+                if nd["criticality"] >= 4:
+                    prob *= 0.85
+                mitre_code = edge.get("mitre_code", "T1021")
+                mitre_desc = edge.get("mitre_desc", "Lateral Movement")
+                access_vector = edge.get("access_vector", edge.get("connection", "network"))
 
-        if success:
-            compromised.add(current_node)
-            G.nodes[current_node]["compromised"] = True
+            success = random.random() < prob
+            visited.add(neighbor)
+            actual_timestep = timestep + 1
+            did_priv_esc = False
 
-        # Critical nodes (criticality ≥ 4) add extra time step (privilege escalation delay)
-        actual_timestep = timestep
-        if criticality >= 4 and success:
-            actual_timestep += 1  # T1068 - privilege escalation delay
+            if success:
+                compromised.add(neighbor)
+                G.nodes[neighbor]["compromised"] = True
+                new_path = path + [neighbor]
+                attack_paths.append(new_path)
+                queue.append((neighbor, actual_timestep, new_path))
 
-        timeline.append({
-            "node": current_node,
-            "timestep": actual_timestep,
-            "mitre_code": mitre_code,
-            "mitre_desc": mitre_desc,
-            "success": success,
-            "vuln": vuln,
-            "criticality": criticality,
-            "ntype": ntype
-        })
+                if nd["criticality"] >= 4 and neighbor not in priv_escalated:
+                    priv_escalated.add(neighbor)
+                    G.nodes[neighbor]["priv_escalated"] = True
+                    did_priv_esc = True
+                    timeline.append({
+                        "node": neighbor,
+                        "from_node": current_node,
+                        "timestep": actual_timestep + 1,
+                        "mitre_code": "T1068",
+                        "mitre_desc": "Privilege Escalation — admin/root on high-value system",
+                        "access_vector": "Credential dump / sudo / token theft",
+                        "success": True,
+                        "vuln": nd["vulnerability"],
+                        "criticality": nd["criticality"],
+                        "ntype": ntype,
+                        "priv_esc": True,
+                    })
 
-        if success:
-            for neighbor in G.successors(current_node):
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    queue.append((neighbor, actual_timestep + 1))
+                if ntype == "honeypot":
+                    honeypot_triggered = True
 
-    # Sort timeline by timestep
+            timeline.append({
+                "node": neighbor,
+                "from_node": current_node,
+                "timestep": actual_timestep,
+                "mitre_code": mitre_code,
+                "mitre_desc": mitre_desc,
+                "access_vector": access_vector,
+                "success": success,
+                "vuln": nd["vulnerability"],
+                "criticality": nd["criticality"],
+                "ntype": ntype,
+                "priv_esc": did_priv_esc,
+            })
+
     timeline.sort(key=lambda x: x["timestep"])
-    return timeline, compromised, honeypot_triggered
+    real_nodes = [n for n in G.nodes if G.nodes[n].get("node_type") != "honeypot"]
+    real_compromised = [n for n in compromised if G.nodes[n].get("node_type") != "honeypot"]
+    max_hops = max((len(p) - 1 for p in attack_paths), default=0)
+
+    stats = {
+        "systems_controlled": len(real_compromised),
+        "total_systems": len(real_nodes),
+        "max_lateral_hops": max_hops,
+        "privilege_escalations": len(priv_escalated),
+        "attack_paths": attack_paths[:10],
+        "reachable_from_entry": len(real_compromised),
+    }
+
+    return timeline, compromised, honeypot_triggered, stats
 
 
 # ─────────────────────────────────────────────────────────────────
 # MODULE 3: RISK (BLAST RADIUS) ENGINE
 # ─────────────────────────────────────────────────────────────────
 
-def calculate_risk(G, compromised_nodes, timeline, honeypot_triggered):
+def calculate_risk(G, compromised_nodes, timeline, honeypot_triggered, attack_stats=None):
     W1, W2, W3 = 0.3, 0.5, 0.2
 
     total_nodes = len(G.nodes)
-    # Exclude honeypot from spread calculation (it's a trap, not real asset)
     real_nodes = [n for n in G.nodes if G.nodes[n].get("node_type") != "honeypot"]
     real_compromised = [n for n in compromised_nodes if G.nodes[n].get("node_type") != "honeypot"]
 
@@ -1371,17 +1534,20 @@ def calculate_risk(G, compromised_nodes, timeline, honeypot_triggered):
     R = (W1 * spread) + (W2 * critical_impact) + (W3 * depth)
     risk_score = R * 100
 
-    # Honeypot penalty: attacker has profiled the network
     if honeypot_triggered:
         risk_score = min(100, risk_score + 15)
 
-    # Per-node blast radius details
+    stats = attack_stats or {}
     blast_details = {
         "spread": round(spread * 100, 1),
         "critical_impact": round(critical_impact * 100, 1),
         "depth": round(depth * 100, 1),
         "compromised_count": len(real_compromised),
         "total_real_nodes": len(real_nodes),
+        "systems_controlled": stats.get("systems_controlled", len(real_compromised)),
+        "max_lateral_hops": stats.get("max_lateral_hops", 0),
+        "privilege_escalations": stats.get("privilege_escalations", 0),
+        "attack_paths": stats.get("attack_paths", []),
     }
 
     return round(risk_score, 1), blast_details
@@ -1392,7 +1558,9 @@ def calculate_risk(G, compromised_nodes, timeline, honeypot_triggered):
 # ─────────────────────────────────────────────────────────────────
 
 def get_defense_actions(G, compromised_nodes, risk_score):
+    """Generate prioritized remediation actions from assessed weaknesses on compromised nodes."""
     actions = []
+    seen_fixes = set()
 
     for node in compromised_nodes:
         if G.nodes[node].get("node_type") == "honeypot":
@@ -1400,63 +1568,78 @@ def get_defense_actions(G, compromised_nodes, risk_score):
         nd = G.nodes[node]
         crit = nd["criticality"]
         vuln = nd["vulnerability"]
+        display = nd.get("display_name", node)
 
-        # Action 1: Patch vulnerability
-        patch_cost = int(10 + crit * 5)
-        patch_reduction = round(vuln * crit * 4.0, 1)
-        actions.append({
-            "action": f"Patch {node}",
-            "node": node,
-            "type": "patch",
-            "cost": patch_cost,
-            "risk_reduction": patch_reduction,
-            "efficiency": round(patch_reduction / patch_cost, 3),
-            "description": f"Apply security patches, update services on {node} [{nd['ip']}]"
-        })
-
-        # Action 2: Isolate node (only if high criticality or deep in network)
-        if crit >= 3:
-            isolate_cost = int(15 + crit * 8)
-            outgoing = G.out_degree(node)
-            isolate_reduction = round(outgoing * crit * 2.5, 1)
+        for fix in nd.get("fixes", []):
+            if fix in seen_fixes:
+                continue
+            seen_fixes.add(fix)
+            fix_cost = int(12 + crit * 4)
+            fix_reduction = round(vuln * crit * 3.5, 1)
             actions.append({
-                "action": f"Isolate {node}",
+                "action": f"Fix: {fix[:55]}{'...' if len(fix) > 55 else ''}",
+                "node": node,
+                "type": "patch",
+                "cost": fix_cost,
+                "risk_reduction": fix_reduction,
+                "efficiency": round(fix_reduction / fix_cost, 3),
+                "description": f"{display} [{nd['ip']}] — {fix}",
+            })
+
+        for weakness in nd.get("weaknesses", [])[:2]:
+            isolate_cost = int(18 + crit * 6)
+            isolate_reduction = round(crit * 2.8, 1)
+            action_key = f"Block: {weakness[:40]}"
+            if action_key in seen_fixes:
+                continue
+            seen_fixes.add(action_key)
+            actions.append({
+                "action": action_key,
                 "node": node,
                 "type": "isolate",
                 "cost": isolate_cost,
                 "risk_reduction": isolate_reduction,
                 "efficiency": round(isolate_reduction / isolate_cost, 3),
-                "description": f"Network quarantine: remove all outgoing connections from {node}"
+                "description": f"Segment or firewall {display} to block: {weakness}",
             })
 
-        # Action 3: Reduce privileges
         if crit >= 4:
-            priv_cost = int(8 + crit * 3)
-            priv_reduction = round(crit * 3.0, 1)
+            priv_cost = int(10 + crit * 3)
+            priv_reduction = round(crit * 3.2, 1)
             actions.append({
-                "action": f"Reduce Privileges on {node}",
+                "action": f"Least Privilege on {display[:30]}",
                 "node": node,
                 "type": "privilege",
                 "cost": priv_cost,
                 "risk_reduction": priv_reduction,
                 "efficiency": round(priv_reduction / priv_cost, 3),
-                "description": f"Remove admin rights, enforce least privilege on {node}"
+                "description": f"Remove admin rights on {display}; enforce MFA and PAM",
             })
 
-    # Global IDS action
     ids_cost = 30
     ids_reduction = round(risk_score * 0.12, 1)
     actions.append({
-        "action": "Deploy Network IDS",
+        "action": "Deploy Network IDS / SIEM",
         "node": "ALL",
         "type": "ids",
         "cost": ids_cost,
         "risk_reduction": ids_reduction,
         "efficiency": round(ids_reduction / ids_cost, 3),
-        "description": "Deploy Intrusion Detection System (Snort/Suricata) across all nodes"
+        "description": "Detect lateral movement (Snort/Suricata/Wazuh) across the LAN",
     })
 
-    # Sort by efficiency (greedy ratio)
+    segment_cost = 25
+    segment_reduction = round(risk_score * 0.15, 1)
+    actions.append({
+        "action": "Network Segmentation (VLANs)",
+        "node": "ALL",
+        "type": "isolate",
+        "cost": segment_cost,
+        "risk_reduction": segment_reduction,
+        "efficiency": round(segment_reduction / segment_cost, 3),
+        "description": "Split workstations, servers, and databases into separate VLANs with ACLs",
+    })
+
     actions.sort(key=lambda x: x["efficiency"], reverse=True)
     return actions
 
@@ -1694,10 +1877,14 @@ def generate_attack_log(timeline, honeypot_triggered):
 # ─────────────────────────────────────────────────────────────────
 
 if "network_mode" not in st.session_state:
-    st.session_state.network_mode = "Simulated Lab"
+    st.session_state.network_mode = "Real Network Scan"
 
 if "G" not in st.session_state:
-    st.session_state.G = build_network()
+    st.session_state.G = (
+        build_network()
+        if st.session_state.network_mode == "Simulated Lab"
+        else nx.DiGraph()
+    )
 
 if "simulation_done" not in st.session_state:
     st.session_state.simulation_done = False
@@ -1726,6 +1913,9 @@ if "selected_defenses" not in st.session_state:
 if "attack_log" not in st.session_state:
     st.session_state.attack_log = []
 
+if "attack_stats" not in st.session_state:
+    st.session_state.attack_stats = {}
+
 if "current_anim_node" not in st.session_state:
     st.session_state.current_anim_node = None
 
@@ -1750,7 +1940,7 @@ with st.sidebar:
         "Network Mode",
         ["Simulated Lab", "Real Network Scan"],
         index=0 if st.session_state.network_mode == "Simulated Lab" else 1,
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 
     # If mode changed, reset and rebuild graph
@@ -1768,6 +1958,8 @@ with st.sidebar:
         st.session_state.current_anim_node = None
         if network_mode == "Simulated Lab":
             st.session_state.G = build_network()
+        else:
+            st.session_state.G = nx.DiGraph()
         st.rerun()
 
     # ── REAL NETWORK SCAN MODE CONTROLS ──
@@ -1777,10 +1969,11 @@ with st.sidebar:
              font-family:Share Tech Mono;font-size:0.65rem;color:#ff8c00;line-height:1.8;margin:8px 0'>
         ⚠ REAL NETWORK MODE<br>
         <span style='color:#3d6a8a'>
-        • Only detects reachable devices<br>
-        • Roles are assigned logically<br>
-        • No real vulnerability scanning<br>
-        • Simulation is still safe/educational
+        • Discovers all LAN hosts by ping + ARP<br>
+        • Scans open ports to find access paths (SSH, RDP, SMB…)<br>
+        • Assesses vulnerabilities from exposed services<br>
+        • Simulates lateral movement & privilege escalation<br>
+        • Recommends fixes to stop attack spread
         </span>
         </div>
         """, unsafe_allow_html=True)
@@ -1827,16 +2020,25 @@ with st.sidebar:
                 st.session_state.attack_log = []
                 st.session_state.current_anim_node = None
                 st.session_state.G = build_dynamic_graph(devices)
+                st.session_state.last_scan_devices = devices
                 st.success(f"Found {len(devices)} device(s). Graph updated.")
                 st.rerun()
 
     st.markdown('<div class="section-header">⚙ SIMULATION CONTROLS</div>', unsafe_allow_html=True)
 
     all_nodes = list(st.session_state.G.nodes)
-    # For simulated lab: exclude honeypot from entry selection
-    if network_mode == "Simulated Lab":
-        all_nodes = [n for n in all_nodes if st.session_state.G.nodes[n].get("node_type") != "honeypot"]
-    entry_node = st.selectbox("Entry Point (Attacker's Foothold)", all_nodes, index=min(1, len(all_nodes) - 1))
+    if not all_nodes:
+        st.warning("No devices in graph. Scan your network first (Real Network Scan mode).")
+        entry_node = None
+    else:
+        if network_mode == "Simulated Lab":
+            all_nodes = [n for n in all_nodes if st.session_state.G.nodes[n].get("node_type") != "honeypot"]
+        entry_node = st.selectbox(
+            "Entry Point (Initially Compromised System)",
+            all_nodes,
+            index=min(1, len(all_nodes) - 1),
+            help="The system where the attacker first gained access (phishing, stolen laptop, etc.)",
+        )
 
     show_honeypot = st.checkbox("Show Honeypot Node", value=True)
     animation_speed = st.slider("Animation Speed (sec/step)", 0.3, 2.0, 0.8, 0.1)
@@ -1860,10 +2062,11 @@ with st.sidebar:
                        "dot-honeypot" if data.get("node_type") == "honeypot" else \
                        "dot-safe"
         label = "🔴" if data["compromised"] else "🟡" if data.get("node_type") == "honeypot" else "🟢"
-        display_name = node.replace("\n", " / ")
+        display_name = data.get('display_name') or node.replace("\n", " / ")
         st.markdown(
             f'<div style="font-family:Share Tech Mono;font-size:0.72rem;padding:3px 0;color:#7ab8d4">'
-            f'<span class="status-dot {status_class}"></span>{display_name} <span style="color:#3d6a8a">({data["ip"]})</span></div>',
+            f'<span class="status-dot {status_class}"></span>{display_name} '
+            f'<span style="color:#3d6a8a">({data["ip"]})</span></div>',
             unsafe_allow_html=True
         )
 
@@ -1883,7 +2086,7 @@ with st.sidebar:
 st.markdown("""
 <div class="cyber-header">
     <div class="cyber-title">🛡 ADAPTIVE CYBER DEFENSE SYSTEM</div>
-    <div class="cyber-subtitle">// ATTACK SIMULATION & DEFENSE OPTIMIZATION PLATFORM // SME CYBERSECURITY FRAMEWORK //</div>
+    <div class="cyber-subtitle">// NETWORK DISCOVERY • ATTACK PATH ANALYSIS • DEFENSE RECOMMENDATIONS // SME CYBERSECURITY //</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1895,10 +2098,10 @@ if st.session_state.network_mode == "Real Network Scan":
          line-height:1.9;margin-bottom:16px'>
         <b>⚠ REAL NETWORK MODE ACTIVE</b><br>
         <span style='color:#7ab8d4'>
-        • Device detection uses ICMP ping only — no port scanning or exploitation<br>
-        • Roles (Entry Node / Server / Database / Workstation) are assigned logically by discovery order<br>
-        • Vulnerability scores are randomly assigned for simulation purposes — no real CVE scanning is performed<br>
-        • Use the <b style='color:#ff8c00'>SCAN NETWORK</b> button in the sidebar to detect devices on your local network
+        • Device detection via ping + ARP + port scan (no exploitation)<br>
+        • Vulnerabilities derived from exposed services on each host<br>
+        • Attack simulation shows lateral movement depth & systems controlled<br>
+        • Use <b style='color:#ff8c00'>SCAN NETWORK</b> then pick compromised entry point
         </span>
     </div>
     """, unsafe_allow_html=True)
@@ -2015,16 +2218,45 @@ with col_details:
             os_icon = {'windows': '🪟', 'linux': '🐧', 'macos': '🍎', 'unknown': '❓'}.get(os_type, '❓')
             os_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>OS:</span><span style='color:#e0f4ff'>{os_icon} {os_type.upper()}</span></div>"
             
-            vendor = data.get('vendor', 'Unknown')
-            vendor_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Vendor:</span><span style='color:#e0f4ff'>{vendor}</span></div>"
-            
             is_mobile = data.get('is_mobile', False)
-            mobile_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Device:</span><span style='color:#e0f4ff'>📱 Mobile</span></div>" if is_mobile else ""
+            device_type = data.get('device_type', '')
+            device_icon = {
+                'Mobile Phone': '📱',
+                'Tablet': '📱',
+                'Router/Gateway': '🌐',
+                'Server': '🖥️',
+                'Database Server': '🗄️',
+                'Computer': '💻',
+                'Mac': '🍎',
+                'Network Device': '🔗',
+            }.get(device_type, '📱' if is_mobile else '')
+            device_html = (
+                f"<div style='display:flex;align-items:center;margin:4px 0'>"
+                f"<span style='color:#3d6a8a;width:70px'>Device:</span>"
+                f"<span style='color:#e0f4ff'>{device_icon} {device_type or ('Mobile' if is_mobile else 'Unknown')}</span>"
+                f"</div>"
+            ) if device_type or is_mobile else ""
             
             services = data.get('services', [])
-            services_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Services:</span><span style='color:#e0f4ff'>{', '.join(services[:3])}{'...' if len(services) > 3 else ''}</span></div>" if services else ""
+            services_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Services:</span><span style='color:#e0f4ff'>{', '.join(services[:4])}{'...' if len(services) > 4 else ''}</span></div>" if services else ""
+
+            vectors = data.get('access_vectors', [])
+            vectors_html = (
+                f"<div style='display:flex;align-items:flex-start;margin:4px 0'>"
+                f"<span style='color:#3d6a8a;width:70px'>Access:</span>"
+                f"<span style='color:#ff8c00'>{', '.join(vectors[:2])}{'...' if len(vectors) > 2 else ''}</span>"
+                f"</div>"
+            ) if vectors else ""
+
+            weaknesses = data.get('weaknesses', [])
+            weak_html = (
+                f"<div style='margin:6px 0;padding:6px;background:rgba(255,51,85,0.06);border-left:2px solid #ff3355'>"
+                f"<div style='color:#3d6a8a;font-size:0.62rem;margin-bottom:3px'>VULNERABILITIES</div>"
+                + "".join(f"<div style='color:#ff8c00;font-size:0.65rem'>• {w[:70]}{'...' if len(w)>70 else ''}</div>" for w in weaknesses[:2])
+                + "</div>"
+            ) if weaknesses else ""
             
-            html += f"<div class='node-card {card_class}'><div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px'><span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span><span style='font-size:0.65rem;opacity:0.8'>{status_icon}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>IP:</span><span style='color:#e0f4ff'>{data['ip']}</span></div>{hostname_html}{os_html}{vendor_html}{mobile_html}{services_html}<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Role:</span><span style='color:#e0f4ff'>{data['role']}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Type:</span><span style='color:#e0f4ff'>{ntype.upper()}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Criticality:</span><span style='color:#ffd700'>{crit_stars}</span></div><div style='margin:8px 0'><div style='color:#3d6a8a;margin-bottom:4px'>Vulnerability:</div><div class='risk-bar-container'><div class='risk-bar' style='width:{vuln_pct}%;background:{vuln_bar_color}'></div></div><span style='color:{vuln_bar_color}'>{vuln_pct}%</span></div></div>"
+            html += f"<div class='node-card {card_class}'><div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px'><span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span><span style='font-size:0.65rem;opacity:0.8'>{status_icon}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>IP:</span><span style='color:#e0f4ff'>{data['ip']}</span></div>{hostname_html}{os_html}{device_html}{services_html}{vectors_html}{weak_html}<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Role:</span><span style='color:#e0f4ff'>{data['role']}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Type:</span><span style='color:#e0f4ff'>{ntype.upper()}</span></div><div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Criticality:</span><span style='color:#ffd700'>{crit_stars}</span></div><div style='margin:8px 0'><div style='color:#3d6a8a;margin-bottom:4px'>Vulnerability:</div><div class='risk-bar-container'><div class='risk-bar' style='width:{vuln_pct}%;background:{vuln_bar_color}'></div></div><span style='color:{vuln_bar_color}'>{vuln_pct}%</span></div></div>"
         return html
 
     node_panel.markdown(f"<div style='padding: 8px;'>{render_node_panel()}</div>", unsafe_allow_html=True)
@@ -2034,12 +2266,12 @@ with col_details:
 # SIMULATION EXECUTION WITH ANIMATION
 # ─────────────────────────────────────────────────────────────────
 
-if run_btn:
+if run_btn and entry_node:
     # Reset graph state first
     for node in st.session_state.G.nodes:
         st.session_state.G.nodes[node]["compromised"] = False
 
-    timeline, compromised, honeypot_triggered = simulate_attack(
+    timeline, compromised, honeypot_triggered, attack_stats = simulate_attack(
         st.session_state.G, entry_node, seed=random.randint(1, 9999)
     )
 
@@ -2064,7 +2296,9 @@ if run_btn:
             status_text.markdown(
                 f'<div style="font-family:Share Tech Mono;font-size:0.75rem;color:{status_color};'
                 f'background:#0d1f2d;border:1px solid {status_color};padding:8px 14px;margin:4px 0">'
-                f'[T{timestep}] {entry["mitre_code"]} → {node} ({entry["mitre_desc"]}) — {status_word}</div>',
+                f'[T{timestep}] {entry.get("mitre_code")} → {node}'
+                f'{" ← " + entry.get("from_node", "") if entry.get("from_node") else ""}'
+                f' via {entry.get("access_vector", "network")} — {status_word}</div>',
                 unsafe_allow_html=True
             )
 
@@ -2103,10 +2337,11 @@ if run_btn:
 
     # Risk calculation
     risk_score, blast_details = calculate_risk(
-        st.session_state.G, compromised, timeline, honeypot_triggered
+        st.session_state.G, compromised, timeline, honeypot_triggered, attack_stats
     )
     st.session_state.risk_score = risk_score
     st.session_state.blast_details = blast_details
+    st.session_state.attack_stats = attack_stats
 
     # Defense actions
     st.session_state.defense_actions = get_defense_actions(
@@ -2174,6 +2409,8 @@ if st.session_state.simulation_done:
                     </div>
                     <div style='color:#e0f4ff;font-weight:bold'>→ {entry["node"]}</div>
                     <div style='color:#3d6a8a'>{entry.get("mitre_code","")}: {entry.get("mitre_desc","")}</div>
+                    <div style='color:#ff8c00;font-size:0.65rem'>Via: {entry.get("access_vector", "network")}</div>
+                    {"<div style='color:#ffd700;font-size:0.65rem'>⬆ Privilege Escalation</div>" if entry.get("priv_esc") else ""}
                     <div style='color:#7ab8d4'>Vuln: {int(entry["vuln"]*100)}% | Crit: {"★"*entry["criticality"]}</div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -2215,10 +2452,23 @@ if st.session_state.simulation_done:
             </div>
             <div class="risk-bar-container"><div class="risk-bar" style='width:{bd.get("depth",0)}%;background:#ffd700'></div></div>
             <br>
-            <div>Nodes Compromised: <span style='color:#ff3355;float:right'>{bd.get("compromised_count",0)} / {bd.get("total_real_nodes",0)}</span></div>
+            <div>Systems Controlled: <span style='color:#ff3355;float:right'>{bd.get("systems_controlled", bd.get("compromised_count",0))} / {bd.get("total_real_nodes",0)}</span></div>
+            <div>Max Lateral Hops: <span style='color:#ffd700;float:right'>{bd.get("max_lateral_hops", 0)}</span></div>
+            <div>Privilege Escalations: <span style='color:#ff8c00;float:right'>{bd.get("privilege_escalations", 0)}</span></div>
             {"<div style='color:#ffd700;margin-top:8px'>⚠ HONEYPOT TRIGGERED: +15 risk penalty</div>" if st.session_state.honeypot_triggered else ""}
         </div>
         """, unsafe_allow_html=True)
+
+        paths = bd.get("attack_paths", [])
+        if paths:
+            st.markdown('<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin:12px 0 6px 0">ATTACK PATHS (longest routes)</div>', unsafe_allow_html=True)
+            for i, path in enumerate(paths[:5]):
+                path_str = " → ".join(p.replace("\n", " / ") for p in path)
+                st.markdown(
+                    f'<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;'
+                    f'padding:6px 10px;margin:3px 0;background:#060d15;border-left:2px solid #ff3355">{path_str}</div>',
+                    unsafe_allow_html=True,
+                )
 
     st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
 
@@ -2288,6 +2538,30 @@ if st.session_state.simulation_done:
                 <span style='color:{badge_color};font-size:0.65rem;white-space:nowrap'>{badge}</span>
             </div>
             """, unsafe_allow_html=True)
+
+        st.markdown('<div class="section-header">💡 RECOMMENDED SOLUTIONS</div>', unsafe_allow_html=True)
+        all_fixes = []
+        for node in st.session_state.compromised:
+            nd = st.session_state.G.nodes.get(node, {})
+            for fix in nd.get("fixes", []):
+                if fix not in all_fixes:
+                    all_fixes.append(fix)
+        if all_fixes:
+            for i, fix in enumerate(all_fixes[:8], 1):
+                st.markdown(
+                    f'<div style="font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4;'
+                    f'padding:8px 12px;margin:4px 0;background:#0a1520;border-left:3px solid #00ff88">'
+                    f'<span style="color:#00ff88">{i}.</span> {fix}</div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.72rem;color:#3d6a8a">'
+                'Run attack simulation to generate targeted remediation steps.</div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
 
     with col_log:
         st.markdown('<div class="section-header">📟 SYSTEM EVENT LOG</div>', unsafe_allow_html=True)
@@ -2384,11 +2658,11 @@ else:
     # Pre-simulation instructions
     if st.session_state.network_mode == "Real Network Scan":
         ready_note = (
-            "1. Use the sidebar to configure your IP prefix and scan range<br>"
-            "2. Click <span style='color:#ff8c00'>📡 SCAN NETWORK</span> to detect devices<br>"
-            "3. Select an entry node and click <span style='color:#00d4ff'>▶ RUN ATTACK SIMULATION</span><br>"
-            "4. Watch real-time propagation across discovered devices<br>"
-            "5. Review risk analysis and defense recommendations"
+            "1. Click <span style='color:#ff8c00'>📡 SCAN NETWORK</span> in the sidebar to discover all LAN devices<br>"
+            "2. Review each node's open ports, vulnerabilities, and access paths<br>"
+            "3. Select which system is <b>initially compromised</b> (attacker foothold)<br>"
+            "4. Click <span style='color:#00d4ff'>▶ RUN ATTACK SIMULATION</span> to see lateral movement<br>"
+            "5. Review how many systems fall, max attack depth, and recommended fixes"
         )
     else:
         ready_note = (
