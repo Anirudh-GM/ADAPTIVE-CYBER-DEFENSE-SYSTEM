@@ -80,6 +80,7 @@ from collections import deque
 from pyvis.network import Network
 import tempfile
 import os
+import html as html_lib
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -631,9 +632,17 @@ def lookup_cves_nvd(version_string):
         if resp.status_code != 200:
             return []
         data = resp.json()
+        product, detected_version = split_product_version(version_string)
+        # A banner such as just "Apache" is useful inventory data but is
+        # insufficient evidence for a version-specific CVE finding.
+        if not product or not detected_version:
+            return []
+
         results = []
         for item in data.get("vulnerabilities", [])[:5]:
             cve = item.get("cve", {})
+            if not cve_applies_to_detected_version(cve, product, detected_version):
+                continue
             cve_id = cve.get("id", "UNKNOWN")
             descs = cve.get("descriptions", [])
             summary = next((d["value"] for d in descs if d.get("lang") == "en"), "")
@@ -655,12 +664,74 @@ def lookup_cves_nvd(version_string):
         return []
 
 
+def split_product_version(version_string):
+    """Return a normalized product label and concrete version from a banner."""
+    if not version_string:
+        return None, None
+    match = re.search(r"(OpenSSH|Apache|nginx|vsftpd|ProFTPD|MySQL|MariaDB|Microsoft-IIS)[ /_-]*([0-9]+(?:\.[0-9A-Za-z]+)+)", version_string, re.I)
+    if not match:
+        return None, None
+    return match.group(1).lower(), match.group(2).lower()
+
+
+def comparable_version(value):
+    """Small, dependency-free comparator for NVD CPE numeric versions."""
+    return tuple(int(part) if part.isdigit() else part for part in re.findall(r"\d+|[a-z]+", value.lower()))
+
+
+def cpe_matches_product(criteria, product):
+    aliases = {
+        "apache": ("apache", "http_server"), "openssh": ("openbsd", "openssh"),
+        "nginx": ("nginx", "nginx"), "vsftpd": ("vsftpd", "vsftpd"),
+        "proftpd": ("proftpd", "proftpd"), "mysql": ("oracle", "mysql"),
+        "mariadb": ("mariadb", "mariadb"), "microsoft-iis": ("microsoft", "internet_information_services"),
+    }
+    parts = criteria.lower().split(":")
+    expected = aliases.get(product)
+    return bool(expected and len(parts) > 5 and parts[3] == expected[0] and parts[4] == expected[1])
+
+
+def version_is_affected(match, detected_version):
+    """Evaluate the CPE range metadata NVD supplies for a concrete version."""
+    target = comparable_version(detected_version)
+    exact = match.get("criteria", "").split(":")
+    if len(exact) > 5 and exact[5] not in {"*", "-"}:
+        return target == comparable_version(exact[5])
+    bounds = (
+        ("versionStartIncluding", lambda a, b: a >= b),
+        ("versionStartExcluding", lambda a, b: a > b),
+        ("versionEndIncluding", lambda a, b: a <= b),
+        ("versionEndExcluding", lambda a, b: a < b),
+    )
+    for field, comparison in bounds:
+        value = match.get(field)
+        if value and not comparison(target, comparable_version(value)):
+            return False
+    return True
+
+
+def cve_applies_to_detected_version(cve, product, detected_version):
+    """Require a vulnerable NVD CPE entry for the detected product/version."""
+    def walk(nodes):
+        for node in nodes or []:
+            for match in node.get("cpeMatch", []):
+                if match.get("vulnerable") and cpe_matches_product(match.get("criteria", ""), product):
+                    if version_is_affected(match, detected_version):
+                        return True
+            if walk(node.get("nodes")):
+                return True
+        return False
+    return walk(cve.get("configurations", []))
+
+
 def lookup_cves_offline(version_string):
     """Fallback lookup against the small built-in historical CVE table."""
-    if not version_string:
+    product, detected_version = split_product_version(version_string)
+    if not product or not detected_version:
         return []
     for key, cves in OFFLINE_CVE_FALLBACK.items():
-        if key.lower() in version_string.lower() or version_string.lower() in key.lower():
+        fallback_product, fallback_version = split_product_version(key)
+        if (fallback_product == product and fallback_version == detected_version):
             return cves
     return []
 
@@ -992,6 +1063,10 @@ def identify_device_type(hostname, os_type, is_mobile, services, mac=None):
         return "Router/Gateway"
     if any(s in services for s in ['MySQL', 'PostgreSQL', 'MongoDB', 'Redis']):
         return "Database Server"
+    # SMB/RPC and a local development HTTP service are common on Windows
+    # workstations. Do not present that evidence as a certain server role.
+    if os_type == 'windows' and not any(s in services for s in ['MySQL', 'PostgreSQL', 'MongoDB', 'Redis']):
+        return "Windows Workstation"
     if any(s in services for s in ['HTTP', 'HTTPS', 'HTTP-Alt', 'HTTPS-Alt', 'SSH', 'RDP', 'DNS', 'SMB']):
         return "Server"
     if os_type == 'macos':
@@ -999,6 +1074,31 @@ def identify_device_type(hostname, os_type, is_mobile, services, mac=None):
     if os_type in ('windows', 'linux'):
         return "Computer"
     return "Network Device"
+
+
+def build_risk_profile(open_ports, cve_findings, criticality):
+    """Create an explainable 0-100 asset-risk estimate.
+
+    This is a prioritisation score, not a claim that a host is compromised.
+    Confirmed CVEs dominate the score; exposed services and asset importance
+    raise priority only moderately when no CVE is confirmed.
+    """
+    sensitive_ports = {21, 23, 135, 139, 445, 3306, 3389, 5432, 5900, 6379, 27017}
+    exposed_sensitive = sorted(set(open_ports) & sensitive_ports)
+    max_cvss = max((float(c.get('cvss', 0)) for c in cve_findings), default=0.0)
+    exposure_points = min(18, len(open_ports) * 2) + min(16, len(exposed_sensitive) * 5)
+    criticality_points = max(0, criticality - 1) * 3
+    if max_cvss:
+        score = min(100, round(max_cvss * 7 + exposure_points + criticality_points))
+        basis = "confirmed CVE plus exposure"
+    else:
+        score = min(49, round(8 + exposure_points + criticality_points))
+        basis = "exposure only — no confirmed CVE"
+    severity = "Critical" if score >= 85 else "High" if score >= 65 else "Medium" if score >= 35 else "Low"
+    return {
+        'score': score, 'severity': severity, 'basis': basis,
+        'max_cvss': max_cvss, 'sensitive_ports': exposed_sensitive,
+    }
 
 
 def format_device_display_name(hostname, device_type, ip):
@@ -1152,8 +1252,13 @@ def assess_device_security(services, os_type, device_type, open_ports, role, ver
     elif services:
         criticality = 3
 
+    risk_profile = build_risk_profile(open_ports, cve_findings, criticality)
     return {
-        'vulnerability': round(min(base_vuln, 0.98), 2),
+        # Kept for simulation compatibility; the user-facing value is now
+        # labelled "Risk score" and explained through risk_profile.
+        'vulnerability': round(risk_profile['score'] / 100, 2),
+        'exposure_level': round(min(base_vuln, 0.98), 2),
+        'risk_profile': risk_profile,
         'weaknesses': weaknesses,
         'access_vectors': access_vectors,
         'fixes': fixes,
@@ -1316,7 +1421,8 @@ def build_dynamic_graph(devices):
             version_map=rec['version_map'], banner_map=rec['banner_map'],
             device_type=rec['device_type'], display_name=rec['display_name'],
             role=role, criticality=security['criticality'],
-            vulnerability=security['vulnerability'], weaknesses=security['weaknesses'],
+            vulnerability=security['vulnerability'], exposure_level=security['exposure_level'],
+            risk_profile=security['risk_profile'], weaknesses=security['weaknesses'],
             access_vectors=security['access_vectors'], fixes=security['fixes'],
             cve_findings=security['cve_findings'], cve_source=security['cve_source'],
             node_type=ntype, compromised=False, priv_escalated=False,
@@ -1359,7 +1465,8 @@ def build_network():
             name, ip=ip, role=role, display_name=name, hostname=name, os=os_type,
             open_ports=open_ports, services=services, version_map={}, banner_map={},
             device_type=device_type, criticality=security['criticality'],
-            vulnerability=security['vulnerability'], weaknesses=security['weaknesses'],
+            vulnerability=security['vulnerability'], exposure_level=security['exposure_level'],
+            risk_profile=security['risk_profile'], weaknesses=security['weaknesses'],
             access_vectors=security['access_vectors'], fixes=security['fixes'],
             cve_findings=security['cve_findings'], cve_source=security['cve_source'],
             node_type=ntype, compromised=False, priv_escalated=False,
@@ -1659,7 +1766,7 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True)
         tooltip = (
             f"<div style='font-family:Share Tech Mono;font-size:11px;color:#e0f4ff;background:#0d1f2d;padding:8px;border:1px solid #1a3a5c'>"
             f"<b style='color:#00d4ff'>{node}</b><br>IP: {data['ip']}<br>Role: {data['role']}<br>"
-            f"Criticality: {'★' * data['criticality']}<br>Vulnerability: {int(data['vulnerability']*100)}%<br>"
+            f"Criticality: {'★' * data['criticality']}<br>Risk score: {int(data['vulnerability']*100)}/100<br>"
             f"{cve_html}"
             f"Status: {'🔴 COMPROMISED' if is_compromised else '🟡 HONEYPOT' if is_honeypot else '🟢 SECURE'}</div>"
         )
@@ -2006,7 +2113,7 @@ with m2:
 with m3:
     st.metric("SERVICES", asset_metrics["services"])
 with m4:
-    st.metric("AVG. EXPOSURE", f"{asset_metrics['average_risk']}%")
+    st.metric("AVG. RISK", f"{asset_metrics['average_risk']}%")
 with m5:
     st.metric("CRITICAL CVEs", asset_metrics["critical"])
 with m6:
@@ -2122,6 +2229,13 @@ with col_details:
             else:
                 svc_strs = services[:4]
             services_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Services:</span><span style='color:#e0f4ff'>{', '.join(svc_strs)}{'...' if len(services) > 4 else ''}</span></div>" if services else ""
+            open_ports = data.get('open_ports', [])
+            ports_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Ports:</span><span style='color:#e0f4ff'>{', '.join(str(p) for p in open_ports) or 'None detected'}</span></div>"
+            risk_profile = data.get('risk_profile', {})
+            risk_basis = html_lib.escape(risk_profile.get('basis', 'legacy assessment'))
+            risk_score = risk_profile.get('score', int(data.get('vulnerability', 0) * 100))
+            risk_severity = html_lib.escape(risk_profile.get('severity', 'Unknown'))
+            risk_html = f"<div style='margin:6px 0;padding:6px;background:rgba(0,212,255,0.05);border-left:2px solid #00d4ff'><div style='color:#00d4ff;font-size:0.65rem'>RISK: {risk_score}/100 — {risk_severity}</div><div style='color:#7ab8d4;font-size:0.62rem'>{risk_basis}</div></div>"
 
             cve_findings = data.get('cve_findings', [])
             cve_html = ""
@@ -2135,6 +2249,8 @@ with col_details:
                         for c in cve_findings[:3]
                     ) + "</div>"
                 )
+            else:
+                cve_html = "<div style='margin:6px 0;padding:6px;background:rgba(0,255,136,0.04);border-left:2px solid #00ff88;color:#7ab8d4;font-size:0.65rem'>No confirmed version-specific CVEs. Open services are shown as exposure, not proof of a vulnerability.</div>"
 
             weaknesses = data.get('weaknesses', [])
             weak_html = (
@@ -2143,6 +2259,12 @@ with col_details:
                 + "".join(f"<div style='color:#ff8c00;font-size:0.65rem'>• {w[:70]}{'...' if len(w)>70 else ''}</div>" for w in weaknesses[:2] if 'CVE' not in w)
                 + "</div>"
             ) if any('CVE' not in w for w in weaknesses) else ""
+            recommendations = data.get('fixes', [])
+            recommendation_html = "".join(
+                f"<div style='color:#7ab8d4;font-size:0.64rem'>• {html_lib.escape(fix)}</div>" for fix in recommendations[:2]
+            )
+            if recommendation_html:
+                recommendation_html = f"<div style='margin:6px 0;padding:6px;background:rgba(0,255,136,0.04);border-left:2px solid #00ff88'><div style='color:#3d6a8a;font-size:0.62rem;margin-bottom:3px'>RECOMMENDED ACTIONS</div>{recommendation_html}</div>"
 
             html += (
                 f"<div class='node-card {card_class}'>"
@@ -2150,10 +2272,10 @@ with col_details:
                 f"<span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span>"
                 f"<span style='font-size:0.65rem;opacity:0.8'>{status_icon}</span></div>"
                 f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>IP:</span><span style='color:#e0f4ff'>{data['ip']}</span></div>"
-                f"{hostname_html}{os_html}{device_html}{services_html}{cve_html}{weak_html}"
+                f"{hostname_html}{os_html}{device_html}{ports_html}{services_html}{risk_html}{cve_html}{weak_html}{recommendation_html}"
                 f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Role:</span><span style='color:#e0f4ff'>{data['role']}</span></div>"
                 f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Criticality:</span><span style='color:#ffd700'>{crit_stars}</span></div>"
-                f"<div style='margin:8px 0'><div style='color:#3d6a8a;margin-bottom:4px'>Vulnerability:</div>"
+                f"<div style='margin:8px 0'><div style='color:#3d6a8a;margin-bottom:4px'>Risk score:</div>"
                 f"<div class='risk-bar-container'><div class='risk-bar' style='width:{vuln_pct}%;background:{vuln_bar_color}'></div></div>"
                 f"<span style='color:{vuln_bar_color}'>{vuln_pct}%</span></div></div>"
             )
@@ -2269,6 +2391,9 @@ if st.session_state.simulation_done:
                 border_color = "#ff3355" if is_success else "#00ff88"
                 status_text_val = "✓ COMPROMISED" if is_success else "✗ BLOCKED"
                 status_color = "#ff3355" if is_success else "#00ff88"
+                privilege_html = "<div style='color:#ffd700;font-size:0.65rem'>⬆ Privilege Escalation</div>" if entry.get("priv_esc") else ""
+                vuln_percent = int(entry["vuln"] * 100)
+                criticality_stars = "★" * entry["criticality"]
                 st.markdown(f"""
                 <div style='background:{bg_color};border:1px solid {border_color};
                      border-left:3px solid {border_color};padding:8px 12px;margin:4px 0;
@@ -2280,8 +2405,8 @@ if st.session_state.simulation_done:
                     <div style='color:#e0f4ff;font-weight:bold'>→ {entry["node"]}</div>
                     <div style='color:#3d6a8a'>{entry.get("mitre_code","")}: {entry.get("mitre_desc","")}</div>
                     <div style='color:#ff8c00;font-size:0.65rem'>Via: {entry.get("access_vector", "network")}</div>
-                    {"<div style='color:#ffd700;font-size:0.65rem'>⬆ Privilege Escalation</div>" if entry.get("priv_esc") else ""}
-                    <div style='color:#7ab8d4'>Vuln: {int(entry["vuln"]*100)}% | Crit: {"★"*entry["criticality"]}</div>
+                    {privilege_html}
+                    <div style='color:#7ab8d4'>Risk: {vuln_percent}/100 | Criticality: {criticality_stars}</div>
                 </div>
                 """, unsafe_allow_html=True)
 
