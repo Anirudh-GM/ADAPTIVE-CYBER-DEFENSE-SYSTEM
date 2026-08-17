@@ -815,6 +815,37 @@ def get_local_ip():
     return "192.168.1."
 
 
+def get_local_system_context():
+    """Identify the scanning machine's own IP, hostname and OS.
+
+    This is cross-platform (Darwin/macOS, Linux, Windows) and is used as
+    ONE piece of supporting evidence in infer_os_type() — if a discovered
+    IP during a scan turns out to be this same machine, that is very
+    strong (but not automatically 100%) evidence of its OS. Nothing here
+    sends network traffic other than a UDP socket "connect" used purely
+    to ask the OS which local interface would be used to reach the
+    internet — no packets are actually transmitted by that call.
+    """
+    system = platform.system()
+    local_os = {'Darwin': 'macos', 'Windows': 'windows', 'Linux': 'linux'}.get(system, 'unknown')
+
+    local_ip = None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+    except OSError:
+        local_ip = None
+
+    try:
+        local_hostname = socket.gethostname()
+    except OSError:
+        local_hostname = None
+
+    return {'os': local_os, 'ip': local_ip, 'hostname': local_hostname, 'system': system}
+
+
 def _clean_hostname(name, ip):
     if not name:
         return None
@@ -935,6 +966,13 @@ def ping_ip(ip, system):
 
 
 def ttl_to_os(ttl):
+    """Legacy TTL-only lookup. NOT used as the OS classifier anymore —
+    kept only as a documented reference for the raw TTL bands, because
+    TTL is now folded into infer_os_type() as supporting evidence only.
+    Do not reintroduce this as a standalone classifier: macOS and Linux
+    both commonly reply with TTL 64, so this function alone cannot tell
+    them apart and previously caused every Mac to be labelled 'linux'.
+    """
     if ttl is None:
         return 'unknown'
     if 110 <= ttl <= 130:
@@ -944,6 +982,134 @@ def ttl_to_os(ttl):
     if 240 <= ttl <= 260:
         return 'macos'
     return 'unknown'
+
+
+# Hostname substrings that are supporting (not decisive) evidence for each
+# OS family. Kept small and readable rather than exhaustive — new patterns
+# can be appended safely without touching the scoring logic.
+_MACOS_HOSTNAME_HINTS = (
+    'macbook', 'imac', 'mac-mini', 'macmini', 'mac-pro', 'macpro',
+    'mac-studio', 'macstudio', 'mbp', 'mba', '-mac', 'macs-',
+)
+_LINUX_HOSTNAME_HINTS = (
+    'ubuntu', 'debian', 'kali', 'linux', 'centos', 'fedora', 'rhel',
+    'raspberrypi', 'raspbian', '-rpi', 'arch-', 'suse',
+)
+_WINDOWS_HOSTNAME_HINTS = (
+    'desktop-', 'win-', 'winpc', '-pc', 'dell-', 'hp-', 'lenovo-',
+)
+
+
+def infer_os_type(ip, ttl, hostname, mac, mac_vendor_, services,
+                   banner_map=None, local_system_context=None):
+    """Evidence-based OS inference.
+
+    TTL is only ever ONE of several supporting signals — it is never
+    treated as decisive on its own. macOS and Linux both commonly reply
+    with TTL 64, so TTL alone cannot separate them (this was the root
+    cause of Macs being reported as Linux). Instead, every available
+    signal — TTL, MAC vendor, hostname, exposed services, service
+    banners, and (when the discovered IP is the scanning machine itself)
+    local system identity — contributes weighted evidence toward one of
+    'macos', 'linux', 'windows', or 'unknown'.
+
+    Returns:
+        {
+            'os': 'macos' | 'linux' | 'windows' | 'unknown',
+            'confidence': float in [0, 1],
+            'evidence': [human-readable reasons for the winning OS],
+        }
+    """
+    banner_map = banner_map or {}
+    services = services or []
+    hl = (hostname or '').lower()
+
+    scores = {'macos': 0.0, 'linux': 0.0, 'windows': 0.0}
+    evidence = {'macos': [], 'linux': [], 'windows': []}
+
+    def add(os_name, weight, reason):
+        scores[os_name] += weight
+        evidence[os_name].append(reason)
+
+    # 1) Local machine identity — only fires for the scanner's own host,
+    #    and only ever contributes evidence, never an unconditional 100%,
+    #    because the scanner may itself run inside a VM/container later.
+    if local_system_context and local_system_context.get('ip') and ip == local_system_context['ip']:
+        local_os = local_system_context.get('os')
+        if local_os in scores:
+            add(local_os, 0.90, "This IP matches the scanning machine's own local IP")
+
+    # 2) MAC vendor (OUI)
+    if mac_vendor_ == 'Apple':
+        add('macos', 0.30, "Apple MAC vendor (also used by iPhone/iPad — cross-checked against hostname/services)")
+
+    # 3) Hostname patterns
+    if any(h in hl for h in _MACOS_HOSTNAME_HINTS):
+        add('macos', 0.35, "Hostname resembles a macOS device")
+    if any(h in hl for h in _LINUX_HOSTNAME_HINTS):
+        add('linux', 0.30, "Hostname resembles a Linux device/distribution")
+    if any(h in hl for h in _WINDOWS_HOSTNAME_HINTS):
+        add('windows', 0.25, "Hostname resembles a Windows device")
+
+    # 4) Service exposure fingerprints
+    if any(s in services for s in ('SMB', 'RDP')):
+        add('windows', 0.30, "SMB/RDP exposed — Windows-specific services")
+    if 'NetBIOS' in services:
+        add('windows', 0.10, "NetBIOS exposed — common on Windows")
+
+    # 5) Service banner fingerprints (passive banners already grabbed
+    #    elsewhere in the pipeline — no extra probing here)
+    ssh_banner = banner_map.get('SSH') or ''
+    if ssh_banner:
+        if re.search(r'ubuntu|debian', ssh_banner, re.IGNORECASE):
+            add('linux', 0.45, f"SSH banner identifies a Linux distribution ({ssh_banner[:50]})")
+        elif re.search(r'openssh', ssh_banner, re.IGNORECASE):
+            add('linux', 0.12, "OpenSSH banner present (common on Linux; also shipped on macOS)")
+            add('macos', 0.08, "OpenSSH banner present (common on macOS; also shipped on Linux)")
+
+    http_banner = banner_map.get('HTTP') or banner_map.get('HTTPS') or banner_map.get('HTTP-Alt') or ''
+    if http_banner:
+        if re.search(r'ubuntu|debian', http_banner, re.IGNORECASE):
+            add('linux', 0.35, "HTTP server banner identifies a Linux distribution")
+        elif re.search(r'win32|iis', http_banner, re.IGNORECASE):
+            add('windows', 0.35, "HTTP server banner indicates Windows/IIS")
+        elif re.search(r'\(unix\)', http_banner, re.IGNORECASE):
+            add('macos', 0.05, "HTTP server banner reports generic Unix (compatible with macOS, not decisive)")
+            add('linux', 0.05, "HTTP server banner reports generic Unix (compatible with Linux, not decisive)")
+
+    # 6) TTL — SUPPORTING EVIDENCE ONLY. Windows' ~128 TTL is fairly
+    #    distinctive, but the ~64 band is shared by both macOS and Linux,
+    #    so it can only nudge the score, never decide macOS vs Linux.
+    if ttl is not None:
+        if 110 <= ttl <= 130:
+            add('windows', 0.20, f"TTL {ttl} is consistent with Windows (supporting evidence only)")
+        elif 55 <= ttl <= 75:
+            add('linux', 0.10, f"TTL {ttl} is consistent with Linux or macOS (supporting evidence only, not decisive)")
+            add('macos', 0.10, f"TTL {ttl} is consistent with Linux or macOS (supporting evidence only, not decisive)")
+
+    best_os = max(scores, key=scores.get)
+    best_score = scores[best_os]
+
+    if best_score <= 0:
+        return {'os': 'unknown', 'confidence': 0.0,
+                'evidence': ['No distinguishing OS evidence was collected for this host']}
+
+    # If two or more OSes are genuinely tied at the top score (e.g. TTL 64
+    # alone, with no other signal to separate Linux from macOS), do not
+    # arbitrarily pick one — report 'unknown' rather than a coin-flip
+    # 'linux' the way the old TTL-only classifier effectively did.
+    tied = [os_name for os_name, sc in scores.items() if sc == best_score]
+    if len(tied) > 1:
+        combined_evidence = []
+        for t in tied:
+            combined_evidence.extend(evidence[t])
+        return {
+            'os': 'unknown', 'confidence': round(min(0.3, best_score), 2),
+            'evidence': [f"Evidence is ambiguous between {' and '.join(tied)}"] + combined_evidence,
+        }
+
+    confidence = round(max(0.05, min(0.97, best_score)), 2)
+    return {'os': best_os, 'confidence': confidence, 'evidence': evidence[best_os]}
 
 
 def ip_in_subnet(ip, base_ip):
@@ -1335,6 +1501,11 @@ def scan_network(base_ip=None, limit=254, progress_cb=None):
 
     total = len(candidate_ips)
 
+    # Computed once per scan (not per host) — cheap, and gives every host
+    # something to compare against for the "is this the scanner itself"
+    # evidence signal in infer_os_type().
+    local_ctx = get_local_system_context()
+
     def enrich_device(ip):
         # NOTE: this runs inside a worker thread. Never call Streamlit UI
         # functions (st.*, or a progress_cb that wraps them) from in here —
@@ -1347,16 +1518,25 @@ def scan_network(base_ip=None, limit=254, progress_cb=None):
             mac = lookup_mac_windows(ip)
 
         hostname = resolve_hostname(ip)
-        os_type = ttl_to_os(ttl)
-        is_mobile = is_mobile_device(hostname, ip, mac)
+        vendor = mac_vendor(mac)
         open_ports = scan_ports(ip, SCAN_PORTS) if ip in ping_results else []
         services, version_map, banner_map = detect_services_and_versions(ip, open_ports)
+
+        # OS is inferred AFTER services/banners are collected, so banner
+        # evidence (e.g. an SSH banner naming "Ubuntu") can be used. TTL
+        # alone is never decisive — see infer_os_type().
+        os_result = infer_os_type(ip, ttl, hostname, mac, vendor, services,
+                                   banner_map=banner_map, local_system_context=local_ctx)
+        os_type = os_result['os']
+
+        is_mobile = is_mobile_device(hostname, ip, mac)
         device_type = identify_device_type(hostname, os_type, is_mobile, services, mac)
         display_name = format_device_display_name(hostname, device_type, ip)
-        vendor = mac_vendor(mac)
 
         return {
-            'hostname': hostname, 'os': os_type, 'is_mobile': is_mobile, 'mac': mac,
+            'hostname': hostname, 'os': os_type,
+            'os_confidence': os_result['confidence'], 'os_evidence': os_result['evidence'],
+            'is_mobile': is_mobile, 'mac': mac,
             'mac_vendor': vendor, 'open_ports': open_ports, 'services': services,
             'version_map': version_map, 'banner_map': banner_map,
             'device_type': device_type, 'display_name': display_name,
@@ -1375,20 +1555,22 @@ def scan_network(base_ip=None, limit=254, progress_cb=None):
                 progress_cb(done, total)
 
     return [
-        (ip, d['hostname'], d['os'], d['is_mobile'], d['mac'], d['mac_vendor'],
-         d['open_ports'], d['services'], d['version_map'], d['banner_map'],
-         d['device_type'], d['display_name'])
+        (ip, d['hostname'], d['os'], d['os_confidence'], d['os_evidence'], d['is_mobile'],
+         d['mac'], d['mac_vendor'], d['open_ports'], d['services'], d['version_map'],
+         d['banner_map'], d['device_type'], d['display_name'])
         for ip, d in sorted(devices.items(), key=lambda item: tuple(map(int, item[0].split('.'))))
     ]
 
 
 def _parse_device_record(device):
-    (ip, hostname, os_type, is_mobile, mac, mac_vendor_, open_ports, services,
-     version_map, banner_map, device_type, display_name) = device
+    (ip, hostname, os_type, os_confidence, os_evidence, is_mobile, mac, mac_vendor_,
+     open_ports, services, version_map, banner_map, device_type, display_name) = device
     if not display_name:
         display_name = format_device_display_name(hostname, device_type, ip)
     return {
-        'ip': ip, 'hostname': hostname, 'os': os_type, 'is_mobile': is_mobile,
+        'ip': ip, 'hostname': hostname, 'os': os_type,
+        'os_confidence': os_confidence, 'os_evidence': os_evidence or [],
+        'is_mobile': is_mobile,
         'mac': mac, 'mac_vendor': mac_vendor_, 'open_ports': open_ports or [],
         'services': services or [], 'version_map': version_map or {},
         'banner_map': banner_map or {}, 'device_type': device_type,
@@ -1416,6 +1598,7 @@ def build_dynamic_graph(devices):
         G.add_node(
             node_name,
             ip=rec['ip'], hostname=rec['hostname'], os=rec['os'],
+            os_confidence=rec['os_confidence'], os_evidence=rec['os_evidence'],
             is_mobile=rec['is_mobile'], mac=rec['mac'], mac_vendor=rec['mac_vendor'],
             open_ports=rec['open_ports'], services=rec['services'],
             version_map=rec['version_map'], banner_map=rec['banner_map'],
@@ -1463,6 +1646,8 @@ def build_network():
         security = assess_device_security(services, os_type, device_type, open_ports, sim_role, ip=ip)
         G.add_node(
             name, ip=ip, role=role, display_name=name, hostname=name, os=os_type,
+            os_confidence=None,
+            os_evidence=['Simulated lab topology — OS is a fixed demo assumption, not measured from a live host'],
             open_ports=open_ports, services=services, version_map={}, banner_map={},
             device_type=device_type, criticality=security['criticality'],
             vulnerability=security['vulnerability'], exposure_level=security['exposure_level'],
@@ -2203,8 +2388,21 @@ with col_details:
             hostname_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>Hostname:</span><span style='color:#e0f4ff'>{hostname}</span></div>" if hostname else ""
 
             os_type = data.get('os', 'unknown')
+            os_confidence = data.get('os_confidence')
+            os_evidence = data.get('os_evidence') or []
             os_icon = {'windows': '🪟', 'linux': '🐧', 'macos': '🍎', 'unknown': '❓'}.get(os_type, '❓')
-            os_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:70px'>OS:</span><span style='color:#e0f4ff'>{os_icon} {os_type.upper()}</span></div>"
+            conf_suffix = f" · {int(round(os_confidence * 100))}% confidence" if isinstance(os_confidence, (int, float)) else ""
+            os_html = (
+                f"<div style='display:flex;align-items:center;margin:4px 0'>"
+                f"<span style='color:#3d6a8a;width:70px'>Inferred OS:</span>"
+                f"<span style='color:#e0f4ff'>{os_icon} {os_type.upper()}{conf_suffix}</span></div>"
+            )
+            if os_evidence:
+                os_html += (
+                    "<div style='margin:2px 0 6px 70px;font-size:0.62rem;color:#3d6a8a;line-height:1.6'>"
+                    + "".join(f"<div>✓ {html_lib.escape(str(e))}</div>" for e in os_evidence[:4])
+                    + "</div>"
+                )
 
             is_mobile = data.get('is_mobile', False)
             device_type = data.get('device_type', '')
