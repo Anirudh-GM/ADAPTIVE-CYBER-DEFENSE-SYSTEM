@@ -145,6 +145,52 @@ def run_full_demo(entry_point="User-PC", seed=100, budget=80):
     print(f"  Calculated Risk Reduction   |       --         | {comp.risk_reduction_pct:>5.1f}% REDUCTION")
     print("=" * 76 + "\n")
 
+    # ── 10. REAL-TIME CONTINUOUS MONITORING & ALERT DISPATCH CYCLE ────────
+    from acds.monitoring.monitor import ContinuousMonitoringEngine
+
+    print("\n" + "=" * 76)
+    print("  [10] REAL-TIME CONTINUOUS MONITORING & ALERT DISPATCH CYCLE")
+    print("=" * 76)
+
+    monitor = ContinuousMonitoringEngine()
+    
+    # Cycle 1: Baseline Network Snapshot
+    cycle1 = monitor.run_single_cycle(network_graph=G, custom_timestamp="2026-09-02 12:00:00 UTC")
+    print(f"\n[*] Cycle 1 Baseline Snapshot Saved:")
+    print(f"    - Tracked Assets: {cycle1.asset_count} | Overall Risk: {cycle1.recalculation.new_overall_risk:.1f}/100 | Posture: {cycle1.recalculation.new_posture_score:.1f}/100")
+
+    # Cycle 2: Network Mutation Event (Rogue device joins and Server opens Port 445)
+    G_mutated = G.copy()
+    G_mutated.add_node(
+        "192.168.1.99",
+        ip="192.168.1.99",
+        display_name="Rogue-Laptop",
+        device_type="Workstation",
+        criticality=3,
+        risk_score=68.0,
+        open_ports=[445, 135],
+        services=["SMB", "RPC"],
+        cve_findings=[],
+    )
+    # Mutate Server ports
+    if "Server" in G_mutated:
+        G_mutated.nodes["Server"]["open_ports"] = [80, 22, 445]
+        G_mutated.nodes["Server"]["services"] = ["HTTP", "SSH", "SMB"]
+        G_mutated.nodes["Server"]["risk_score"] = 88.5
+
+    cycle2 = monitor.run_single_cycle(network_graph=G_mutated, custom_timestamp="2026-09-02 12:05:00 UTC")
+    print(f"\n[*] Cycle 2 Mutation Detected & Real-Time Re-Assessment:")
+    print(f"    - Added Devices: {len(cycle2.diff.new_devices)} ({cycle2.diff.new_devices[0]['hostname']})")
+    print(f"    - Risk Shift: {cycle2.recalculation.previous_overall_risk:.1f} -> {cycle2.recalculation.new_overall_risk:.1f} ({'+' if cycle2.recalculation.risk_delta > 0 else ''}{cycle2.recalculation.risk_delta} pts)")
+    print(f"    - Real-Time Alerts Generated ({len(cycle2.alerts)}):")
+    for alt in cycle2.alerts[:4]:
+        print(f"      * [{alt.severity}] {alt.title}: {alt.description}")
+        print(f"        -> Action: {alt.suggested_action}")
+    print(f"    - Recalculated Optimal Defenses ({len(cycle2.recalculation.recommended_defense_actions)} actions, Budget Used: {cycle2.recalculation.defense_budget_used}):")
+    for act in cycle2.recalculation.recommended_defense_actions[:3]:
+        print(f"      * {act['action']} (Cost: {act['cost']}, Eff: {act['efficiency']:.2f})")
+    print("=" * 76 + "\n")
+
 
 if __name__ == "__main__":
     run_full_demo(entry_point="User-PC", seed=100, budget=80)

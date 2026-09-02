@@ -165,7 +165,67 @@ def init_database(db_path: Optional[str] = None) -> None:
         scan_id INTEGER,
         observed_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alert_id TEXT UNIQUE NOT NULL,
+        timestamp TEXT NOT NULL,
+        alert_type TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        asset_ip TEXT,
+        asset_name TEXT,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        details_json TEXT,
+        risk_before REAL,
+        risk_after REAL,
+        acknowledged BOOLEAN DEFAULT FALSE
+    );
+
+    CREATE TABLE IF NOT EXISTS cve_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        query_key TEXT UNIQUE NOT NULL,
+        cve_json TEXT NOT NULL,
+        source TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        ttl_hours INTEGER DEFAULT 24
+    );
+
+    CREATE TABLE IF NOT EXISTS scan_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_time TEXT NOT NULL,
+        scan_type TEXT NOT NULL,
+        asset_count INTEGER DEFAULT 0,
+        avg_risk REAL DEFAULT 0.0,
+        posture_score REAL DEFAULT 100.0,
+        diff_summary_json TEXT,
+        full_data_json TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS inventory_assets (
+        asset_id TEXT PRIMARY KEY,
+        ip TEXT NOT NULL,
+        hostname TEXT,
+        display_name TEXT,
+        mac TEXT,
+        mac_vendor TEXT,
+        os TEXT,
+        os_confidence REAL,
+        device_type TEXT,
+        role TEXT,
+        criticality INTEGER,
+        criticality_label TEXT,
+        risk_score REAL,
+        open_ports_json TEXT,
+        services_json TEXT,
+        status TEXT,
+        first_seen TEXT,
+        last_seen TEXT,
+        changes_detected_json TEXT,
+        scan_history_count INTEGER DEFAULT 1
+    );
     """)
 
     conn.commit()
     conn.close()
+
