@@ -1,29 +1,62 @@
 """
-ACDS Live Demonstration Script:
-Network Discovery -> Vulnerability Intelligence (Deduplication + Contextual Prioritization)
--> Simulation -> Honeypot Feedback -> Defense Optimization -> Re-simulation
+ACDS v2.1 Live Demonstration Script:
+Demonstrates the complete ACDS Core Engine v1 Pipeline:
+Discover -> Understand -> Assess -> Prioritize -> Predict -> Defend -> Explain -> Report
 """
 
 from acds.core.graph import build_network
+from acds.inventory.tracker import AssetInventoryTracker
+from acds.surface.analyzer import analyze_attack_surface
+from acds.vulnerability.adaptive_risk import calculate_adaptive_contextual_risk
+from acds.vulnerability.deduplication import deduplicate_findings
+from acds.vulnerability.prioritization import prioritize_findings, get_top_priority_findings
+from acds.posture.scorer import calculate_security_posture
+from acds.analysis.attack_paths import analyze_attack_paths
+from acds.analysis.mitre import correlate_mitre_techniques
+from acds.defense.recommendations import generate_sme_recommendations
 from acds.honeypot.behavior import extract_attacker_behavior
 from acds.adaptive.feedback import compute_adaptive_feedback_signals
 from acds.simulation.attack_engine import simulate_attack
-from acds.vulnerability.blast_radius import calculate_risk, calculate_overall_acds_risk
-from acds.vulnerability.deduplication import deduplicate_findings
-from acds.vulnerability.prioritization import prioritize_findings, get_top_priority_findings
+from acds.vulnerability.blast_radius import calculate_risk
 from acds.defense.actions import get_defense_actions, apply_defense_actions
 from acds.defense.optimizer import greedy_defense_selection
 from acds.simulation.comparison import compare_simulations
 
 
 def run_full_demo(entry_point="User-PC", seed=100, budget=80):
-    print("\n" + "=" * 70)
-    print(f"  ACDS v2.1 PIPELINE DEMO (Entry: {entry_point}, Seed: {seed}, Budget: {budget})")
-    print("=" * 70)
+    print("\n" + "=" * 76)
+    print(f"  ACDS v2.1 CORE ENGINE v1 DEMO (Entry: {entry_point}, Seed: {seed}, Budget: {budget})")
+    print("=" * 76)
 
     G = build_network()
 
-    # 1. Vulnerability Normalization & Deduplication
+    # ── 1. CONTINUOUS ASSET INVENTORY ─────────────────────────────────────
+    tracker = AssetInventoryTracker()
+    inventory = tracker.update_from_graph(G)
+    inv_summary = tracker.get_summary()
+
+    print(f"\n[1] Continuous Asset Inventory Tracker:")
+    print(f"    - Total Tracked Assets: {inv_summary['total_assets']} ({inv_summary['new_assets']} New, {inv_summary['active_assets']} Active, {inv_summary['missing_assets']} Missing)")
+    print(f"    - Criticality 4-Star/5-Star Assets: {inv_summary['critical_assets']} | Mean Asset Risk: {inv_summary['average_risk']:.1f}/100")
+    for row in tracker.to_inventory_table()[:4]:
+        print(f"      * {row['IP']:<15} | {row['Hostname']:<15} | {row['Type']:<18} | Risk: {row['Risk']:>4.1f} | Status: {row['Status']}")
+
+    # ── 2. ATTACK SURFACE MANAGEMENT ──────────────────────────────────────
+    surface = analyze_attack_surface(G)
+    surf_metrics = surface["metrics"]
+    print(f"\n[2] Attack Surface Management & Exposure Hierarchy:")
+    print(f"    - Exposed Assets: {surf_metrics['exposed_assets']} / {surf_metrics['total_assets']} ({surf_metrics['attack_surface_ratio'] * 100:.0f}% Exposure Ratio)")
+    print(f"    - Open Services: {surf_metrics['open_services_count']} (Internet-Facing: {surf_metrics['internet_facing_count']}, Database: {surf_metrics['database_services_count']}, High-Risk: {surf_metrics['high_risk_services_count']})")
+    print(f"    - Vulnerable Services: {surf_metrics['vulnerable_services_count']} | Critical Exposures: {surf_metrics['critical_exposure_count']}")
+
+    # ── 3. ADAPTIVE CONTEXTUAL RISK ENGINE ────────────────────────────────
+    web_risk = calculate_adaptive_contextual_risk(8.2, asset_criticality=4, is_internet_exposed=True)
+    dev_risk = calculate_adaptive_contextual_risk(8.2, asset_criticality=3, is_internet_exposed=False)
+    print(f"\n[3] Adaptive Contextual Risk Engine (Environmental Placement Impact):")
+    print(f"    - Public Web Server (CVSS 8.2 + Internet Facing): Risk = {web_risk['contextual_risk_score']:.1f} ({web_risk['severity']})")
+    print(f"    - Internal Dev PC  (CVSS 8.2 + Internal Only):    Risk = {dev_risk['contextual_risk_score']:.1f} ({dev_risk['severity']})")
+
+    # ── 4. VULNERABILITY DEDUPLICATION & PRIORITIZATION ───────────────────
     raw_findings = []
     ctx_map = {}
     for node, data in G.nodes(data=True):
@@ -45,75 +78,72 @@ def run_full_demo(entry_point="User-PC", seed=100, budget=80):
             raw_findings.append(rf)
 
     dedup_res = deduplicate_findings(raw_findings, asset_context_map=ctx_map)
-    print(f"\n[1] Vulnerability Intelligence Layer (VulnEx Architecture):")
-    print(f"    - Raw Findings Discovered: {dedup_res.raw_findings_count}")
-    print(f"    - Unique Logical Vulnerabilities: {dedup_res.unique_vulnerabilities_count}")
-    print(f"    - Duplicates Removed: {dedup_res.duplicates_removed_count} ({dedup_res.deduplication_rate_pct}% deduplication rate)")
-
-    # 2. Contextual Prioritization
     prioritized_vdefs = prioritize_findings(dedup_res.definitions)
-    top_5 = get_top_priority_findings(prioritized_vdefs, limit=5)
-    print(f"\n[2] Top Contextual Remediation Targets (Severity, Attack Path & Criticality):")
-    for i, t in enumerate(top_5, 1):
-        assets_str = ", ".join(t['affected_assets'])
-        print(f"    {i}. {t['cve_id']:<14} | {t['priority_level']:<2} (Score: {t['priority_score']:>4.1f}) | Host: {assets_str:<12} | Rec: {t['recommendation']}")
+    top_4 = get_top_priority_findings(prioritized_vdefs, limit=4)
 
-    # 3. Baseline Simulation
-    timeline_pre, comp_pre, hp_pre, stats_pre = simulate_attack(
-        G, entry_node=entry_point, seed=seed, ids_deployed=False, segmentation_applied=False
-    )
+    print(f"\n[4] Vulnerability Intelligence & Prioritization (VulnEx 6-Component):")
+    print(f"    - Deduplication: {dedup_res.raw_findings_count} Raw Findings -> {dedup_res.unique_vulnerabilities_count} Unique ({dedup_res.deduplication_rate_pct}% dedup rate)")
+    for i, t in enumerate(top_4, 1):
+        assets_str = ", ".join(t['affected_assets'])
+        print(f"      {i}. {t['cve_id']:<14} | {t['priority_level']:<2} (Score: {t['priority_score']:>4.1f}) | Host: {assets_str:<10} | Fix: {t['recommendation'][:55]}")
+
+    # ── 5. SECURITY POSTURE SCORE ─────────────────────────────────────────
+    posture = calculate_security_posture(G, prioritized_findings=prioritized_vdefs)
+    print(f"\n[5] Organization Security Posture Scorer:")
+    print(f"    - Overall Posture: {posture.overall_score:.1f} / 100 [{posture.rating_label}]")
+    for pillar, p_data in posture.pillar_breakdown.items():
+        print(f"      * {pillar:<28}: {p_data['score']:>4.1f} / 100 ({p_data['status']}) - {p_data['detail']}")
+
+    # ── 6. ANALYTICAL ATTACK PATH ENGINE (Passive Reachability) ───────────
+    attack_paths = analyze_attack_paths(G, entry_node=entry_point)
+    print(f"\n[6] Risk-Based Analytical Attack Path Analyzer (Passive Structural):")
+    print(f"    - Paths Identified to Crown Jewels: {len(attack_paths)}")
+    if attack_paths:
+        top_p = attack_paths[0]
+        chain_str = " -> ".join(top_p.nodes)
+        print(f"      * Most Critical Path: {chain_str} (Hops: {top_p.hop_count}, Feasibility: {top_p.path_feasibility_score:.1f}/100)")
+        print(f"      * Why: {top_p.why_explanation}")
+        print(f"      * Choke Point Countermeasure: {top_p.recommended_choke_point}")
+
+    # ── 7. MITRE ATT&CK CONTEXTUAL CORRELATION ────────────────────────────
+    mitre_findings = correlate_mitre_techniques(G)
+    print(f"\n[7] Contextual MITRE ATT&CK Mapping (Observed Services):")
+    for f in mitre_findings[:3]:
+        print(f"      * {f.technique_id} ({f.technique_name}) on {f.affected_host} [{f.risk_level}]: {f.recommended_countermeasure}")
+
+    # ── 8. SME DEFENSE RECOMMENDATIONS ────────────────────────────────────
+    sme_recs = generate_sme_recommendations(G, prioritized_findings=prioritized_vdefs, limit=3)
+    print(f"\n[8] SME-Readable Action Recommendations:")
+    for rec in sme_recs:
+        print(f"      [{rec.priority_tier}] {rec.title}: {rec.recommended_action}")
+        print(f"          Reason: {rec.technical_reason}")
+        print(f"          Business Impact: {rec.business_impact}")
+
+    # ── 9. BASELINE SIMULATION & KNAPSACK OPTIMIZATION ────────────────────
+    timeline_pre, comp_pre, hp_pre, stats_pre = simulate_attack(G, entry_node=entry_point, seed=seed)
     risk_pre, blast_pre = calculate_risk(G, comp_pre, timeline_pre, hp_pre, stats_pre)
 
-    print(f"\n[3] Baseline Attack Simulation:")
-    print(f"    - Compromised Assets ({len(comp_pre)}): {list(comp_pre)}")
-    print(f"    - Honeypot Decoy Trap Sprung: {hp_pre}")
-    print(f"    - Network Blast Radius: Spread={blast_pre['spread']}%, Critical Impact={blast_pre['critical_impact']}%, Depth={blast_pre['depth']}%")
-    print(f"    - Pre-Defense Risk Score: {risk_pre}/100")
-
-    # 4. Honeypot Behavioral Feedback
-    adaptive_multipliers = {}
-    if hp_pre:
-        hp_obs = stats_pre.get("honeypot_observations", [])
-        profiles = extract_attacker_behavior(hp_obs)
-        signals = compute_adaptive_feedback_signals(G, profiles)
-        adaptive_multipliers = {n: d["defense_multiplier"] for n, d in signals.get("affected_nodes", {}).items()}
-        print(f"\n[4] Adaptive Honeypot Behavioral Telemetry:")
-        print(f"    - Adversary Probed Protocols: {signals['targeted_services']}")
-        print(f"    - Assets in Adversary's Path: {list(signals['affected_nodes'].keys())}")
-        print(f"    - Defense Priority Multiplier (1.35x) applied to targeted nodes.")
-
-    # 5. Defense Knapsack Optimization (Consumes Prioritized Vulnerabilities)
-    print(f"\n[5] Defense Knapsack Optimization (Budget: {budget} units):")
-    candidates = get_defense_actions(
-        G, comp_pre, risk_pre, adaptive_multipliers=adaptive_multipliers, prioritized_vulnerabilities=prioritized_vdefs
-    )
+    candidates = get_defense_actions(G, comp_pre, risk_pre, prioritized_vulnerabilities=prioritized_vdefs)
     selected, total_red, remaining = greedy_defense_selection(candidates, budget=budget)
-
-    for i, act in enumerate(selected, 1):
-        print(f"    {i}. {act['action']:<40} | Cost: {act['cost']:>2} | Est. Red: {act['risk_reduction']:>4.1f} | Eff: {act['efficiency']:.2f}")
-    print(f"    => Budget Used: {budget - remaining} / {budget} units")
-
-    # 6. Model Mutation & Re-Simulation
     applied, ids_dep, seg_app = apply_defense_actions(G, selected)
+
     timeline_post, comp_post, hp_post, stats_post = simulate_attack(
         G, entry_node=entry_point, seed=seed, ids_deployed=ids_dep, segmentation_applied=seg_app
     )
     risk_post, blast_post = calculate_risk(G, comp_post, timeline_post, hp_post, stats_post)
-
-    # 7. Comparison
     comp = compare_simulations(risk_pre, risk_post, blast_pre, blast_post, budget_used=budget - remaining, applied_actions=applied)
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 76)
     print("                    BEFORE VS AFTER VERIFICATION")
-    print("=" * 70)
+    print("=" * 76)
     print(f"  Metric                      | BEFORE           | AFTER")
     print(f"  ----------------------------+------------------+------------------")
     print(f"  Simulated Risk Score        | {risk_pre:>5.1f} / 100    | {risk_post:>5.1f} / 100")
     print(f"  Compromised Systems         | {comp.systems_compromised_before:>5} nodes      | {comp.systems_compromised_after:>5} nodes")
     print(f"  Critical Assets Reached     | {comp.critical_reached_before:>5} assets     | {comp.critical_reached_after:>5} assets")
     print(f"  Max Lateral Hops (Depth)    | {comp.max_depth_before:>5} hops       | {comp.max_depth_after:>5} hops")
-    print(f"  Calculated Risk Reduction   |       —          | {comp.risk_reduction_pct:>5.1f}% REDUCTION")
-    print("=" * 70 + "\n")
+    print(f"  Calculated Risk Reduction   |       --         | {comp.risk_reduction_pct:>5.1f}% REDUCTION")
+    print("=" * 76 + "\n")
 
 
 if __name__ == "__main__":
