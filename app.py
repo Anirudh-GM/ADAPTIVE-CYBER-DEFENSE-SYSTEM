@@ -575,11 +575,49 @@ h1, h2, h3 {
     font-family: 'Material Symbols Outlined', sans-serif !important;
     font-size: 0 !important;
     line-height: 1 !important;
-}
 [data-testid="stSidebarCollapseButton"] span[data-testid="stIconMaterial"]::after,
 [data-testid="collapsedControl"] span[data-testid="stIconMaterial"]::after {
     font-size: 1rem;
     content: '\\21C4';
+}
+
+/* Futuristic Cyberpunk Tab Navigation */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 8px;
+    background-color: #060d15;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid #1a3a5c;
+    margin-bottom: 20px;
+}
+.stTabs [data-baseweb="tab"] {
+    font-family: var(--font-display), monospace;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: #7ab8d4;
+    border-radius: 4px;
+    padding: 10px 18px;
+    transition: all 0.25s ease;
+    border: 1px solid transparent;
+    background: transparent;
+}
+.stTabs [data-baseweb="tab"]:hover {
+    color: #00d4ff;
+    background: rgba(0, 212, 255, 0.08);
+    border-color: rgba(0, 212, 255, 0.3);
+}
+.stTabs [aria-selected="true"] {
+    color: #00d4ff !important;
+    background: rgba(0, 212, 255, 0.15) !important;
+    border-color: #00d4ff !important;
+    box-shadow: 0 0 15px rgba(0, 212, 255, 0.25);
+}
+.stTabs [data-baseweb="tab-border"] {
+    display: none;
+}
+.stTabs [data-baseweb="tab-highlight"] {
+    background-color: #00d4ff;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -2477,18 +2515,19 @@ def calculate_risk(G, compromised_nodes, timeline, honeypot_triggered, attack_st
     real_nodes = [n for n in G.nodes if G.nodes[n].get("node_type") != "honeypot"]
     real_compromised = [n for n in compromised_nodes if G.nodes[n].get("node_type") != "honeypot"]
 
-    spread = len(real_compromised) / max(len(real_nodes), 1)
+    spread = min(1.0, len(real_compromised) / max(len(real_nodes), 1))
     all_criticality = sum(G.nodes[n]["criticality"] for n in real_nodes)
     compromised_criticality = sum(G.nodes[n]["criticality"] for n in real_compromised)
-    critical_impact = compromised_criticality / max(all_criticality, 1)
+    critical_impact = min(1.0, compromised_criticality / max(all_criticality, 1))
 
     max_timestep = max((t["timestep"] for t in timeline), default=1)
-    depth = max_timestep / max(total_nodes, 1)
+    depth = min(1.0, max_timestep / max(total_nodes, 1))
 
     R = (W1 * spread) + (W2 * critical_impact) + (W3 * depth)
     risk_score = R * 100
     if honeypot_triggered:
-        risk_score = min(100, risk_score + 15)
+        risk_score += 15
+    risk_score = max(0.0, min(100.0, risk_score))
 
     stats = attack_stats or {}
     blast_details = {
@@ -4086,19 +4125,7 @@ with st.sidebar:
                 st.session_state.monitoring_enabled = False
                 st.rerun()
 
-        if st.session_state.monitoring_enabled:
-            st.markdown(
-                f'<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#00ff88">'
-                f'🟢 LIVE — scanning every {interval_choice}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(
-                '<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a">'
-                '⚫ Monitoring stopped</div>', unsafe_allow_html=True)
-        if st.session_state.monitor_last_error:
-            st.warning(f"Last monitoring pass failed safely: {st.session_state.monitor_last_error}")
-
     st.markdown('<div class="section-header">⚙ SIMULATION CONTROLS</div>', unsafe_allow_html=True)
-
     all_nodes = list(st.session_state.G.nodes)
     if not all_nodes:
         st.warning("No devices in graph. Scan your network first (Real Network Scan mode).")
@@ -4109,33 +4136,10 @@ with st.sidebar:
         entry_node = st.selectbox(
             "Entry Point (Initially Compromised System)", all_nodes,
             index=min(1, len(all_nodes) - 1),
-            help="The system where the attacker first gained access (phishing, stolen laptop, etc.)",
         )
 
     show_honeypot = st.checkbox("Show Honeypot Node (simulation view)", value=True)
     animation_speed = st.slider("Animation Speed (sec/step)", 0.3, 2.0, 0.6, 0.1)
-
-    st.markdown('<div class="section-header">📡 NETWORK STATUS</div>', unsafe_allow_html=True)
-    for node, data in st.session_state.G.nodes(data=True):
-        status_class = "dot-compromised" if data["compromised"] else \
-                       "dot-honeypot" if data.get("node_type") == "honeypot" else "dot-safe"
-        label = "🔴" if data["compromised"] else "🟢" if data.get("isolated") else "🟡" if data.get("node_type") == "honeypot" else "🟢"
-        display_name = data.get('display_name') or node.replace("\n", " / ")
-        st.markdown(
-            f'<div style="font-family:Share Tech Mono;font-size:0.72rem;padding:3px 0;color:#7ab8d4">'
-            f'<span class="status-dot {status_class}"></span>{display_name} '
-            f'<span style="color:#3d6a8a">({data["ip"]})</span></div>',
-            unsafe_allow_html=True
-        )
-
-    st.markdown('<hr style="border-color:#1a3a5c;margin:12px 0">', unsafe_allow_html=True)
-    st.markdown(
-        '<div style="font-family:Share Tech Mono;font-size:0.6rem;color:#3d6a8a;text-align:center">'
-        'PASSIVE SCANNING ONLY — NO EXPLOITS PERFORMED<br>'
-        'CVE DATA FROM NIST NVD WHERE AVAILABLE<br>MITRE ATT&CK ALIGNED</div>',
-        unsafe_allow_html=True
-    )
-
 
 # ─────────────────────────────────────────────────────────────────
 # MAIN LAYOUT
@@ -4148,36 +4152,8 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if st.session_state.network_mode == "Real Network Scan":
-    st.markdown("""
-    <div style='background:rgba(255,140,0,0.06);border:1px solid #ff8c00;border-left:4px solid #ff8c00;
-         padding:12px 18px;font-family:Share Tech Mono;font-size:0.72rem;color:#ff8c00;
-         line-height:1.9;margin-bottom:16px'>
-        <b>⚠ REAL NETWORK MODE — passive scan only</b><br>
-        <span style='color:#7ab8d4'>
-        • Device + service detection via ping/ARP/port scan + real banner grabbing<br>
-        • Vulnerabilities matched against live NIST NVD CVE data for the exact version found<br>
-        • Attack simulation shows lateral movement depth &amp; systems controlled (probabilistic model only)<br>
-        • Use <b style='color:#ff8c00'>SCAN NETWORK</b> then pick the compromised entry point
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
-else:
-    st.markdown("""
-    <div style='background:rgba(0,212,255,0.04);border:1px solid #1a3a5c;border-left:4px solid #00d4ff;
-         padding:8px 16px;font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin-bottom:16px'>
-        MODE: <span style='color:#00d4ff'>SIMULATED LAB</span> &nbsp;|&nbsp; 7-NODE DEMO TOPOLOGY &nbsp;|&nbsp; MITRE ATT&CK ALIGNED
-    </div>
-    """, unsafe_allow_html=True)
-
 # ─────────────────────────────────────────────────────────────────
 # SPRINT 3 — PHASE 3: EXECUTIVE CYBER DASHBOARD (top KPI row)
-# Reads Total Assets / Critical Assets / Active Alerts from the
-# persisted SQLite layer (core/database.py) so these numbers are
-# meaningful even before this session has run a scan — falling back
-# to the live in-memory graph only when the DB has nothing yet (e.g.
-# a brand-new install). Active Vulnerabilities and Overall ACDS Risk
-# come from the live model, same as the rest of the app.
 # ─────────────────────────────────────────────────────────────────
 asset_metrics = get_asset_metrics(st.session_state.G)
 _db_asset_count = monitor_db.get_asset_count()
@@ -4188,175 +4164,124 @@ _critical_assets = (sum(1 for a in _db_live_assets if (_safe_int(a.get("critical
                      if _db_live_assets else
                      sum(1 for _, d in st.session_state.G.nodes(data=True) if (d.get("criticality") or 0) >= 4))
 _active_vulns = len(vuln_dedup.deduplicate_findings(st.session_state.G))
-_overall_obj = st.session_state.get("overall_acds_risk")
+_overall_obj = st.session_state.get("overall_acds_risk") or calculate_overall_acds_risk(st.session_state.G, st.session_state.risk_score)
 _overall_display = f"{_overall_obj['overall_score']}/100" if _overall_obj and _overall_obj.get("overall_score") is not None else "—"
 _active_alerts = len(monitor_db.get_alerts(limit=500))
 
-st.markdown('<div class="section-header">🏠 EXECUTIVE CYBER DASHBOARD</div>', unsafe_allow_html=True)
-k1, k2, k3, k4, k5, k6 = st.columns(6)
-with k1:
-    st.metric("TOTAL ASSETS", _total_assets)
-with k2:
-    st.metric("CRITICAL ASSETS", _critical_assets)
-with k3:
-    st.metric("ACTIVE VULNERABILITIES", _active_vulns)
-with k4:
-    st.metric("OVERALL ACDS RISK", _overall_display)
-with k5:
-    st.metric("ACTIVE ALERTS", _active_alerts)
-with k6:
-    st.metric("AVERAGE RISK", f"{asset_metrics['average_risk']}")
+# Pre-calculate overall ACDS risk
+overall = _overall_obj
 
-m1, m2, m3, m4, m5 = st.columns(5)
-with m1:
-    st.metric("HIGH", asset_metrics["high"])
-with m2:
-    st.metric("MEDIUM", asset_metrics["medium"])
-with m3:
-    st.metric("LOW", asset_metrics["low"])
-with m4:
-    st.metric("SERVERS", asset_metrics["servers"])
-with m5:
-    st.metric("OTHER DEVICES", asset_metrics["other_devices"])
+# Helper definitions for UI components
+_CHANGE_ICONS = {
+    "NEW_ASSET": "🟢", "REMOVED_ASSET": "⚫", "NEW_PORT": "🟠",
+    "CLOSED_PORT": "🔵", "SERVICE_CHANGED": "🟡", "VERSION_CHANGED": "🟣",
+}
 
-st.markdown('<hr style="border-color:#1a3a5c;margin:8px 0 20px 0">', unsafe_allow_html=True)
+def _render_change_entry(c):
+    icon = _CHANGE_ICONS.get(c["type"], "⚪")
+    if c["type"] == "NEW_ASSET":
+        body = f"New device detected<br><b>{c['asset']}</b>" + (f" &middot; {c['hostname']}" if c.get('hostname') else "")
+        label = "New device detected"
+    elif c["type"] == "REMOVED_ASSET":
+        body = f"Device offline<br><b>{c['asset']}</b>"
+        label = "Device offline"
+    elif c["type"] == "NEW_PORT":
+        body = f"New port opened<br><b>{c['asset']}</b><br>{c['port']} / {c.get('service') or 'unknown'}"
+        label = "New port opened"
+    elif c["type"] == "CLOSED_PORT":
+        body = f"Port closed<br><b>{c['asset']}</b><br>{c['port']} / {c.get('service') or 'unknown'}"
+        label = "Port closed"
+    elif c["type"] == "SERVICE_CHANGED":
+        body = f"Service changed<br><b>{c['asset']}</b><br>port {c['port']}: {c.get('before_service')} → {c.get('after_service')}"
+        label = "Service changed"
+    else:  # VERSION_CHANGED
+        body = f"Version changed<br><b>{c['asset']}</b><br>{c.get('service')} {c.get('before_version')} → {c.get('after_version')}"
+        label = "Version changed"
+    sev = c.get("severity", "LOW")
+    sev_color = {"HIGH": "#ff3355", "MEDIUM": "#ff8c00", "LOW": "#3d6a8a"}.get(sev, "#3d6a8a")
+    st.markdown(f"""
+    <div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+         padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid {sev_color}">
+        <span style="font-size:0.9rem">{icon}</span>
+        <span style="color:#e0f4ff;margin-left:4px">{label}</span>
+        <span style="float:right;color:{sev_color};font-size:0.6rem">{sev}</span>
+        <div style="margin-top:4px;color:#7ab8d4">{body}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────
-# SPRINT 1 — PHASES 6/7: LIVE ASSET INVENTORY + NETWORK CHANGES
-# Persists independently of attack simulation / defense state, so it
-# stays visible and current for as long as monitoring has ever run —
-# even before a simulation is started (Phases 5/6/7 are pure
-# discovery + change detection, no attack/risk logic here).
-# ─────────────────────────────────────────────────────────────────
-if st.session_state.network_mode == "Real Network Scan":
-
-    _CHANGE_ICONS = {
-        "NEW_ASSET": "🟢", "REMOVED_ASSET": "⚫", "NEW_PORT": "🟠",
-        "CLOSED_PORT": "🔵", "SERVICE_CHANGED": "🟡", "VERSION_CHANGED": "🟣",
-    }
-
-    def _render_change_entry(c):
-        icon = _CHANGE_ICONS.get(c["type"], "⚪")
-        if c["type"] == "NEW_ASSET":
-            body = f"New device detected<br><b>{c['asset']}</b>" + (f" &middot; {c['hostname']}" if c.get('hostname') else "")
-            label = "New device detected"
-        elif c["type"] == "REMOVED_ASSET":
-            body = f"Device offline<br><b>{c['asset']}</b>"
-            label = "Device offline"
-        elif c["type"] == "NEW_PORT":
-            body = f"New port opened<br><b>{c['asset']}</b><br>{c['port']} / {c.get('service') or 'unknown'}"
-            label = "New port opened"
-        elif c["type"] == "CLOSED_PORT":
-            body = f"Port closed<br><b>{c['asset']}</b><br>{c['port']} / {c.get('service') or 'unknown'}"
-            label = "Port closed"
-        elif c["type"] == "SERVICE_CHANGED":
-            body = f"Service changed<br><b>{c['asset']}</b><br>port {c['port']}: {c.get('before_service')} → {c.get('after_service')}"
-            label = "Service changed"
-        else:  # VERSION_CHANGED
-            body = f"Version changed<br><b>{c['asset']}</b><br>{c.get('service')} {c.get('before_version')} → {c.get('after_version')}"
-            label = "Version changed"
-        sev = c.get("severity", "LOW")
-        sev_color = {"HIGH": "#ff3355", "MEDIUM": "#ff8c00", "LOW": "#3d6a8a"}.get(sev, "#3d6a8a")
-        st.markdown(f"""
-        <div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
-             padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid {sev_color}">
-            <span style="font-size:0.9rem">{icon}</span>
-            <span style="color:#e0f4ff;margin-left:4px">{label}</span>
-            <span style="float:right;color:{sev_color};font-size:0.6rem">{sev}</span>
-            <div style="margin-top:4px;color:#7ab8d4">{body}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    def _render_monitoring_panel():
-        if st.session_state.monitoring_enabled:
-            run_monitoring_iteration()
-
-        counts = monitor_db.get_asset_count()
-        last_run = st.session_state.monitor_last_run
-        last_run_txt = last_run.strftime("%Y-%m-%d %H:%M:%S UTC") if last_run else "never"
-        st.markdown(
-            f'<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin-bottom:6px">'
-            f'Tracked assets: <span style="color:#00d4ff">{counts["total"]}</span> total, '
-            f'<span style="color:#00ff88">{counts["online"]}</span> online &middot; '
-            f'last monitoring pass: <span style="color:#7ab8d4">{last_run_txt}</span> &middot; '
-            f'passes run this session: {st.session_state.monitor_run_count}</div>',
-            unsafe_allow_html=True,
-        )
-
-        live_col, changes_col = st.columns([3, 2], gap="medium")
-
-        with live_col:
-            st.markdown('<div class="section-header">📡 LIVE ASSET INVENTORY</div>', unsafe_allow_html=True)
-            live_assets = monitor_db.get_live_assets()
-            if not live_assets:
-                st.markdown(
-                    '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
-                    'No assets tracked yet — run SCAN NETWORK or START MONITORING.</div>',
-                    unsafe_allow_html=True)
-            else:
-                rows_html = []
-                for a in live_assets:
-                    dot = "🟢" if a["status"] == "ONLINE" else "⚫"
-                    rows_html.append(
-                        f"<tr style='border-bottom:1px solid #1a3a5c'>"
-                        f"<td style='padding:4px 6px'>{dot} {a['status']}</td>"
-                        f"<td style='padding:4px 6px'>{a['ip_address'] or '—'}</td>"
-                        f"<td style='padding:4px 6px'>{a['hostname'] or '—'}</td>"
-                        f"<td style='padding:4px 6px'>{a['device_type'] or '—'}</td>"
-                        f"<td style='padding:4px 6px'>{a['operating_system'] or '—'}</td>"
-                        f"<td style='padding:4px 6px'>{a['vendor'] or '—'}</td>"
-                        f"<td style='padding:4px 6px'>{(a['first_seen'] or '')[:19]}</td>"
-                        f"<td style='padding:4px 6px'>{(a['last_seen'] or '')[:19]}</td>"
-                        f"</tr>"
-                    )
-                st.markdown(f"""
-                <div style="max-height:340px;overflow-y:auto">
-                <table style="width:100%;border-collapse:collapse;font-family:Share Tech Mono;
-                       font-size:0.62rem;color:#7ab8d4">
-                <thead><tr style="color:#00d4ff;border-bottom:1px solid #00d4ff">
-                <th style='text-align:left;padding:4px 6px'>Status</th>
-                <th style='text-align:left;padding:4px 6px'>IP</th>
-                <th style='text-align:left;padding:4px 6px'>Hostname</th>
-                <th style='text-align:left;padding:4px 6px'>Device</th>
-                <th style='text-align:left;padding:4px 6px'>OS</th>
-                <th style='text-align:left;padding:4px 6px'>Vendor</th>
-                <th style='text-align:left;padding:4px 6px'>First Seen</th>
-                <th style='text-align:left;padding:4px 6px'>Last Seen</th>
-                </tr></thead>
-                <tbody>{''.join(rows_html)}</tbody>
-                </table>
-                </div>
-                """, unsafe_allow_html=True)
-
-        with changes_col:
-            st.markdown('<div class="section-header">🔔 NETWORK CHANGES</div>', unsafe_allow_html=True)
-            changes = st.session_state.monitor_last_changes
-            if not changes:
-                st.markdown(
-                    '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
-                    'No changes detected since the last monitoring pass.</div>',
-                    unsafe_allow_html=True)
-            else:
-                for c in changes[:25]:
-                    _render_change_entry(c)
-
+def _render_monitoring_panel():
     if st.session_state.monitoring_enabled:
-        # st.fragment(run_every=...) reruns ONLY this function on the chosen
-        # interval — no manual threads, no blocking loops, and the rest of
-        # the Streamlit app (sidebar, simulation controls) stays fully
-        # responsive in between (Phase 5 requirements).
-        st.fragment(run_every=st.session_state.monitor_interval)(_render_monitoring_panel)()
-    else:
-        _render_monitoring_panel()
+        run_monitoring_iteration()
 
-    st.markdown('<hr style="border-color:#1a3a5c;margin:8px 0 20px 0">', unsafe_allow_html=True)
+    counts = monitor_db.get_asset_count()
+    last_run = st.session_state.monitor_last_run
+    last_run_txt = last_run.strftime("%Y-%m-%d %H:%M:%S UTC") if last_run else "never"
+    st.markdown(
+        f'<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin-bottom:6px">'
+        f'Tracked assets: <span style="color:#00d4ff">{counts["total"]}</span> total, '
+        f'<span style="color:#00ff88">{counts["online"]}</span> online &middot; '
+        f'last monitoring pass: <span style="color:#7ab8d4">{last_run_txt}</span> &middot; '
+        f'passes run this session: {st.session_state.monitor_run_count}</div>',
+        unsafe_allow_html=True,
+    )
 
-# ─────────────────────────────────────────────────────────────────
-# SPRINT 3 — PHASE 5: LIVE RECENT CHANGES PANEL (read entirely from
-# SQLite via monitor_db.get_recent_timeline() — a scrolling history
-# across restarts, not just this session's last monitoring pass).
-# Shown regardless of network mode, same as Alerts/Risk Trend below.
-# ─────────────────────────────────────────────────────────────────
+    live_col, changes_col = st.columns([3, 2], gap="medium")
+
+    with live_col:
+        st.markdown('<div class="section-header">📡 LIVE ASSET INVENTORY</div>', unsafe_allow_html=True)
+        live_assets = monitor_db.get_live_assets()
+        if not live_assets:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+                'No assets tracked yet — run SCAN NETWORK or START MONITORING.</div>',
+                unsafe_allow_html=True)
+        else:
+            rows_html = []
+            for a in live_assets:
+                dot = "🟢" if a["status"] == "ONLINE" else "⚫"
+                rows_html.append(
+                    f"<tr style='border-bottom:1px solid #1a3a5c'>"
+                    f"<td style='padding:4px 6px'>{dot} {a['status']}</td>"
+                    f"<td style='padding:4px 6px'>{a['ip_address'] or '—'}</td>"
+                    f"<td style='padding:4px 6px'>{a['hostname'] or '—'}</td>"
+                    f"<td style='padding:4px 6px'>{a['device_type'] or '—'}</td>"
+                    f"<td style='padding:4px 6px'>{a['operating_system'] or '—'}</td>"
+                    f"<td style='padding:4px 6px'>{a['vendor'] or '—'}</td>"
+                    f"<td style='padding:4px 6px'>{(a['first_seen'] or '')[:19]}</td>"
+                    f"<td style='padding:4px 6px'>{(a['last_seen'] or '')[:19]}</td>"
+                    f"</tr>"
+                )
+            st.markdown(f"""
+            <div style="max-height:340px;overflow-y:auto">
+            <table style="width:100%;border-collapse:collapse;font-family:Share Tech Mono;
+                   font-size:0.62rem;color:#7ab8d4">
+            <thead><tr style="color:#00d4ff;border-bottom:1px solid #00d4ff">
+            <th style='text-align:left;padding:4px 6px'>Status</th>
+            <th style='text-align:left;padding:4px 6px'>IP</th>
+            <th style='text-align:left;padding:4px 6px'>Hostname</th>
+            <th style='text-align:left;padding:4px 6px'>Device</th>
+            <th style='text-align:left;padding:4px 6px'>OS</th>
+            <th style='text-align:left;padding:4px 6px'>Vendor</th>
+            <th style='text-align:left;padding:4px 6px'>First Seen</th>
+            <th style='text-align:left;padding:4px 6px'>Last Seen</th>
+            </tr></thead>
+            <tbody>{''.join(rows_html)}</tbody>
+            </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with changes_col:
+        st.markdown('<div class="section-header">🔔 NETWORK CHANGES</div>', unsafe_allow_html=True)
+        changes = st.session_state.monitor_last_changes
+        if not changes:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+                'No changes detected since the last monitoring pass.</div>',
+                unsafe_allow_html=True)
+        else:
+            for c in changes[:25]:
+                _render_change_entry(c)
+
 _TIMELINE_ICONS = {
     "NEW_ASSET": "🟢", "REMOVED_ASSET": "⚫", "NEW_PORT": "🟠", "CLOSED_PORT": "🔵",
     "SERVICE_CHANGED": "🟡", "VERSION_CHANGED": "🟣",
@@ -4368,7 +4293,6 @@ _TIMELINE_LABELS = {
     "SERVICE_CHANGED": "Service Changed", "VERSION_CHANGED": "Version Changed",
     "RISK_INCREASE": "Overall Risk Increased", "RISK_DECREASE": "Risk Reduced",
 }
-
 
 def render_recent_changes_timeline():
     st.markdown('<div class="section-header">📜 RECENT CHANGES</div>', unsafe_allow_html=True)
@@ -4402,18 +4326,6 @@ def render_recent_changes_timeline():
         f"<div style='max-height:340px;overflow-y:auto;background:#0a1520;border:1px solid #1a3a5c;padding:4px 10px'>"
         f"{''.join(entries_html)}</div>", unsafe_allow_html=True)
 
-
-render_recent_changes_timeline()
-st.markdown('<hr style="border-color:#1a3a5c;margin:8px 0 20px 0">', unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────────
-# SPRINT 2 — PHASE 7: REAL-TIME ALERT ENGINE (UI)
-# PHASE 8: RISK TREND VISUALIZATION (UI)
-# PHASE 9: CVE / VULNERABILITY LIFECYCLE (UI)
-# Shown regardless of network mode (Simulated Lab produces alerts/history
-# too, once a scan or simulation has fed the pipeline at least once).
-# ─────────────────────────────────────────────────────────────────
-
 _ALERT_SEVERITY_COLOR = {
     "CRITICAL": "#ff3355", "HIGH": "#ff8c00", "MEDIUM": "#ffd700",
     "LOW": "#3d6a8a", "INFO": "#00d4ff",
@@ -4422,7 +4334,6 @@ _ALERT_TYPE_ICON = {
     "NEW_CVE": "🧬", "RISK_INCREASE": "📈", "RISK_DECREASE": "📉",
     "CRITICAL_ASSET_EXPOSED": "🚨", "NEW_EXPOSURE_PATH": "🛣", "HONEYPOT_PATH": "🍯",
 }
-
 
 def _render_alert_card(a):
     sev = a.get("severity", "INFO")
@@ -4446,552 +4357,203 @@ def _render_alert_card(a):
     </div>
     """, unsafe_allow_html=True)
 
+def _evidence_block(title, evidence_list, color="#3d6a8a"):
+    if not evidence_list:
+        return ""
+    items = "".join(f"<div>✓ {html_lib.escape(str(e))}</div>" for e in evidence_list[:4])
+    return (f"<div style='margin:2px 0 6px 70px;font-size:0.62rem;color:{color};line-height:1.6'>{items}</div>")
 
-st.markdown('<div class="section-header">🚨 REAL-TIME ALERTS</div>', unsafe_allow_html=True)
-alerts_to_show = st.session_state.get("alerts") or monitor_db.get_alerts(limit=25)
-if not alerts_to_show:
-    st.markdown(
-        '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
-        'No alerts yet — alerts fire automatically the first time a scan, monitoring pass, or '
-        'simulation detects a risk increase, a new CVE, a newly exposed critical asset, a new '
-        'exposure path, or a honeypot hit.</div>', unsafe_allow_html=True)
-else:
-    sev_filter = st.multiselect("Filter by severity", ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
-                                 default=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"], key="alert_sev_filter")
-    shown = [a for a in alerts_to_show if a.get("severity") in sev_filter][:25]
-    for a in shown:
-        _render_alert_card(a)
+def render_node_panel(active_node=None, selected_node=None):
+    html = ""
+    for node, data in st.session_state.G.nodes(data=True):
+        if selected_node and node != selected_node:
+            continue
+        is_comp = data["compromised"]
+        ntype = data.get("node_type", "endpoint")
+        is_honey = ntype == "honeypot"
+        is_active = node == active_node
+        is_isolated = data.get("isolated", False)
 
-st.markdown('<hr style="border-color:#1a3a5c;margin:14px 0 20px 0">', unsafe_allow_html=True)
+        card_class = "compromised" if is_comp else "honeypot" if is_honey else "safe"
+        if is_active:
+            card_class = "compromised"
 
-# ─────────────────────────────────────────────────────────────────
-# SPRINT 3 — PHASE 6: DEDICATED ALERT CENTER
-# Full history (not capped to the last 25 like the live glance above),
-# with severity filter, free-text search (IP / hostname / CVE / alert
-# type all live in asset/title/description/alert_type, so one search
-# box covers all four per the sprint spec), and acknowledgement that
-# is stored in SQLite and never deletes the underlying alert.
-# ─────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">🎯 ALERT CENTER</div>', unsafe_allow_html=True)
+        status_icon = ("🔴 COMPROMISED (simulated)" if is_comp else
+                        "🟢 ISOLATED (defense applied)" if is_isolated else
+                        "⚠ ALERT" if (is_honey and st.session_state.honeypot_triggered) else
+                        "🟡 DECOY" if is_honey else "🔵 OBSERVED SECURE")
+        if is_active:
+            status_icon = "💥 UNDER SIMULATED ATTACK"
 
-ac_col1, ac_col2, ac_col3 = st.columns([1.3, 2, 1.3])
-with ac_col1:
-    ac_severity = st.selectbox("Filter", ["All", "Critical", "High", "Medium", "Low", "Info"],
-                                key="alert_center_severity", help="Show only alerts at this severity level.")
-with ac_col2:
-    ac_search = st.text_input("Search by IP, hostname, CVE, or alert type",
-                               key="alert_center_search", placeholder="e.g. 192.168.1.12, CVE-2024-…, RISK_INCREASE",
-                               help="Matches against the asset, title, description, and alert type fields.")
-with ac_col3:
-    ac_show_acked = st.checkbox("Show acknowledged", value=False, key="alert_center_show_acked",
-                                 help="Acknowledged alerts are hidden by default but never deleted.")
+        crit_label = data.get('criticality_label', 'Unknown')
+        crit_stars = "★" * data["criticality"] + "☆" * (5 - data["criticality"])
+        crit_conf = data.get('criticality_confidence')
+        conf_str = f" ({int(crit_conf*100)}% confidence)" if isinstance(crit_conf, (int, float)) else ""
 
-ac_results = monitor_db.get_alerts(
-    limit=300,
-    severity=None if ac_severity == "All" else ac_severity.upper(),
-    search=ac_search.strip() if ac_search else None,
-    acknowledged=None if ac_show_acked else False,
-)
+        hostname = data.get('hostname', '')
+        hostname_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Hostname:</span><span style='color:#e0f4ff'>{hostname}</span></div>" if hostname else ""
 
-st.markdown(
-    f"<div style='font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin-bottom:6px'>"
-    f"{len(ac_results)} alert(s) matching current filters</div>", unsafe_allow_html=True)
-
-if not ac_results:
-    st.markdown(
-        '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
-        'No alerts match these filters.</div>', unsafe_allow_html=True)
-else:
-    for a in ac_results[:100]:
-        sev = a.get("severity", "INFO")
-        color = _ALERT_SEVERITY_COLOR.get(sev, "#3d6a8a")
-        icon = _ALERT_TYPE_ICON.get(a.get("alert_type"), "🔔")
-        ts = (a.get("timestamp") or "")[:19].replace("T", " ")
-        is_acked = bool(a.get("acknowledged"))
-        card_col, btn_col = st.columns([5, 1])
-        with card_col:
-            delta_html = ""
-            if a.get("old_value") and a.get("new_value"):
-                delta_html = (f"<div style='color:#e0f4ff;font-family:Orbitron,monospace;font-size:0.75rem;margin-top:3px'>"
-                               f"{html_lib.escape(str(a['old_value']))} → {html_lib.escape(str(a['new_value']))}</div>")
-            ack_badge = (f"<span style='color:#00ff88;font-size:0.6rem;margin-left:8px'>✔ ACKNOWLEDGED "
-                         f"{(a.get('acknowledged_at') or '')[:16].replace('T',' ')}</span>") if is_acked else ""
-            st.markdown(f"""
-            <div style='background:#0d1f2d;border:1px solid {color};border-left:4px solid {color};
-                 padding:9px 12px;margin:4px 0;font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
-                 opacity:{0.6 if is_acked else 1}'>
-                <div style='display:flex;justify-content:space-between;align-items:center'>
-                    <span style='color:{color};font-weight:bold'>{icon} {sev} — {a.get("title","")}</span>
-                    <span style='color:#3d6a8a;font-size:0.6rem'>{ts}</span>
-                </div>
-                <div style='color:#e0f4ff;margin-top:2px'>Asset: {html_lib.escape(str(a.get("asset") or "—"))}
-                    <span style='color:#3d6a8a'>· {a.get("alert_type","")}</span>{ack_badge}</div>
-                <div style='margin-top:2px'>{html_lib.escape(str(a.get("description") or ""))}</div>
-                {delta_html}
-            </div>
-            """, unsafe_allow_html=True)
-        with btn_col:
-            if not is_acked:
-                if st.button("✅ Ack", key=f"ack_alert_{a['id']}", use_container_width=True,
-                             help="Mark this alert acknowledged — it stays in history, never deleted."):
-                    monitor_db.acknowledge_alert(a["id"])
-                    st.toast("Alert acknowledged", icon="✅")
-                    st.rerun()
-
-st.markdown('<hr style="border-color:#1a3a5c;margin:14px 0 20px 0">', unsafe_allow_html=True)
-
-st.markdown('<div class="section-header">📈 RISK TREND &amp; DISTRIBUTION</div>', unsafe_allow_html=True)
-trend_col, dist_col = st.columns([1, 1], gap="medium")
-
-with trend_col:
-    st.markdown("<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin-bottom:4px'>Overall Risk Trend</div>", unsafe_allow_html=True)
-    trend_rows = monitor_db.get_overall_risk_trend(limit=100)
-    if trend_rows:
-        trend_df = pd.DataFrame(trend_rows)
-        trend_df["timestamp"] = pd.to_datetime(trend_df["timestamp"]).dt.strftime("%m-%d %H:%M")
-        trend_df = trend_df.set_index("timestamp")[["overall_risk"]].rename(columns={"overall_risk": "Overall ACDS Risk"})
-        st.line_chart(trend_df, height=220)
-    else:
-        st.markdown(
-            '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a">'
-            'No risk history yet — run a scan or simulation to seed the trend.</div>', unsafe_allow_html=True)
-
-with dist_col:
-    st.markdown("<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin-bottom:4px'>Asset Risk Distribution</div>", unsafe_allow_html=True)
-    latest_rows = monitor_db.get_latest_asset_risk_rows()
-    if latest_rows:
-        buckets = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-        for r in latest_rows:
-            if r.get("asset_risk") is None:
-                continue
-            buckets[severity_from_score(r["asset_risk"])] += 1
-        dist_df = pd.DataFrame({"Assets": buckets}, index=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
-        st.bar_chart(dist_df, height=220)
-    else:
-        st.markdown(
-            '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a">'
-            'No risk history yet.</div>', unsafe_allow_html=True)
-
-st.markdown("<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin:14px 0 4px'>Top 10 Highest Risk Assets</div>", unsafe_allow_html=True)
-latest_rows = monitor_db.get_latest_asset_risk_rows()
-if latest_rows:
-    top10 = sorted([r for r in latest_rows if r.get("asset_risk") is not None],
-                    key=lambda r: r["asset_risk"], reverse=True)[:10]
-    rows_html = "".join(
-        f"<tr style='border-bottom:1px solid #1a3a5c'>"
-        f"<td style='padding:4px 6px'>{r.get('asset_ip') or '—'}</td>"
-        f"<td style='padding:4px 6px'>{r.get('hostname') or '—'}</td>"
-        f"<td style='padding:4px 6px;color:{_ALERT_SEVERITY_COLOR.get(severity_from_score(r['asset_risk']), '#7ab8d4')}'>{r['asset_risk']} ({severity_from_score(r['asset_risk'])})</td>"
-        f"<td style='padding:4px 6px'>{CRITICALITY_LABELS.get(_safe_int(r.get('criticality')), '—')}</td>"
-        f"<td style='padding:4px 6px'>{(r.get('last_seen') or '')[:19]}</td>"
-        f"</tr>" for r in top10
-    )
-    st.markdown(f"""
-    <table style="width:100%;border-collapse:collapse;font-family:Share Tech Mono;
-           font-size:0.65rem;color:#7ab8d4">
-    <thead><tr style="color:#00d4ff;border-bottom:1px solid #00d4ff">
-    <th style='text-align:left;padding:4px 6px'>IP</th>
-    <th style='text-align:left;padding:4px 6px'>Hostname</th>
-    <th style='text-align:left;padding:4px 6px'>Risk</th>
-    <th style='text-align:left;padding:4px 6px'>Criticality</th>
-    <th style='text-align:left;padding:4px 6px'>Last Seen</th>
-    </tr></thead>
-    <tbody>{rows_html}</tbody>
-    </table>
-    """, unsafe_allow_html=True)
-else:
-    st.markdown(
-        '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a">'
-        'No risk history yet.</div>', unsafe_allow_html=True)
-
-st.markdown('<hr style="border-color:#1a3a5c;margin:14px 0 20px 0">', unsafe_allow_html=True)
-
-st.markdown('<div class="section-header">🧬 VULNERABILITY TIMELINE</div>', unsafe_allow_html=True)
-_CVE_EVENT_ICON = {"DISCOVERED": "🔴", "RESOLVED": "🟢", "CVSS_CHANGED": "🟡", "VERSION_CHANGED": "🟣"}
-cve_events = st.session_state.get("cve_timeline") or monitor_db.get_cve_timeline(limit=30)
-if not cve_events:
-    st.markdown(
-        '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
-        'No CVE lifecycle events recorded yet.</div>', unsafe_allow_html=True)
-else:
-    for e in cve_events[:30]:
-        icon = _CVE_EVENT_ICON.get(e.get("event_type"), "⚪")
-        ts = (e.get("timestamp") or "")[:16].replace("T", " ")
-        st.markdown(f"""
-        <div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
-             padding:6px 10px;margin:3px 0;background:#0a1520;border-left:3px solid #1a3a5c'>
-            <span style='color:#00d4ff'>{ts}</span>
-            &nbsp;{icon}&nbsp;
-            <span style='color:#e0f4ff'>{html_lib.escape(str(e.get("detail") or ""))}</span>
-        </div>
-        """, unsafe_allow_html=True)
-
-st.markdown('<hr style="border-color:#1a3a5c;margin:8px 0 20px 0">', unsafe_allow_html=True)
-
-col_graph, col_details = st.columns([3, 2], gap="medium")
-
-with col_graph:
-    st.markdown('<div class="section-header">🗺 NETWORK EXPOSURE &amp; ATTACK PATH MODEL</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div style='font-family:Share Tech Mono;font-size:0.6rem;color:#3d6a8a;margin-bottom:6px'>
-    Edges = modeled POTENTIAL REACHABILITY from exposed services. This is NOT observed network traffic.
-    </div>
-    """, unsafe_allow_html=True)
-    graph_placeholder = st.empty()
-    html_graph = render_graph(st.session_state.G, compromised_set=st.session_state.compromised,
-                               current_node=st.session_state.current_anim_node, show_honeypot=show_honeypot,
-                               new_exposure_edges=st.session_state.get("new_exposure_edges"))
-    with graph_placeholder:
-        st.components.v1.html(html_graph, height=500, scrolling=False)
-
-    st.markdown("""
-    <div style='display:flex;gap:16px;font-family:Share Tech Mono;font-size:0.65rem;margin-top:8px;flex-wrap:wrap'>
-        <span><span style='color:#00d4ff'>■</span> OBSERVED ASSET</span>
-        <span><span style='color:#ff3355'>■</span> COMPROMISED (simulated)</span>
-        <span><span style='color:#ff8c00'>■</span> ACTIVE (simulated)</span>
-        <span><span style='color:#00ff88'>■</span> ISOLATED (defense applied)</span>
-        <span><span style='color:#ffd700'>★</span> HONEYPOT (decoy)</span>
-        <span><span style='color:#1a3a5c'>──</span> POTENTIAL REACHABILITY</span>
-        <span><span style='color:#ff8c00'>──</span> NEWLY EXPOSED PATH</span>
-        <span><span style='color:#ff3355'>──</span> SIMULATED ATTACK / HIGH-RISK PATH</span>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    run_col, reset_col = st.columns([2, 1])
-    with run_col:
-        run_btn = st.button("▶  RUN ATTACK SIMULATION (SIMULATION ONLY)", use_container_width=True)
-    with reset_col:
-        reset_btn = st.button("↺  RESET", use_container_width=True)
-
-    if reset_btn:
-        for node in st.session_state.G.nodes:
-            st.session_state.G.nodes[node]["compromised"] = False
-        st.session_state.simulation_done = False
-        st.session_state.timeline = []
-        st.session_state.compromised = set()
-        st.session_state.risk_score = 0.0
-        st.session_state.blast_details = {}
-        st.session_state.honeypot_triggered = False
-        st.session_state.defense_actions = []
-        st.session_state.selected_defenses = []
-        st.session_state.attack_log = []
-        st.session_state.current_anim_node = None
-        st.session_state.overall_acds_risk = None
-        st.rerun()
-
-with col_details:
-    st.markdown('<div class="section-header">📋 ASSET INTELLIGENCE</div>', unsafe_allow_html=True)
-    asset_nodes = list(st.session_state.G.nodes)
-    selected_asset = st.selectbox(
-        "Selected asset",
-        asset_nodes,
-        format_func=lambda node: f"{st.session_state.G.nodes[node].get('display_name', node)} — {st.session_state.G.nodes[node].get('ip', '')}",
-        disabled=not asset_nodes,
-    ) if asset_nodes else None
-    node_panel = st.empty()
-
-    def _evidence_block(title, evidence_list, color="#3d6a8a"):
-        if not evidence_list:
-            return ""
-        items = "".join(f"<div>✓ {html_lib.escape(str(e))}</div>" for e in evidence_list[:4])
-        return (f"<div style='margin:2px 0 6px 70px;font-size:0.62rem;color:{color};line-height:1.6'>{items}</div>")
-
-    def render_node_panel(active_node=None, selected_node=None):
-        html = ""
-        for node, data in st.session_state.G.nodes(data=True):
-            if selected_node and node != selected_node:
-                continue
-            is_comp = data["compromised"]
-            ntype = data.get("node_type", "endpoint")
-            is_honey = ntype == "honeypot"
-            is_active = node == active_node
-            is_isolated = data.get("isolated", False)
-
-            card_class = "compromised" if is_comp else "honeypot" if is_honey else "safe"
-            if is_active:
-                card_class = "compromised"
-
-            status_icon = ("🔴 COMPROMISED (simulated)" if is_comp else
-                            "🟢 ISOLATED (defense applied)" if is_isolated else
-                            "⚠ ALERT" if (is_honey and st.session_state.honeypot_triggered) else
-                            "🟡 DECOY" if is_honey else "🔵 OBSERVED SECURE")
-            if is_active:
-                status_icon = "💥 UNDER SIMULATED ATTACK"
-
-            crit_label = data.get('criticality_label', 'Unknown')
-            crit_stars = "★" * data["criticality"] + "☆" * (5 - data["criticality"])
-            crit_conf = data.get('criticality_confidence')
-            conf_str = f" ({int(crit_conf*100)}% confidence)" if isinstance(crit_conf, (int, float)) else ""
-
-            hostname = data.get('hostname', '')
-            hostname_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Hostname:</span><span style='color:#e0f4ff'>{hostname}</span></div>" if hostname else ""
-
-            os_type = data.get('os', 'unknown')
-            os_confidence = data.get('os_confidence')
-            os_evidence = data.get('os_evidence') or []
-            os_icon = {'windows': '🪟', 'linux': '🐧', 'macos': '🍎', 'unknown': '❓'}.get(os_type, '❓')
-            conf_suffix = f" · {int(round(os_confidence * 100))}% confidence" if isinstance(os_confidence, (int, float)) else ""
-            os_html = (
-                f"<div style='display:flex;align-items:center;margin:4px 0'>"
-                f"<span style='color:#3d6a8a;width:90px'>Inferred OS:</span>"
-                f"<span style='color:#e0f4ff'>{os_icon} {os_type.upper()}{conf_suffix}</span></div>"
-                + _evidence_block("", os_evidence)
-            )
-
-            device_type = data.get('device_type', '')
-            device_evidence = data.get('device_evidence') or []
-            device_conf = data.get('device_confidence')
-            dconf_str = f" · {int(device_conf*100)}% confidence" if isinstance(device_conf, (int, float)) else ""
-            vendor = data.get('mac_vendor')
-            device_icon = {
-                'Mobile Device': '📱', 'Tablet': '📱', 'Network Device': '🌐',
-                'Web Server': '🖥️', 'Database Server': '🗄️', 'Linux Server': '🖥️',
-                'Windows Server': '🖥️', 'Windows Workstation': '💻', 'Linux Workstation': '💻',
-                'Mac Computer': '🍎',
-            }.get(device_type, '📦')
-            vendor_suffix = f" ({vendor})" if vendor else ""
-            device_html = (
-                f"<div style='display:flex;align-items:center;margin:4px 0'>"
-                f"<span style='color:#3d6a8a;width:90px'>Inferred Device:</span>"
-                f"<span style='color:#e0f4ff'>{device_icon} {device_type or 'Unknown'}{vendor_suffix}{dconf_str}</span>"
-                f"</div>" + _evidence_block("", device_evidence)
-            )
-
-            version_map = data.get('version_map', {})
-            services = data.get('services', [])
-            if version_map:
-                svc_strs = [f"{s} ({version_map[s]})" if version_map.get(s) else s for s in services[:4]]
-            else:
-                svc_strs = services[:4]
-            services_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Services:</span><span style='color:#e0f4ff'>{', '.join(svc_strs)}{'...' if len(services) > 4 else ''}</span></div>" if services else ""
-            open_ports = data.get('open_ports', [])
-            ports_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Ports:</span><span style='color:#e0f4ff'>{', '.join(str(p) for p in open_ports) or 'None detected'}</span></div>"
-
-            risk_score = data.get('risk_score', int(data.get('vulnerability', 0) * 100))
-            risk_severity = data.get('risk_severity', 'Unknown')
-            comps = data.get('risk_components') or {}
-
-            def comp_row(key, label, cap):
-                c = comps.get(key, {})
-                contrib = c.get('contribution', 0)
-                return f"<div style='display:flex;justify-content:space-between;color:#7ab8d4'><span>{label}</span><span>{contrib:.1f} / {cap}</span></div>"
-
-            risk_breakdown_html = ""
-            if comps:
-                risk_breakdown_html = (
-                    "<div style='margin:6px 0;padding:8px;background:rgba(0,212,255,0.05);border-left:2px solid #00d4ff;font-size:0.65rem'>"
-                    "<div style='color:#00d4ff;font-weight:bold;margin-bottom:4px'>RISK CALCULATION</div>"
-                    + comp_row('vulnerability', 'Vulnerability / CVSS', 40)
-                    + comp_row('service_exposure', 'Service Exposure', 20)
-                    + comp_row('sensitive_services', 'Sensitive Services', 15)
-                    + comp_row('criticality', 'Asset Criticality', 15)
-                    + comp_row('network_exposure', 'Network Exposure', 10)
-                    + f"<div style='border-top:1px solid #1a3a5c;margin-top:4px;padding-top:4px;display:flex;justify-content:space-between;color:#00d4ff;font-weight:bold'><span>TOTAL</span><span>{risk_score} / 100</span></div>"
-                    "</div>"
-                )
-            risk_html = (
-                f"<div style='margin:6px 0;padding:6px;background:rgba(0,212,255,0.05);border-left:2px solid #00d4ff'>"
-                f"<div style='color:#00d4ff;font-size:0.68rem'>RISK: {risk_score}/100 — {risk_severity}</div></div>"
-                + risk_breakdown_html
-            )
-
-            sensitive_detected = (data.get('asset_risk') or {}).get('sensitive_detected', [])
-            sensitive_html = ""
-            if sensitive_detected:
-                sensitive_html = (
-                    "<div style='margin:6px 0;padding:6px;background:rgba(255,140,0,0.06);border-left:2px solid #ff8c00;font-size:0.63rem'>"
-                    "<div style='color:#3d6a8a;margin-bottom:3px'>SENSITIVE SERVICES</div>"
-                    + "".join(f"<div style='color:#ff8c00'>✓ {label} — {port}</div>" for port, label in sensitive_detected)
-                    + "</div>"
-                )
-
-            cve_findings = data.get('cve_findings', [])
-            cve_html = ""
-            if cve_findings:
-                cve_html = "<div style='margin:6px 0;padding:6px;background:rgba(255,51,85,0.08);border-left:2px solid #ff3355;font-size:0.63rem'>"
-                cve_html += "<div style='color:#3d6a8a;margin-bottom:3px'>CONFIRMED VULNERABILITY</div>"
-                for c in cve_findings[:3]:
-                    cve_html += (
-                        f"<div style='color:#ff3355'>• {c['cve_id']} — CVSS {c['cvss']} ({c.get('severity','?')})</div>"
-                        f"<div style='color:#3d6a8a;margin-left:10px'>{c.get('detected_product')} {c.get('detected_version') or ''} · "
-                        f"Published {c.get('published')} · Modified {c.get('modified')} · Confidence: {c.get('detection_confidence')}</div>"
-                    )
-                cve_html += "</div>"
-            else:
-                exp = data.get('exposure_findings', [])
-                if exp:
-                    cve_html = ("<div style='margin:6px 0;padding:6px;background:rgba(255,140,0,0.05);border-left:2px solid #ff8c00;"
-                                 "color:#7ab8d4;font-size:0.63rem'>EXPOSURE / WEAK CONFIGURATION — no confirmed version-specific CVE. "
-                                 f"{len(exp)} exposed service(s) contribute baseline risk only.</div>")
-                else:
-                    cve_html = "<div style='margin:6px 0;padding:6px;background:rgba(0,255,136,0.04);border-left:2px solid #00ff88;color:#7ab8d4;font-size:0.63rem'>NO VERSION-SPECIFIC CVE FOUND.</div>"
-
-            recommendations = data.get('fixes', [])
-            recommendation_html = "".join(
-                f"<div style='color:#7ab8d4;font-size:0.64rem'>• {html_lib.escape(fix)}</div>" for fix in recommendations[:2]
-            )
-            if recommendation_html:
-                recommendation_html = f"<div style='margin:6px 0;padding:6px;background:rgba(0,255,136,0.04);border-left:2px solid #00ff88'><div style='color:#3d6a8a;font-size:0.62rem;margin-bottom:3px'>RECOMMENDED ACTIONS</div>{recommendation_html}</div>"
-
-            node_color = "#ff3355" if is_comp else "#00ff88" if is_isolated else "#ffd700" if is_honey else "#00d4ff"
-            html += (
-                f"<div class='node-card {card_class}'>"
-                f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px'>"
-                f"<span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span>"
-                f"<span style='font-size:0.62rem;opacity:0.8'>{status_icon}</span></div>"
-                f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>IP:</span><span style='color:#e0f4ff'>{data['ip']}</span></div>"
-                f"{hostname_html}{os_html}{device_html}{ports_html}{services_html}{risk_html}{sensitive_html}{cve_html}{recommendation_html}"
-                f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Role:</span><span style='color:#e0f4ff'>{data['role']}</span></div>"
-                f"<div style='margin:4px 0'><span style='color:#3d6a8a'>Inferred Criticality: </span><span style='color:#ffd700'>{crit_label}{conf_str}</span><br>"
-                f"<span style='color:#ffd700'>{crit_stars}</span>"
-                + _evidence_block("", data.get('criticality_evidence') or [])
-                + "</div></div>"
-            )
-        return html
-
-    node_panel.markdown(f"<div style='padding: 8px;'>{render_node_panel(selected_node=selected_asset)}</div>", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────────
-# SIMULATION EXECUTION WITH ANIMATION
-# ─────────────────────────────────────────────────────────────────
-
-if run_btn and entry_node:
-    # Sprint 2 — Phase 6/10: remember this entry point so future automatic
-    # recalculation passes (a new scan, a monitoring pass) can re-run the
-    # blast-radius simulation against the CHANGED topology without asking
-    # the user to pick an entry node again.
-    st.session_state.last_entry_node = entry_node
-
-    for node in st.session_state.G.nodes:
-        st.session_state.G.nodes[node]["compromised"] = False
-
-    timeline, compromised, honeypot_triggered, attack_stats = simulate_attack(
-        st.session_state.G, entry_node, seed=random.randint(1, 9999),
-        ids_deployed=st.session_state.ids_deployed,
-        segmentation_applied=st.session_state.segmentation_applied,
-    )
-
-    steps = {}
-    for entry in timeline:
-        steps.setdefault(entry["timestep"], []).append(entry)
-
-    animated_compromised = set()
-    status_text = st.empty()
-
-    for timestep in sorted(steps.keys()):
-        for entry in steps[timestep]:
-            node = entry["node"]
-            st.session_state.current_anim_node = node
-
-            status_color = "#ff3355" if entry["success"] else "#00ff88"
-            status_word = "POTENTIAL PATH" if entry["success"] else "BLOCKED"
-            status_text.markdown(
-                f'<div style="font-family:Share Tech Mono;font-size:0.75rem;color:{status_color};'
-                f'background:#0d1f2d;border:1px solid {status_color};padding:8px 14px;margin:4px 0">'
-                f'SIMULATED ATTACK EVENT — [T{timestep}] {entry.get("mitre_code")} → {node}'
-                f'{" ← " + entry.get("from_node", "") if entry.get("from_node") else ""}'
-                f' via {entry.get("access_vector", "network")} — {status_word}</div>',
-                unsafe_allow_html=True
-            )
-
-            if entry["success"]:
-                animated_compromised.add(node)
-
-            updated_html = render_graph(st.session_state.G, compromised_set=animated_compromised,
-                                         current_node=node, show_honeypot=show_honeypot)
-            with graph_placeholder:
-                st.components.v1.html(updated_html, height=500, scrolling=False)
-            node_panel.markdown(f"<div style='padding: 8px;'>{render_node_panel(active_node=node, selected_node=selected_asset)}</div>", unsafe_allow_html=True)
-            time.sleep(animation_speed)
-
-    status_text.markdown(
-        '<div style="font-family:Share Tech Mono;font-size:0.75rem;color:#ffd700;'
-        'background:#1a1000;border:1px solid #ffd700;padding:8px 14px;margin:4px 0">'
-        '[ SIMULATION COMPLETE ] SIMULATION ONLY — no real attack traffic generated, no exploitation performed.</div>',
-        unsafe_allow_html=True
-    )
-
-    st.session_state.timeline = timeline
-    st.session_state.compromised = compromised
-    st.session_state.honeypot_triggered = honeypot_triggered
-    st.session_state.simulation_done = True
-    st.session_state.current_anim_node = None
-
-    risk_score, blast_details = calculate_risk(st.session_state.G, compromised, timeline, honeypot_triggered, attack_stats)
-    st.session_state.risk_score = risk_score
-    st.session_state.blast_details = blast_details
-    st.session_state.attack_stats = attack_stats
-
-    # Priority 19: persist the honeypot interaction (if any) and compute the
-    # rule-based adaptive feedback signal from PERSISTENT history, not just
-    # this single run's boolean.
-    if honeypot_triggered:
-        honeypot_engine.record_trigger(
-            source_node=entry_node, decoy_node="Honeypot (decoy)",
-            event_type="simulated_probe",
-            details="Simulated attacker reached the decoy node during attack simulation.",
-            risk_before=risk_score - 15 if risk_score is not None else None,
-            risk_after=risk_score,
+        os_type = data.get('os', 'unknown')
+        os_confidence = data.get('os_confidence')
+        os_evidence = data.get('os_evidence') or []
+        os_icon = {'windows': '🪟', 'linux': '🐧', 'macos': '🍎', 'unknown': '❓'}.get(os_type, '❓')
+        conf_suffix = f" · {int(round(os_confidence * 100))}% confidence" if isinstance(os_confidence, (int, float)) else ""
+        os_html = (
+            f"<div style='display:flex;align-items:center;margin:4px 0'>"
+            f"<span style='color:#3d6a8a;width:90px'>Inferred OS:</span>"
+            f"<span style='color:#e0f4ff'>{os_icon} {os_type.upper()}{conf_suffix}</span></div>"
+            + _evidence_block("", os_evidence)
         )
-    st.session_state.adaptive_feedback = honeypot_engine.apply_adaptive_feedback(risk_score)
-    st.session_state.overall_acds_risk = calculate_overall_acds_risk(st.session_state.G, risk_score)
 
-    # Snapshot BEFORE state the first time a simulation runs after a scan,
-    # so the Priority 19 Before/After panel has something honest to diff
-    # against once defenses are applied.
-    if st.session_state.risk_before_defense is None:
-        st.session_state.risk_before_defense = risk_score
-        st.session_state.blast_before_defense = blast_details
-        st.session_state.overall_acds_risk_before = st.session_state.overall_acds_risk
-        st.session_state.mitre_before_defense = {
-            e["mitre_code"]: e["mitre_desc"] for e in timeline if e["success"]
-        }
+        device_type = data.get('device_type', '')
+        device_evidence = data.get('device_evidence') or []
+        device_conf = data.get('device_confidence')
+        dconf_str = f" · {int(device_conf*100)}% confidence" if isinstance(device_conf, (int, float)) else ""
+        vendor = data.get('mac_vendor')
+        device_icon = {
+            'Mobile Device': '📱', 'Tablet': '📱', 'Network Device': '🌐',
+            'Web Server': '🖥️', 'Database Server': '🗄️', 'Linux Server': '🖥️',
+            'Windows Server': '🖥️', 'Windows Workstation': '💻', 'Linux Workstation': '💻',
+            'Mac Computer': '🍎',
+        }.get(device_type, '📦')
+        vendor_suffix = f" ({vendor})" if vendor else ""
+        device_html = (
+            f"<div style='display:flex;align-items:center;margin:4px 0'>"
+            f"<span style='color:#3d6a8a;width:90px'>Inferred Device:</span>"
+            f"<span style='color:#e0f4ff'>{device_icon} {device_type or 'Unknown'}{vendor_suffix}{dconf_str}</span>"
+            f"</div>" + _evidence_block("", device_evidence)
+        )
 
-    st.session_state.defense_actions = get_defense_actions(st.session_state.G, compromised, risk_score)
-    selected, total_reduction, remaining = greedy_defense_selection(st.session_state.defense_actions, st.session_state.budget)
-    st.session_state.selected_defenses = selected
-    st.session_state.attack_log = generate_attack_log(timeline, honeypot_triggered)
-    st.session_state.blast_radius_last_computed = datetime.now(timezone.utc)
-    record_scan_history(st.session_state.G, "Post-simulation")
-    # Sprint 2 — Phase 10: risk_score/blast_details/overall_acds_risk are
-    # already fresh from this exact simulation run above, so just persist
-    # Risk History + generate Alerts (no need to re-run the simulation).
-    persist_dynamic_risk_pipeline("SIMULATION")
+        version_map = data.get('version_map', {})
+        services = data.get('services', [])
+        if version_map:
+            svc_strs = [f"{s} ({version_map[s]})" if version_map.get(s) else s for s in services[:4]]
+        else:
+            svc_strs = services[:4]
+        services_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Services:</span><span style='color:#e0f4ff'>{', '.join(svc_strs)}{'...' if len(services) > 4 else ''}</span></div>" if services else ""
+        open_ports = data.get('open_ports', [])
+        ports_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Ports:</span><span style='color:#e0f4ff'>{', '.join(str(p) for p in open_ports) or 'None detected'}</span></div>"
 
-    final_html = render_graph(st.session_state.G, compromised_set=compromised, current_node=None, show_honeypot=show_honeypot,
-                               new_exposure_edges=st.session_state.get("new_exposure_edges"))
-    with graph_placeholder:
-        st.components.v1.html(final_html, height=500, scrolling=False)
-    node_panel.markdown(f"<div style='padding: 8px;'>{render_node_panel(selected_node=selected_asset)}</div>", unsafe_allow_html=True)
+        risk_score = data.get('risk_score', int(data.get('vulnerability', 0) * 100))
+        risk_severity = data.get('risk_severity', 'Unknown')
+        comps = data.get('risk_components') or {}
 
-    st.rerun()
+        def comp_row(key, label, cap):
+            c = comps.get(key, {})
+            contrib = c.get('contribution', 0)
+            return f"<div style='display:flex;justify-content:space-between;color:#7ab8d4'><span>{label}</span><span>{contrib:.1f} / {cap}</span></div>"
 
+        risk_breakdown_html = ""
+        if comps:
+            risk_breakdown_html = (
+                "<div style='margin:6px 0;padding:8px;background:rgba(0,212,255,0.05);border-left:2px solid #00d4ff;font-size:0.65rem'>"
+                "<div style='color:#00d4ff;font-weight:bold;margin-bottom:4px'>RISK CALCULATION</div>"
+                + comp_row('vulnerability', 'Vulnerability / CVSS', 40)
+                + comp_row('service_exposure', 'Service Exposure', 20)
+                + comp_row('sensitive_services', 'Sensitive Services', 15)
+                + comp_row('criticality', 'Asset Criticality', 15)
+                + comp_row('network_exposure', 'Network Exposure', 10)
+                + f"<div style='border-top:1px solid #1a3a5c;margin-top:4px;padding-top:4px;display:flex;justify-content:space-between;color:#00d4ff;font-weight:bold'><span>TOTAL</span><span>{risk_score} / 100</span></div>"
+                "</div>"
+            )
+        risk_html = (
+            f"<div style='margin:6px 0;padding:6px;background:rgba(0,212,255,0.05);border-left:2px solid #00d4ff'>"
+            f"<div style='color:#00d4ff;font-size:0.68rem'>RISK: {risk_score}/100 — {risk_severity}</div></div>"
+            + risk_breakdown_html
+        )
+
+        sensitive_detected = (data.get('asset_risk') or {}).get('sensitive_detected', [])
+        sensitive_html = ""
+        if sensitive_detected:
+            sensitive_html = (
+                f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Sensitive:</span>"
+                f"<span style='color:#ff3355'>{', '.join(sensitive_detected)}</span></div>"
+            )
+
+        cve_findings = data.get('cve_findings', [])
+        cve_html = ""
+        if cve_findings:
+            cve_badges = "".join(
+                f"<span class='cve-tag' title='{c.get('summary','')[:80]}'>{c['cve_id']} (CVSS {c['cvss']})</span>"
+                for c in cve_findings[:4]
+            )
+            cve_html = f"<div style='margin:4px 0'><div style='color:#3d6a8a;font-size:0.65rem'>MATCHED CVEs:</div>{cve_badges}</div>"
+
+        fixes = data.get('fixes', [])
+        recommendation_html = ""
+        if fixes:
+            recommendation_html = "".join(f"<div style='color:#00ff88;font-size:0.65rem'>• {fix}</div>" for fix in fixes[:3])
+            recommendation_html = f"<div style='margin:6px 0;padding:6px;background:rgba(0,255,136,0.04);border-left:2px solid #00ff88'><div style='color:#3d6a8a;font-size:0.62rem;margin-bottom:3px'>RECOMMENDED ACTIONS</div>{recommendation_html}</div>"
+
+        node_color = "#ff3355" if is_comp else "#00ff88" if is_isolated else "#ffd700" if is_honey else "#00d4ff"
+        html += (
+            f"<div class='node-card {card_class}'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px'>"
+            f"<span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span>"
+            f"<span style='font-size:0.62rem;opacity:0.8'>{status_icon}</span></div>"
+            f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>IP:</span><span style='color:#e0f4ff'>{data['ip']}</span></div>"
+            f"{hostname_html}{os_html}{device_html}{ports_html}{services_html}{risk_html}{sensitive_html}{cve_html}{recommendation_html}"
+            f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Role:</span><span style='color:#e0f4ff'>{data['role']}</span></div>"
+            f"<div style='margin:4px 0'><span style='color:#3d6a8a'>Inferred Criticality: </span><span style='color:#ffd700'>{crit_label}{conf_str}</span><br>"
+            f"<span style='color:#ffd700'>{crit_stars}</span>"
+            + _evidence_block("", data.get('criticality_evidence') or [])
+            + "</div></div>"
+        )
+    return html
 
 # ─────────────────────────────────────────────────────────────────
-# POST-SIMULATION PANELS
+# 🧭 MODERN TAB-BASED DASHBOARD NAVIGATION
 # ─────────────────────────────────────────────────────────────────
+tab_exec, tab_sim_map, tab_defense, tab_assets_vulns, tab_alerts = st.tabs([
+    "🏠 Executive Dashboard",
+    "⚔️ Attack Simulation & Live Map",
+    "🛡️ Defense & Remediation",
+    "🧬 Assets & Vulnerabilities",
+    "🚨 Alerts & Reports",
+])
 
-if st.session_state.simulation_done:
+# ═════════════════════════════════════════════════════════════════
+# TAB 1: 🏠 EXECUTIVE DASHBOARD
+# ═════════════════════════════════════════════════════════════════
+with tab_exec:
+    st.markdown('<div class="section-header">🏠 EXECUTIVE CYBER DASHBOARD</div>', unsafe_allow_html=True)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    with k1:
+        st.metric("TOTAL ASSETS", _total_assets)
+    with k2:
+        st.metric("CRITICAL ASSETS", _critical_assets)
+    with k3:
+        st.metric("ACTIVE VULNERABILITIES", _active_vulns)
+    with k4:
+        st.metric("OVERALL ACDS RISK", _overall_display)
+    with k5:
+        st.metric("ACTIVE ALERTS", _active_alerts)
+    with k6:
+        st.metric("AVERAGE RISK", f"{asset_metrics['average_risk']}")
 
-    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
-    st.markdown("""
-    <div style='background:rgba(255,51,85,0.06);border:1px solid #ff3355;padding:8px 14px;
-         font-family:Share Tech Mono;font-size:0.65rem;color:#ff3355;letter-spacing:1px;margin-bottom:10px'>
-    SIMULATION ONLY &nbsp;•&nbsp; NO REAL ATTACK TRAFFIC GENERATED &nbsp;•&nbsp; NO EXPLOITATION PERFORMED
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown('<div class="section-header">📝 EXECUTIVE SUMMARY (PLAIN ENGLISH)</div>', unsafe_allow_html=True)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1:
+        st.metric("HIGH RISK", asset_metrics["high"])
+    with m2:
+        st.metric("MEDIUM RISK", asset_metrics["medium"])
+    with m3:
+        st.metric("LOW RISK", asset_metrics["low"])
+    with m4:
+        st.metric("SERVERS", asset_metrics["servers"])
+    with m5:
+        st.metric("OTHER DEVICES", asset_metrics["other_devices"])
+
+    st.markdown('<hr style="border-color:#1a3a5c;margin:12px 0 16px 0">', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-header">📝 EXECUTIVE BRIEFING (PLAIN ENGLISH)</div>', unsafe_allow_html=True)
     summary_html = build_executive_summary(
         st.session_state.G, st.session_state.compromised, st.session_state.risk_score,
-        st.session_state.blast_details, entry_node,
+        st.session_state.blast_details, st.session_state.get("last_entry_node") or (entry_node if 'entry_node' in locals() else None),
     )
     st.markdown(f"<div class='exec-summary'>{summary_html}</div>", unsafe_allow_html=True)
 
-    # PRIORITY 15 / SPRINT 2 PHASE 3 — OVERALL ACDS RISK (primary dashboard metric)
-    overall = st.session_state.overall_acds_risk or calculate_overall_acds_risk(st.session_state.G, st.session_state.risk_score)
-    st.markdown('<div class="section-header">🎯 OVERALL ACDS RISK</div>', unsafe_allow_html=True)
+    # Overall ACDS Risk Formula Breakdown
+    st.markdown('<div class="section-header">🎯 OVERALL ACDS RISK FORMULA BREAKDOWN</div>', unsafe_allow_html=True)
     blast_ts = st.session_state.get("blast_radius_last_computed")
     blast_ts_txt = blast_ts.strftime("%Y-%m-%d %H:%M:%S UTC") if blast_ts else "not yet computed"
     if overall['status'] == 'COMPLETE':
@@ -5010,7 +4572,6 @@ if st.session_state.simulation_done:
             <div style='font-family:Share Tech Mono;font-size:0.58rem;color:#3d6a8a;text-align:center;margin-top:8px'>
                 Overall ACDS Risk = Avg Asset Risk × {overall['asset_weight']} + Blast Radius × {overall['blast_weight']}
                 + Critical Asset Exposure × {overall['critical_exposure_weight']} + Network Exposure × {overall['network_exposure_weight']}
-                (ACDS design choice, not an industry-standard formula)
             </div>
             <div style='font-family:Share Tech Mono;font-size:0.58rem;color:#ff3355;text-align:center;margin-top:6px;letter-spacing:1px'>
                 SIMULATED — NO REAL ATTACK TRAFFIC &nbsp;·&nbsp; Blast Radius last computed: {blast_ts_txt}
@@ -5020,116 +4581,376 @@ if st.session_state.simulation_done:
     else:
         st.info(f"Overall ACDS Risk: {overall['status']} — Avg Asset Risk {overall['asset_component']}/100, "
                 f"Critical Asset Exposure {overall['critical_exposure_component']}/100, "
-                f"Network Exposure {overall['network_exposure_component']}/100; run a simulation to compute the Blast Radius component.")
+                f"Network Exposure {overall['network_exposure_component']}/100. Run an attack simulation in the **⚔️ Attack Simulation & Live Map** tab to compute the Blast Radius component.")
 
-    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
-    col_timeline, col_risk = st.columns([1, 1], gap="medium")
+    st.markdown('<hr style="border-color:#1a3a5c;margin:12px 0 16px 0">', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">📈 RISK TREND &amp; DISTRIBUTION</div>', unsafe_allow_html=True)
+    trend_col, dist_col = st.columns([1, 1], gap="medium")
 
-    with col_timeline:
-        st.markdown('<div class="section-header">⏱ SIMULATED ATTACK TIMELINE</div>', unsafe_allow_html=True)
-        ts_groups = {}
-        for entry in st.session_state.timeline:
-            ts_groups.setdefault(entry["timestep"], []).append(entry)
-        for t, entries in sorted(ts_groups.items()):
-            for entry in entries:
-                is_success = entry["success"]
-                bg_color = "rgba(255,51,85,0.1)" if is_success else "rgba(0,255,136,0.05)"
-                border_color = "#ff3355" if is_success else "#00ff88"
-                status_text_val = "✓ POTENTIAL PATH" if is_success else "✗ BLOCKED"
-                status_color = "#ff3355" if is_success else "#00ff88"
-                privilege_html = (
-                    "<div style='color:#ffd700;font-size:0.65rem'>⬆ Privilege Escalation (simulated)</div>"
-                    if entry.get("priv_esc") else ""
-                )
-                vuln_percent = int(entry["vuln"] * 100)
-                criticality_stars = "★" * entry["criticality"]
-                card_html = (
-                    f"<div style='background:{bg_color};border:1px solid {border_color};"
-                    f"border-left:3px solid {border_color};padding:8px 12px;margin:4px 0;"
-                    f"font-family:Share Tech Mono;font-size:0.72rem;line-height:1.8'>"
-                    f"<div style='display:flex;justify-content:space-between'>"
-                    f"<span style='color:#00d4ff'>T{t}</span>"
-                    f"<span style='color:{status_color}'>{status_text_val}</span>"
-                    f"</div>"
-                    f"<div style='color:#e0f4ff;font-weight:bold'>→ {entry['node']}</div>"
-                    f"<div style='color:#3d6a8a'>{entry.get('mitre_code','')}: {entry.get('mitre_desc','')}</div>"
-                    f"<div style='color:#ff8c00;font-size:0.65rem'>Reason: {entry.get('access_vector', 'network')}</div>"
-                    f"{privilege_html}"
-                    f"<div style='color:#7ab8d4'>Risk: {vuln_percent}/100 | Criticality: {criticality_stars}</div>"
-                    f"</div>"
-                )
-                st.markdown(card_html, unsafe_allow_html=True)
+    with trend_col:
+        st.markdown("<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin-bottom:4px'>Overall Risk Trend</div>", unsafe_allow_html=True)
+        trend_rows = monitor_db.get_overall_risk_trend(limit=100)
+        if trend_rows:
+            trend_df = pd.DataFrame(trend_rows)
+            trend_df["timestamp"] = pd.to_datetime(trend_df["timestamp"]).dt.strftime("%m-%d %H:%M")
+            trend_df = trend_df.set_index("timestamp")[["overall_risk"]].rename(columns={"overall_risk": "Overall ACDS Risk"})
+            st.line_chart(trend_df, height=220)
+        else:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a">'
+                'No risk history yet — run a scan or simulation to seed the trend.</div>', unsafe_allow_html=True)
 
-    with col_risk:
-        st.markdown('<div class="section-header">📊 NETWORK BLAST RADIUS (SIMULATION)</div>', unsafe_allow_html=True)
-        rs = st.session_state.risk_score
-        bd = st.session_state.blast_details
-        risk_color = "#ff3355" if rs > 70 else "#ff8c00" if rs > 40 else "#00ff88"
-        risk_label = severity_from_score(rs)
+    with dist_col:
+        st.markdown("<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin-bottom:4px'>Asset Risk Distribution</div>", unsafe_allow_html=True)
+        latest_rows = monitor_db.get_latest_asset_risk_rows()
+        if latest_rows:
+            buckets = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+            for r in latest_rows:
+                if r.get("asset_risk") is None:
+                    continue
+                buckets[severity_from_score(r["asset_risk"])] += 1
+            dist_df = pd.DataFrame({"Assets": buckets}, index=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
+            st.bar_chart(dist_df, height=220)
+        else:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a">'
+                'No risk history yet.</div>', unsafe_allow_html=True)
 
+    st.markdown("<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin:14px 0 4px'>Top 10 Highest Risk Assets</div>", unsafe_allow_html=True)
+    latest_rows = monitor_db.get_latest_asset_risk_rows()
+    if latest_rows:
+        top10 = sorted([r for r in latest_rows if r.get("asset_risk") is not None],
+                        key=lambda r: r["asset_risk"], reverse=True)[:10]
+        rows_html = "".join(
+            f"<tr style='border-bottom:1px solid #1a3a5c'>"
+            f"<td style='padding:4px 6px'>{r.get('asset_ip') or '—'}</td>"
+            f"<td style='padding:4px 6px'>{r.get('hostname') or '—'}</td>"
+            f"<td style='padding:4px 6px;color:{_ALERT_SEVERITY_COLOR.get(severity_from_score(r['asset_risk']), '#7ab8d4')}'>{r['asset_risk']} ({severity_from_score(r['asset_risk'])})</td>"
+            f"<td style='padding:4px 6px'>{CRITICALITY_LABELS.get(_safe_int(r.get('criticality')), '—')}</td>"
+            f"<td style='padding:4px 6px'>{(r.get('last_seen') or '')[:19]}</td>"
+            f"</tr>" for r in top10
+        )
         st.markdown(f"""
-        <div style='background:#0d1f2d;border:1px solid {risk_color};padding:20px;text-align:center;margin-bottom:16px'>
-            <div style='font-family:Orbitron,monospace;font-size:2.5rem;color:{risk_color};
-                        text-shadow:0 0 20px {risk_color};font-weight:900'>{rs}</div>
-            <div style='font-family:Share Tech Mono;font-size:0.7rem;color:{risk_color};letter-spacing:3px'> / 100 — {risk_label}</div>
-            <div class="risk-bar-container" style='margin-top:12px'>
-                <div class="risk-bar" style='width:{rs}%;background:linear-gradient(90deg,#003d5c,{risk_color})'></div>
+        <table style="width:100%;border-collapse:collapse;font-family:Share Tech Mono;
+               font-size:0.65rem;color:#7ab8d4">
+        <thead><tr style="color:#00d4ff;border-bottom:1px solid #00d4ff">
+        <th style='text-align:left;padding:4px 6px'>IP</th>
+        <th style='text-align:left;padding:4px 6px'>Hostname</th>
+        <th style='text-align:left;padding:4px 6px'>Risk</th>
+        <th style='text-align:left;padding:4px 6px'>Criticality</th>
+        <th style='text-align:left;padding:4px 6px'>Last Seen</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+        </table>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a">'
+            'No risk history yet.</div>', unsafe_allow_html=True)
+
+# ═════════════════════════════════════════════════════════════════
+# TAB 2: ⚔️ ATTACK SIMULATION & LIVE TOPOLOGY MAP
+# ═════════════════════════════════════════════════════════════════
+with tab_sim_map:
+    st.markdown('<div class="section-header">⚔️ ATTACK PATH SIMULATION &amp; LIVE TOPOLOGY MAP</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style='background:rgba(255,51,85,0.06);border:1px solid #ff3355;padding:8px 14px;
+         font-family:Share Tech Mono;font-size:0.65rem;color:#ff3355;letter-spacing:1px;margin-bottom:12px'>
+    SIMULATION ONLY &nbsp;•&nbsp; NO REAL ATTACK TRAFFIC GENERATED &nbsp;•&nbsp; NO EXPLOITATION PERFORMED
+    </div>
+    """, unsafe_allow_html=True)
+
+    sim_ctrl1, sim_ctrl2, sim_ctrl3 = st.columns([2, 1, 1])
+    all_sim_nodes = list(st.session_state.G.nodes)
+    if st.session_state.network_mode == "Simulated Lab":
+        all_sim_nodes = [n for n in all_sim_nodes if st.session_state.G.nodes[n].get("node_type") != "honeypot"]
+
+    with sim_ctrl1:
+        entry_node_sim = st.selectbox(
+            "Attacker Foothold / Entry Point",
+            all_sim_nodes,
+            index=min(1, len(all_sim_nodes) - 1) if all_sim_nodes else 0,
+            disabled=not all_sim_nodes,
+            key="sim_tab_entry_node",
+            help="The system where the attacker first gained simulated access",
+        )
+    with sim_ctrl2:
+        run_sim_btn = st.button("▶  RUN SIMULATION", use_container_width=True, disabled=not all_sim_nodes)
+    with sim_ctrl3:
+        reset_sim_btn = st.button("↺  RESET SIMULATION", use_container_width=True)
+
+    if reset_sim_btn:
+        for node in st.session_state.G.nodes:
+            st.session_state.G.nodes[node]["compromised"] = False
+        st.session_state.simulation_done = False
+        st.session_state.timeline = []
+        st.session_state.compromised = set()
+        st.session_state.risk_score = 0.0
+        st.session_state.blast_details = {}
+        st.session_state.honeypot_triggered = False
+        st.session_state.defense_actions = []
+        st.session_state.selected_defenses = []
+        st.session_state.attack_log = []
+        st.session_state.current_anim_node = None
+        st.session_state.overall_acds_risk = None
+        st.rerun()
+
+    if run_sim_btn and entry_node_sim:
+        st.session_state.last_entry_node = entry_node_sim
+        for node in st.session_state.G.nodes:
+            st.session_state.G.nodes[node]["compromised"] = False
+
+        timeline, compromised, honeypot_triggered, attack_stats = simulate_attack(
+            st.session_state.G, entry_node_sim, seed=random.randint(1, 9999),
+            ids_deployed=st.session_state.ids_deployed,
+            segmentation_applied=st.session_state.segmentation_applied,
+        )
+
+        st.session_state.timeline = timeline
+        st.session_state.compromised = compromised
+        st.session_state.honeypot_triggered = honeypot_triggered
+        st.session_state.simulation_done = True
+        st.session_state.current_anim_node = None
+
+        risk_score, blast_details = calculate_risk(st.session_state.G, compromised, timeline, honeypot_triggered, attack_stats)
+        st.session_state.risk_score = risk_score
+        st.session_state.blast_details = blast_details
+        st.session_state.attack_stats = attack_stats
+
+        if honeypot_triggered:
+            honeypot_engine.record_trigger(
+                source_node=entry_node_sim, decoy_node="Honeypot (decoy)",
+                event_type="simulated_probe",
+                details="Simulated attacker reached the decoy node during attack simulation.",
+                risk_before=risk_score - 15 if risk_score is not None else None,
+                risk_after=risk_score,
+            )
+        st.session_state.adaptive_feedback = honeypot_engine.apply_adaptive_feedback(risk_score)
+        st.session_state.overall_acds_risk = calculate_overall_acds_risk(st.session_state.G, risk_score)
+
+        if st.session_state.risk_before_defense is None:
+            st.session_state.risk_before_defense = risk_score
+            st.session_state.blast_before_defense = blast_details
+            st.session_state.overall_acds_risk_before = st.session_state.overall_acds_risk
+            st.session_state.mitre_before_defense = {
+                e["mitre_code"]: e["mitre_desc"] for e in timeline if e["success"]
+            }
+
+        st.session_state.defense_actions = get_defense_actions(st.session_state.G, compromised, risk_score)
+        selected, total_reduction, remaining = greedy_defense_selection(st.session_state.defense_actions, st.session_state.budget)
+        st.session_state.selected_defenses = selected
+        st.session_state.attack_log = generate_attack_log(timeline, honeypot_triggered)
+        st.session_state.blast_radius_last_computed = datetime.now(timezone.utc)
+        record_scan_history(st.session_state.G, "Post-simulation")
+        persist_dynamic_risk_pipeline("SIMULATION")
+        st.rerun()
+
+    st.markdown('<hr style="border-color:#1a3a5c;margin:12px 0 16px 0">', unsafe_allow_html=True)
+
+    # Co-located Live Map (Left) and Attack Results / Timeline (Right)
+    col_map, col_sim_results = st.columns([1.1, 0.9], gap="medium")
+
+    with col_map:
+        st.markdown('<div class="section-header">🗺 LIVE EXPOSURE &amp; ATTACK TOPOLOGY MAP</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div style='font-family:Share Tech Mono;font-size:0.6rem;color:#3d6a8a;margin-bottom:6px'>
+        Edges = modeled POTENTIAL REACHABILITY from exposed services. Shows simulated lateral paths live.
+        </div>
+        """, unsafe_allow_html=True)
+        graph_placeholder = st.empty()
+        html_graph = render_graph(st.session_state.G, compromised_set=st.session_state.compromised,
+                                   current_node=st.session_state.current_anim_node, show_honeypot=show_honeypot if 'show_honeypot' in locals() else True,
+                                   new_exposure_edges=st.session_state.get("new_exposure_edges"))
+        with graph_placeholder:
+            st.components.v1.html(html_graph, height=480, scrolling=False)
+
+        st.markdown("""
+        <div style='display:flex;gap:12px;font-family:Share Tech Mono;font-size:0.62rem;margin-top:8px;flex-wrap:wrap;background:#050a0f;padding:8px 10px;border:1px solid #1a3a5c'>
+            <span><span style='color:#00d4ff'>■</span> OBSERVED ASSET</span>
+            <span><span style='color:#ff3355'>■</span> COMPROMISED (simulated)</span>
+            <span><span style='color:#ff8c00'>■</span> ACTIVE (simulated)</span>
+            <span><span style='color:#00ff88'>■</span> ISOLATED (defense applied)</span>
+            <span><span style='color:#ffd700'>★</span> HONEYPOT (decoy)</span>
+            <span><span style='color:#1a3a5c'>──</span> POTENTIAL REACHABILITY</span>
+            <span><span style='color:#ff8c00'>──</span> NEWLY EXPOSED PATH</span>
+            <span><span style='color:#ff3355'>──</span> SIMULATED ATTACK PATH</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("🔍 ASSET INTELLIGENCE INSPECTOR", expanded=False):
+            asset_nodes = list(st.session_state.G.nodes)
+            selected_asset = st.selectbox(
+                "Select asset to inspect",
+                asset_nodes,
+                format_func=lambda node: f"{st.session_state.G.nodes[node].get('display_name', node)} — {st.session_state.G.nodes[node].get('ip', '')}",
+                disabled=not asset_nodes,
+                key="tab_sim_map_selected_asset",
+            ) if asset_nodes else None
+            if selected_asset:
+                st.markdown(f"<div style='padding: 4px;'>{render_node_panel(selected_node=selected_asset)}</div>", unsafe_allow_html=True)
+
+    with col_sim_results:
+        if st.session_state.simulation_done:
+            st.markdown('<div class="section-header">📊 SIMULATED BLAST RADIUS</div>', unsafe_allow_html=True)
+            rs = st.session_state.risk_score
+            bd = st.session_state.blast_details
+            risk_color = "#ff3355" if rs > 70 else "#ff8c00" if rs > 40 else "#00ff88"
+            risk_label = severity_from_score(rs)
+
+            st.markdown(f"""
+            <div style='background:#0d1f2d;border:1px solid {risk_color};padding:14px;text-align:center;margin-bottom:12px'>
+                <div style='font-family:Orbitron,monospace;font-size:2.2rem;color:{risk_color};
+                            text-shadow:0 0 16px {risk_color};font-weight:900'>{rs}</div>
+                <div style='font-family:Share Tech Mono;font-size:0.68rem;color:{risk_color};letter-spacing:3px'> / 100 — {risk_label}</div>
+                <div class="risk-bar-container" style='margin-top:8px'>
+                    <div class="risk-bar" style='width:{rs}%;background:linear-gradient(90deg,#003d5c,{risk_color})'></div>
+                </div>
             </div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
-        st.markdown(f"""
-        <div style='font-family:Share Tech Mono;font-size:0.75rem;line-height:2;background:#0a1520;
-             border:1px solid #1a3a5c;padding:14px 16px'>
-            <div style='color:#3d6a8a'>FORMULA: R = 0.3×spread + 0.5×critical_impact + 0.2×depth (ACDS blast-radius model)</div><br>
-            <div>Spread (w1=0.3): <span style='color:#00d4ff;float:right'>{bd.get("spread",0)}% nodes compromised</span></div>
-            <div class="risk-bar-container"><div class="risk-bar" style='width:{bd.get("spread",0)}%;background:#00d4ff'></div></div>
-            <div>Critical Impact (w2=0.5): <span style='color:#ff8c00;float:right'>{bd.get("critical_impact",0)}% criticality</span></div>
-            <div class="risk-bar-container"><div class="risk-bar" style='width:{bd.get("critical_impact",0)}%;background:#ff8c00'></div></div>
-            <div>Attack Depth (w3=0.2): <span style='color:#ffd700;float:right'>{bd.get("depth",0)}% of network</span></div>
-            <div class="risk-bar-container"><div class="risk-bar" style='width:{bd.get("depth",0)}%;background:#ffd700'></div></div>
-            <br>
-            <div>Systems Controlled: <span style='color:#ff3355;float:right'>{bd.get("systems_controlled", bd.get("compromised_count",0))} / {bd.get("total_real_nodes",0)}</span></div>
-            <div>Critical Assets Reached: <span style='color:#ff3355;float:right'>{bd.get("critical_assets_reached", 0)}</span></div>
-            <div>Max Lateral Hops (Attack Depth): <span style='color:#ffd700;float:right'>{bd.get("max_lateral_hops", 0)}</span></div>
-            <div>Privilege Escalations: <span style='color:#ff8c00;float:right'>{bd.get("privilege_escalations", 0)}</span></div>
-            {"<div style='color:#ffd700;margin-top:8px'>⚠ HONEYPOT TRIGGERED (simulated): +15 risk penalty</div>" if st.session_state.honeypot_triggered else ""}
-        </div>
-        """, unsafe_allow_html=True)
+            hp_penalty_html = "<div style='color:#ffd700;margin-top:6px'>⚠ HONEYPOT TRIGGERED (simulated): +15 risk penalty</div>" if st.session_state.honeypot_triggered else ""
+            st.markdown(f"""
+            <div style='font-family:Share Tech Mono;font-size:0.7rem;line-height:1.8;background:#0a1520;
+                 border:1px solid #1a3a5c;padding:10px 14px;margin-bottom:12px'>
+                <div style='color:#3d6a8a'>FORMULA: R = 0.3×spread + 0.5×critical_impact + 0.2×depth</div>
+                <div>Spread (0.3): <span style='color:#00d4ff;float:right'>{bd.get("spread",0)}%</span></div>
+                <div class="risk-bar-container"><div class="risk-bar" style='width:{bd.get("spread",0)}%;background:#00d4ff'></div></div>
+                <div>Critical Impact (0.5): <span style='color:#ff8c00;float:right'>{bd.get("critical_impact",0)}%</span></div>
+                <div class="risk-bar-container"><div class="risk-bar" style='width:{bd.get("critical_impact",0)}%;background:#ff8c00'></div></div>
+                <div>Depth (0.2): <span style='color:#ffd700;float:right'>{bd.get("depth",0)}%</span></div>
+                <div class="risk-bar-container"><div class="risk-bar" style='width:{bd.get("depth",0)}%;background:#ffd700'></div></div>
+                <div style='display:flex;justify-content:space-between;margin-top:6px'>
+                    <span>Controlled: <b style='color:#ff3355'>{bd.get("systems_controlled", bd.get("compromised_count",0))}/{bd.get("total_real_nodes",0)}</b></span>
+                    <span>Critical Reached: <b style='color:#ff3355'>{bd.get("critical_assets_reached", 0)}</b></span>
+                </div>
+                <div style='display:flex;justify-content:space-between;margin-top:2px'>
+                    <span>Lateral Hops: <b style='color:#ffd700'>{bd.get("max_lateral_hops", 0)}</b></span>
+                    <span>Priv Esc: <b style='color:#ff8c00'>{bd.get("privilege_escalations", 0)}</b></span>
+                </div>
+                {hp_penalty_html}
+            </div>
+            """, unsafe_allow_html=True)
 
-        paths = bd.get("attack_paths", [])
-        if paths:
-            st.markdown('<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin:12px 0 6px 0">SIMULATED ATTACK PATHS (longest routes)</div>', unsafe_allow_html=True)
-            for path in paths[:5]:
-                path_str = " → ".join(p.replace("\n", " / ") for p in path)
-                st.markdown(
-                    f'<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;'
-                    f'padding:6px 10px;margin:3px 0;background:#060d15;border-left:2px solid #ff3355">{path_str}</div>',
-                    unsafe_allow_html=True,
-                )
+            paths = bd.get("attack_paths", [])
+            if paths:
+                with st.expander("📍 SIMULATED ATTACK PATHS", expanded=False):
+                    for path in paths[:4]:
+                        path_str = " → ".join(p.replace("\n", " / ") for p in path)
+                        st.markdown(
+                            f'<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#7ab8d4;'
+                            f'padding:4px 8px;margin:2px 0;background:#060d15;border-left:2px solid #ff3355">{path_str}</div>',
+                            unsafe_allow_html=True,
+                        )
 
-    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
-    col_defense, col_log = st.columns([1, 1], gap="medium")
+            st.markdown('<div class="section-header">⏱ SIMULATED ATTACK TIMELINE</div>', unsafe_allow_html=True)
+            ts_groups = {}
+            for entry in st.session_state.timeline:
+                ts_groups.setdefault(entry["timestep"], []).append(entry)
+            for t, entries in sorted(ts_groups.items()):
+                for entry in entries:
+                    is_success = entry["success"]
+                    bg_color = "rgba(255,51,85,0.1)" if is_success else "rgba(0,255,136,0.05)"
+                    border_color = "#ff3355" if is_success else "#00ff88"
+                    status_text_val = "✓ POTENTIAL PATH" if is_success else "✗ BLOCKED"
+                    status_color = "#ff3355" if is_success else "#00ff88"
+                    privilege_html = (
+                        "<div style='color:#ffd700;font-size:0.65rem'>⬆ Privilege Escalation (simulated)</div>"
+                        if entry.get("priv_esc") else ""
+                    )
+                    vuln_percent = int(entry["vuln"] * 100)
+                    criticality_stars = "★" * entry["criticality"]
+                    card_html = (
+                        f"<div style='background:{bg_color};border:1px solid {border_color};"
+                        f"border-left:3px solid {border_color};padding:8px 12px;margin:4px 0;"
+                        f"font-family:Share Tech Mono;font-size:0.72rem;line-height:1.8'>"
+                        f"<div style='display:flex;justify-content:space-between'>"
+                        f"<span style='color:#00d4ff'>T{t}</span>"
+                        f"<span style='color:{status_color}'>{status_text_val}</span>"
+                        f"</div>"
+                        f"<div style='color:#e0f4ff;font-weight:bold'>→ {entry['node']}</div>"
+                        f"<div style='color:#3d6a8a'>{entry.get('mitre_code','')}: {entry.get('mitre_desc','')}</div>"
+                        f"<div style='color:#ff8c00;font-size:0.65rem'>Reason: {entry.get('access_vector', 'network')}</div>"
+                        f"{privilege_html}"
+                        f"<div style='color:#7ab8d4'>Risk: {vuln_percent}/100 | Criticality: {criticality_stars}</div>"
+                        f"</div>"
+                    )
+                    st.markdown(card_html, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div style='background:#0a1520;border:1px solid #1a3a5c;border-left:3px solid #00d4ff;
+                 padding:24px;font-family:Share Tech Mono;font-size:0.78rem;line-height:2;
+                 text-align:center;margin-top:16px'>
+                <div style='color:#00d4ff;font-size:0.95rem;font-family:Orbitron,monospace;letter-spacing:3px;margin-bottom:12px'>
+                    READY TO SIMULATE ATTACK
+                </div>
+                <div style='color:#7ab8d4'>
+                    1. Select an <b>Attacker Foothold / Entry Point</b> in the controls above.<br>
+                    2. Click <b>▶ RUN SIMULATION</b> to model lateral movement.<br>
+                    3. The map on the left will immediately highlight compromised routes (red/orange) and the timeline will populate here with MITRE ATT&CK techniques.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    if st.session_state.simulation_done:
+        st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+        col_log1, col_log2 = st.columns([1, 1], gap="medium")
+        with col_log1:
+            st.markdown('<div class="section-header">📟 SIMULATED ATTACK EVENT LOG</div>', unsafe_allow_html=True)
+            if st.session_state.honeypot_triggered:
+                st.markdown("""
+                <div class="honeypot-alert">
+                    ⚠ HONEYPOT TRIGGERED (SIMULATED) — modeled attacker probed decoy system<br>
+                    <span style='color:#3d6a8a'>Action: Risk model updated (+15 penalty)</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown("""
+            <div style='background:#050a0f;border:1px solid #1a3a5c;padding:10px 12px;font-family:Share Tech Mono;max-height:280px;overflow-y:auto'>
+            """, unsafe_allow_html=True)
+            for log in st.session_state.attack_log:
+                sev = log["severity"]
+                color = "#ff3355" if sev == "critical" else "#00ff88" if sev == "ok" else "#ff8c00"
+                st.markdown(f"""
+                <div style='font-size:0.66rem;padding:5px 0;border-bottom:1px solid #0a1520;color:#7ab8d4;line-height:1.6'>
+                    <div><span style='color:#3d6a8a'>Source:</span> {log["src"]} &nbsp;→&nbsp; <span style='color:#00d4ff'>Target: {log["target"]}</span></div>
+                    <div><span style='color:#3d6a8a'>Technique:</span> {log["technique"]}</div>
+                    <div style='color:{color}'>Result: {log["status"]}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with col_log2:
+            st.markdown('<div class="section-header">🔖 MITRE ATT&CK MAPPING</div>', unsafe_allow_html=True)
+            mitre_seen = {}
+            for entry in st.session_state.timeline:
+                if entry["success"]:
+                    mitre_seen[entry["mitre_code"]] = entry["mitre_desc"]
+            mitre_html = "".join(f'<span class="mitre-tag">{code}</span>' for code in mitre_seen) + "<br><br>"
+            for code, desc in mitre_seen.items():
+                mitre_html += f'<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin:3px 0"><span style="color:#ff8c00">{code}</span> — {desc}</div>'
+            st.markdown(f'<div style="background:#0d1f2d;border:1px solid #1a3a5c;padding:12px;max-height:280px;overflow-y:auto">{mitre_html}</div>', unsafe_allow_html=True)
+
+# ═════════════════════════════════════════════════════════════════
+# TAB 3: 🛡️ DEFENSE & REMEDIATION
+# ═════════════════════════════════════════════════════════════════
+with tab_defense:
+    st.markdown('<div class="section-header">🛡 ACDS DEFENSE OPTIMIZATION &amp; REMEDIATION</div>', unsafe_allow_html=True)
+    col_defense, col_solutions = st.columns([1, 1], gap="medium")
 
     with col_defense:
-        st.markdown('<div class="section-header">🛡 ACDS DEFENSE OPTIMIZATION</div>', unsafe_allow_html=True)
         st.markdown("""
         <div style='font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;
              background:#060d15;border:1px solid #1a3a5c;padding:10px;margin-bottom:12px;line-height:1.8'>
-        // Greedy algorithm: rank by risk_reduction/cost ratio<br>
-        // Select highest-value, CVE-specific actions within budget<br>
-        // Objective: maximize risk reduction under limited resources<br>
+        // Greedy algorithm: rank by risk_reduction / cost ratio<br>
+        // Selects highest-value, CVE-specific actions within budget constraints<br>
         // States: RECOMMENDED → SELECTED → APPLIED TO SIMULATION MODEL
         </div>
         """, unsafe_allow_html=True)
 
-        # PRIORITY 24: Budget control lives in the Defense Optimization
-        # section now (moved out of the sidebar).
         all_actions_for_budget = get_defense_actions(st.session_state.G, set(st.session_state.G.nodes) - {"Honeypot"}, 50)
         max_budget = sum(a["cost"] for a in all_actions_for_budget) or 100
         st.slider("Defense Budget (units)", 0, max_budget, key="budget",
-                   help="Total cost the optimizer can spend selecting recommended controls below. "
-                        "Default comes from ⚙ Settings and can be changed here for this session only.")
+                   help="Total cost the optimizer can spend selecting recommended controls below.")
 
         defense_actions = st.session_state.defense_actions
         selected, total_reduction_val, remaining = greedy_defense_selection(defense_actions, st.session_state.budget)
@@ -5141,25 +4962,7 @@ if st.session_state.simulation_done:
         applied = st.session_state.applied_defenses
         has_applied = bool(applied)
 
-        st.markdown("**BEFORE**")
-        st.markdown(f"""
-        <div style='display:flex;gap:10px;margin-bottom:10px;font-family:Share Tech Mono;font-size:0.7rem'>
-            <div style='flex:1;background:#0d1f2d;border:1px solid #1a3a5c;padding:10px;text-align:center'>
-                <div style='color:#3d6a8a'>RISK</div><div style='color:#ff3355'>{before_risk} / 100</div>
-            </div>
-            <div style='flex:1;background:#0d1f2d;border:1px solid #1a3a5c;padding:10px;text-align:center'>
-                <div style='color:#3d6a8a'>SYSTEMS REACHED</div><div style='color:#ffd700'>{before_bd.get('systems_controlled', before_bd.get('compromised_count',0))}</div>
-            </div>
-            <div style='flex:1;background:#0d1f2d;border:1px solid #1a3a5c;padding:10px;text-align:center'>
-                <div style='color:#3d6a8a'>CRITICAL REACHED</div><div style='color:#ffd700'>{before_bd.get('critical_assets_reached',0)}</div>
-            </div>
-            <div style='flex:1;background:#0d1f2d;border:1px solid #1a3a5c;padding:10px;text-align:center'>
-                <div style='color:#3d6a8a'>MAX DEPTH</div><div style='color:#ffd700'>{before_bd.get('max_lateral_hops',0)}</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("**RECOMMENDED / SELECTED ACTIONS**")
+        st.markdown("**RECOMMENDED / SELECTED CONTROLS**")
         selected_set = {a["action"] for a in selected}
         for action in defense_actions[:10]:
             is_sel = action["action"] in selected_set
@@ -5193,23 +4996,15 @@ if st.session_state.simulation_done:
             </div>
             """, unsafe_allow_html=True)
 
-        st.markdown(f"""
-        <div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin:8px 0'>
-        Budget used: {sum(a['cost'] for a in selected)} / {st.session_state.budget} &nbsp;|&nbsp;
-        Modeled risk reduction if applied: -{total_reduction_val:.1f}
-        </div>
-        """, unsafe_allow_html=True)
-
         if st.button("🛡  APPLY SELECTED DEFENSES", use_container_width=True, disabled=not selected):
             applied_actions, ids_dep, seg_applied = apply_defense_actions(st.session_state.G, selected)
             st.session_state.applied_defenses = applied_actions
             st.session_state.ids_deployed = st.session_state.ids_deployed or ids_dep
             st.session_state.segmentation_applied = st.session_state.segmentation_applied or seg_applied
 
-            # Re-simulate from the same entry point so BEFORE vs AFTER is a
-            # genuine comparison against the mutated model (Priority 18/19).
+            current_entry = st.session_state.get("last_entry_node") or (entry_node if 'entry_node' in locals() else None)
             new_timeline, new_compromised, new_honeypot, new_stats = simulate_attack(
-                st.session_state.G, entry_node, seed=random.randint(1, 9999),
+                st.session_state.G, current_entry, seed=random.randint(1, 9999),
                 ids_deployed=st.session_state.ids_deployed, segmentation_applied=st.session_state.segmentation_applied,
             )
             new_risk, new_bd = calculate_risk(st.session_state.G, new_compromised, new_timeline, new_honeypot, new_stats)
@@ -5226,7 +5021,7 @@ if st.session_state.simulation_done:
 
             if new_honeypot:
                 honeypot_engine.record_trigger(
-                    source_node=entry_node, decoy_node="Honeypot (decoy)",
+                    source_node=current_entry, decoy_node="Honeypot (decoy)",
                     event_type="simulated_probe_post_defense",
                     details="Simulated attacker reached the decoy node after defenses were applied.",
                     risk_before=new_risk - 15 if new_risk is not None else None,
@@ -5240,32 +5035,8 @@ if st.session_state.simulation_done:
             st.toast(f"🛡 {len(applied_actions)} defense action(s) applied", icon="🛡")
             st.rerun()
 
-        if has_applied:
-            after_bd = st.session_state.post_defense_stats or st.session_state.blast_details
-            after_risk = st.session_state.risk_score
-            reduction_pct = round(max(0, (before_risk - after_risk) / before_risk * 100), 1) if before_risk else 0.0
-            st.markdown("**AFTER (applied to model, re-simulated)**")
-            st.markdown(f"""
-            <div style='display:flex;gap:10px;margin:10px 0;font-family:Share Tech Mono;font-size:0.7rem'>
-                <div style='flex:1;background:#0d1f2d;border:1px solid #00ff88;padding:10px;text-align:center'>
-                    <div style='color:#3d6a8a'>RISK</div><div style='color:#00ff88'>{after_risk} / 100</div>
-                </div>
-                <div style='flex:1;background:#0d1f2d;border:1px solid #00ff88;padding:10px;text-align:center'>
-                    <div style='color:#3d6a8a'>SYSTEMS REACHED</div><div style='color:#00ff88'>{after_bd.get('systems_controlled', after_bd.get('compromised_count',0))}</div>
-                </div>
-                <div style='flex:1;background:#0d1f2d;border:1px solid #00ff88;padding:10px;text-align:center'>
-                    <div style='color:#3d6a8a'>CRITICAL REACHED</div><div style='color:#00ff88'>{after_bd.get('critical_assets_reached',0)}</div>
-                </div>
-                <div style='flex:1;background:#0d1f2d;border:1px solid #00ff88;padding:10px;text-align:center'>
-                    <div style='color:#3d6a8a'>MAX DEPTH</div><div style='color:#00ff88'>{after_bd.get('max_lateral_hops',0)}</div>
-                </div>
-            </div>
-            <div style='text-align:center;font-family:Orbitron,monospace;color:#00ff88;font-size:1.1rem'>
-                RISK REDUCTION: {reduction_pct}%
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown('<div class="section-header">💡 RECOMMENDED SOLUTIONS (SPECIFIC, PER-HOST)</div>', unsafe_allow_html=True)
+    with col_solutions:
+        st.markdown('<div class="section-header">💡 RECOMMENDED REMEDIATION (SPECIFIC, PER-HOST)</div>', unsafe_allow_html=True)
         all_fixes = []
         for node in st.session_state.compromised:
             nd = st.session_state.G.nodes.get(node, {})
@@ -5283,55 +5054,53 @@ if st.session_state.simulation_done:
         else:
             st.markdown(
                 '<div style="font-family:Share Tech Mono;font-size:0.72rem;color:#3d6a8a">'
-                'Run attack simulation to generate targeted remediation steps.</div>',
+                'Run an attack simulation to generate targeted remediation steps.</div>',
                 unsafe_allow_html=True,
             )
 
-    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
-
-    with col_log:
-        st.markdown('<div class="section-header">📟 SIMULATED ATTACK EVENT LOG</div>', unsafe_allow_html=True)
-        if st.session_state.honeypot_triggered:
-            st.markdown("""
-            <div class="honeypot-alert">
-                ⚠ HONEYPOT TRIGGERED (SIMULATED) — modeled attacker probed decoy system<br>
-                <span style='color:#3d6a8a'>Source: Simulated Attacker | Target: Honeypot (port 21/FTP)<br>
-                Action: Risk model updated (+15 penalty)<br>
-                Recommendation: Analyze modeled TTPs for adaptive defense</span>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("""
-        <div style='background:#050a0f;border:1px solid #1a3a5c;padding:10px 12px;font-family:Share Tech Mono'>
-            <div style='font-size:0.62rem;color:#3d6a8a;border-bottom:1px solid #1a3a5c;padding-bottom:6px;margin-bottom:6px'>
-                SOURCE &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; TARGET &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; TECHNIQUE &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; RESULT
-            </div>
-        """, unsafe_allow_html=True)
-        for log in st.session_state.attack_log:
-            sev = log["severity"]
-            color = "#ff3355" if sev == "critical" else "#00ff88" if sev == "ok" else "#ff8c00"
+        st.markdown('<br>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">🍯 ADAPTIVE HONEYPOT FEEDBACK</div>', unsafe_allow_html=True)
+        af = st.session_state.adaptive_feedback
+        if af:
+            hp1, hp2, hp3 = st.columns(3)
+            hp1.metric("Events (24h)", af["event_count"])
+            hp2.metric("Adaptive Boost", f"+{af['boost']}")
+            hp3.metric("Adjusted Risk", f"{af['adjusted_risk']}/100", delta=f"{af['boost']}")
             st.markdown(f"""
-            <div style='font-size:0.66rem;padding:5px 0;border-bottom:1px solid #0a1520;color:#7ab8d4;line-height:1.6'>
-                <div><span style='color:#3d6a8a'>Source:</span> {log["src"]} &nbsp;→&nbsp; <span style='color:#00d4ff'>Target: {log["target"]}</span></div>
-                <div><span style='color:#3d6a8a'>Technique:</span> {log["technique"]}</div>
-                <div><span style='color:#3d6a8a'>Reason:</span> {log["reason"]}</div>
-                <div style='color:{color}'>Result: {log["status"]}</div>
+            <div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+                 padding:8px 10px;margin:6px 0;background:#1a1000;border-left:3px solid #ffd700">
+                {af['reason']}<br>
+                <span style="color:#3d6a8a">Method: {af['method']}</span>
             </div>
             """, unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+                'No adaptive feedback computed yet — run an attack simulation.</div>', unsafe_allow_html=True)
 
-        st.markdown('<br>', unsafe_allow_html=True)
-        st.markdown('<div class="section-header">🔖 MITRE ATT&CK MAPPING</div>', unsafe_allow_html=True)
-        mitre_seen = {}
-        for entry in st.session_state.timeline:
-            if entry["success"]:
-                mitre_seen[entry["mitre_code"]] = entry["mitre_desc"]
-        mitre_html = "".join(f'<span class="mitre-tag">{code}</span>' for code in mitre_seen) + "<br><br>"
-        for code, desc in mitre_seen.items():
-            mitre_html += f'<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin:3px 0"><span style="color:#ff8c00">{code}</span> — {desc}</div>'
-        st.markdown(f'<div style="background:#0d1f2d;border:1px solid #1a3a5c;padding:12px">{mitre_html}</div>', unsafe_allow_html=True)
+    st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+    render_before_after_verification()
 
-        st.markdown('<br>', unsafe_allow_html=True)
+# ═════════════════════════════════════════════════════════════════
+# TAB 4: 🧬 ASSETS & VULNERABILITIES
+# ═════════════════════════════════════════════════════════════════
+with tab_assets_vulns:
+    st.markdown('<div class="section-header">🧬 ASSET INVENTORY &amp; VULNERABILITY INTELLIGENCE</div>', unsafe_allow_html=True)
+
+    # Live Asset Inventory and Changes (if real scan mode)
+    if st.session_state.network_mode == "Real Network Scan":
+        if st.session_state.monitoring_enabled:
+            st.fragment(run_every=st.session_state.monitor_interval)(_render_monitoring_panel)()
+        else:
+            _render_monitoring_panel()
+        st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+
+    render_recent_changes_timeline()
+    st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+
+    vuln_col1, vuln_col2 = st.columns([1, 1], gap="medium")
+
+    with vuln_col1:
         st.markdown('<div class="section-header">🦠 ALL CONFIRMED CVEs DISCOVERED ON NETWORK</div>', unsafe_allow_html=True)
         all_cves = []
         for node, data in st.session_state.G.nodes(data=True):
@@ -5339,7 +5108,7 @@ if st.session_state.simulation_done:
                 all_cves.append((node, data['ip'], c))
         all_cves.sort(key=lambda x: x[2]['cvss'], reverse=True)
         if all_cves:
-            for node, ip, c in all_cves[:10]:
+            for node, ip, c in all_cves[:12]:
                 st.markdown(f"""
                 <div style="font-family:Share Tech Mono;font-size:0.66rem;color:#7ab8d4;
                      padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid #ff3355">
@@ -5347,7 +5116,7 @@ if st.session_state.simulation_done:
                     <span class="mitre-tag" style="border-color:#ff3355;color:#ff3355">CVSS {c['cvss']} ({c.get('severity','?')})</span>
                     <div style="margin-top:4px;color:#e0f4ff">{node.replace(chr(10),' / ')} ({ip}) — {c['service']} {c.get('detected_version') or ''}</div>
                     <div style="margin-top:2px;color:#3d6a8a">{c['summary'][:120]}{'...' if len(c['summary'])>120 else ''}</div>
-                    <div style="margin-top:2px;color:#3d6a8a">Published: {c.get('published')} · Modified: {c.get('modified')} · Confidence: {c.get('detection_confidence')}</div>
+                    <div style="margin-top:2px;color:#3d6a8a">Published: {c.get('published')} · Confidence: {c.get('detection_confidence')}</div>
                 </div>
                 """, unsafe_allow_html=True)
         else:
@@ -5358,134 +5127,165 @@ if st.session_state.simulation_done:
                 unsafe_allow_html=True,
             )
 
-    render_before_after_verification()
-
-    # ─────────────────────────────────────────────────────────
-    # PRIORITY 8/10 — DEDUPLICATED VULNERABILITY FINDINGS
-    # ─────────────────────────────────────────────────────────
-    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
-    st.markdown('<div class="section-header">🧬 DEDUPLICATED FINDINGS (unique CVE × affected assets)</div>', unsafe_allow_html=True)
-    grouped_findings = vuln_dedup.deduplicate_findings(st.session_state.G)
-    if grouped_findings:
-        for g in grouped_findings[:15]:
-            asset_list = ", ".join(a["display_name"] for a in g["affected_assets"][:6])
-            if g["affected_count"] > 6:
-                asset_list += f" (+{g['affected_count'] - 6} more)"
-            st.markdown(f"""
-            <div style="font-family:Share Tech Mono;font-size:0.66rem;color:#7ab8d4;
-                 padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid #00d4ff">
-                <span class="cve-tag">{g['cve_id']}</span>
-                <span class="mitre-tag" style="border-color:#ff3355;color:#ff3355">CVSS {g['cvss']} ({g.get('severity','?')})</span>
-                <span style="color:#ffd700;margin-left:6px">Affected Assets: {g['affected_count']}</span>
-                <div style="margin-top:4px;color:#e0f4ff">{asset_list}</div>
-                <div style="margin-top:2px;color:#3d6a8a">Service: {g['service']} · Source: {g['detection_source']}</div>
-            </div>
-            """, unsafe_allow_html=True)
-    else:
-        st.markdown(
-            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
-            'No CVE findings to deduplicate yet.</div>', unsafe_allow_html=True)
-
-    # ─────────────────────────────────────────────────────────
-    # PRIORITY 13 — CHANGE DETECTION (persisted across app restarts)
-    # ─────────────────────────────────────────────────────────
-    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
-    st.markdown('<div class="section-header">🔁 CHANGE DETECTION (vs last persisted scan)</div>', unsafe_allow_html=True)
-    cs = st.session_state.change_summary
-    if not cs:
-        st.markdown(
-            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
-            'Run a Real Network Scan to generate a persisted baseline for comparison.</div>',
-            unsafe_allow_html=True)
-    elif not cs["has_baseline"]:
-        st.markdown(
-            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
-            'This is the first persisted scan — no previous snapshot to compare against yet. '
-            'Future scans will diff against this one.</div>', unsafe_allow_html=True)
-    else:
-        cd1, cd2, cd3, cd4 = st.columns(4)
-        cd1.metric("New Assets", len(cs["new_assets"]))
-        cd2.metric("Missing Assets", len(cs["missing_assets"]))
-        cd3.metric("New Vulnerabilities", len(cs["new_vulnerabilities"]))
-        cd4.metric("Resolved Vulnerabilities", len(cs["resolved_vulnerabilities"]))
-
-        if cs["changed_assets"]:
-            for ca in cs["changed_assets"][:10]:
-                field_lines = "".join(
-                    f"<div style='color:#3d6a8a'>&bull; {c['field']}: {c['before']} → {c['after']}</div>"
-                    for c in ca["changes"]
-                )
+    with vuln_col2:
+        st.markdown('<div class="section-header">🧬 DEDUPLICATED FINDINGS (unique CVE × affected assets)</div>', unsafe_allow_html=True)
+        grouped_findings = vuln_dedup.deduplicate_findings(st.session_state.G)
+        if grouped_findings:
+            for g in grouped_findings[:15]:
+                asset_list = ", ".join(a["display_name"] for a in g["affected_assets"][:6])
+                if g["affected_count"] > 6:
+                    asset_list += f" (+{g['affected_count'] - 6} more)"
                 st.markdown(f"""
-                <div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
-                     padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid #ff8c00">
-                    <span style="color:#e0f4ff">{ca['hostname'] or ca['ip']} ({ca['ip']})</span>
-                    {f"<span style='color:#ffd700;margin-left:8px'>Risk: {ca['risk_before']} → {ca['risk_after']}</span>" if ca['risk_delta'] is not None else ""}
-                    {field_lines}
+                <div style="font-family:Share Tech Mono;font-size:0.66rem;color:#7ab8d4;
+                     padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid #00d4ff">
+                    <span class="cve-tag">{g['cve_id']}</span>
+                    <span class="mitre-tag" style="border-color:#ff3355;color:#ff3355">CVSS {g['cvss']} ({g.get('severity','?')})</span>
+                    <span style="color:#ffd700;margin-left:6px">Affected Assets: {g['affected_count']}</span>
+                    <div style="margin-top:4px;color:#e0f4ff">{asset_list}</div>
+                    <div style="margin-top:2px;color:#3d6a8a">Service: {g['service']} · Source: {g['detection_source']}</div>
                 </div>
                 """, unsafe_allow_html=True)
-        if not (cs["new_assets"] or cs["missing_assets"] or cs["changed_assets"]):
+        else:
             st.markdown(
-                '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#00ff88">'
-                'No changes detected since the last scan.</div>', unsafe_allow_html=True)
+                '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+                'No CVE findings to deduplicate yet.</div>', unsafe_allow_html=True)
 
-    # ─────────────────────────────────────────────────────────
-    # PRIORITY 19 — ADAPTIVE HONEYPOT FEEDBACK (persistent, rule-based)
-    # ─────────────────────────────────────────────────────────
-    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
-    st.markdown('<div class="section-header">🍯 ADAPTIVE HONEYPOT FEEDBACK</div>', unsafe_allow_html=True)
-    af = st.session_state.adaptive_feedback
-    if af:
-        hp1, hp2, hp3 = st.columns(3)
-        hp1.metric("Honeypot Events (24h)", af["event_count"])
-        hp2.metric("Adaptive Boost Applied", f"+{af['boost']}")
-        hp3.metric("Adjusted Risk", f"{af['adjusted_risk']} / 100", delta=f"{af['boost']}")
-        st.markdown(f"""
-        <div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
-             padding:8px 10px;margin:6px 0;background:#1a1000;border-left:3px solid #ffd700">
-            {af['reason']}<br>
-            <span style="color:#3d6a8a">Method: {af['method']}</span>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown(
-            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
-            'No adaptive feedback computed yet — run an attack simulation.</div>', unsafe_allow_html=True)
+    st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+    cve_hist_col, change_det_col = st.columns([1, 1], gap="medium")
 
-    # ─────────────────────────────────────────────────────────
-    # PRIORITY 20/21/22 — SCAN TIMELINE, SCAN HISTORY, REPORTING
-    # ─────────────────────────────────────────────────────────
-    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
-    col_scanlog, col_history = st.columns([1, 1], gap="medium")
+    with cve_hist_col:
+        st.markdown('<div class="section-header">🧬 VULNERABILITY LIFECYCLE TIMELINE</div>', unsafe_allow_html=True)
+        _CVE_EVENT_ICON = {"DISCOVERED": "🔴", "RESOLVED": "🟢", "CVSS_CHANGED": "🟡", "VERSION_CHANGED": "🟣"}
+        cve_events = st.session_state.get("cve_timeline") or monitor_db.get_cve_timeline(limit=30)
+        if not cve_events:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+                'No CVE lifecycle events recorded yet.</div>', unsafe_allow_html=True)
+        else:
+            for e in cve_events[:20]:
+                icon = _CVE_EVENT_ICON.get(e.get("event_type"), "⚪")
+                ts = (e.get("timestamp") or "")[:16].replace("T", " ")
+                st.markdown(f"""
+                <div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+                     padding:6px 10px;margin:3px 0;background:#0a1520;border-left:3px solid #1a3a5c'>
+                    <span style='color:#00d4ff'>{ts}</span>
+                    &nbsp;{icon}&nbsp;
+                    <span style='color:#e0f4ff'>{html_lib.escape(str(e.get("detail") or ""))}</span>
+                </div>
+                """, unsafe_allow_html=True)
 
-    with col_scanlog:
-        with st.expander("🕒 SCAN TIMELINE (actual operations performed)", expanded=False):
-            if st.session_state.scan_timeline:
-                for ev in st.session_state.scan_timeline[-60:]:
-                    st.markdown(
-                        f'<div class="log-entry"><span style="color:#3d6a8a">{ev["timestamp"]}</span> '
-                        f'<span style="color:#00d4ff">{ev["event"]}</span> — '
-                        f'<span style="color:#7ab8d4">{ev["target"]}</span> '
-                        f'<span style="color:#00ff88">[{ev["status"]}]</span></div>',
-                        unsafe_allow_html=True,
+    with change_det_col:
+        st.markdown('<div class="section-header">🔁 CHANGE DETECTION (vs last persisted scan)</div>', unsafe_allow_html=True)
+        cs = st.session_state.change_summary
+        if not cs:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+                'Run a Real Network Scan to generate a persisted baseline for comparison.</div>',
+                unsafe_allow_html=True)
+        elif not cs["has_baseline"]:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+                'This is the first persisted scan — no previous snapshot to compare against yet. '
+                'Future scans will diff against this one.</div>', unsafe_allow_html=True)
+        else:
+            cd1, cd2, cd3, cd4 = st.columns(4)
+            cd1.metric("New", len(cs["new_assets"]))
+            cd2.metric("Missing", len(cs["missing_assets"]))
+            cd3.metric("New CVEs", len(cs["new_vulnerabilities"]))
+            cd4.metric("Fixed", len(cs["resolved_vulnerabilities"]))
+
+            if cs["changed_assets"]:
+                for ca in cs["changed_assets"][:6]:
+                    field_lines = "".join(
+                        f"<div style='color:#3d6a8a'>&bull; {c['field']}: {c['before']} → {c['after']}</div>"
+                        for c in ca["changes"]
                     )
-            else:
-                st.markdown('<div style="color:#3d6a8a;font-family:Share Tech Mono;font-size:0.7rem">No scan timeline recorded yet (run a Real Network Scan).</div>', unsafe_allow_html=True)
-
-    with col_history:
-        with st.expander("📈 SCAN HISTORY", expanded=False):
-            if st.session_state.scan_history:
-                for h in st.session_state.scan_history[-10:]:
                     st.markdown(f"""
-                    <div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;padding:6px 10px;margin:3px 0;background:#0a1520;border-left:3px solid #00d4ff'>
-                        Scan #{h['scan_id']} ({h['scan_type']})<br>
-                        {h['asset_count']} assets · Avg Risk {h['average_risk']} ·
-                        {h['critical_count']}C / {h['high_count']}H / {h['medium_count']}M / {h['low_count']}L
+                    <div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+                         padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid #ff8c00">
+                        <span style="color:#e0f4ff">{ca['hostname'] or ca['ip']} ({ca['ip']})</span>
+                        {f"<span style='color:#ffd700;margin-left:8px'>Risk: {ca['risk_before']} → {ca['risk_after']}</span>" if ca['risk_delta'] is not None else ""}
+                        {field_lines}
                     </div>
                     """, unsafe_allow_html=True)
-            else:
-                st.markdown('<div style="color:#3d6a8a;font-family:Share Tech Mono;font-size:0.7rem">No scans recorded yet this session.</div>', unsafe_allow_html=True)
+            if not (cs["new_assets"] or cs["missing_assets"] or cs["changed_assets"]):
+                st.markdown(
+                    '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#00ff88">'
+                    'No changes detected since the last scan.</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section-header">📤 REPORTING / EXPORT</div>', unsafe_allow_html=True)
+# ═════════════════════════════════════════════════════════════════
+# TAB 5: 🚨 ALERT CENTER, REPORTS & SETTINGS
+# ═════════════════════════════════════════════════════════════════
+with tab_alerts:
+    st.markdown('<div class="section-header">🎯 DEDICATED ALERT CENTER</div>', unsafe_allow_html=True)
+
+    ac_col1, ac_col2, ac_col3 = st.columns([1.3, 2, 1.3])
+    with ac_col1:
+        ac_severity = st.selectbox("Severity Filter", ["All", "Critical", "High", "Medium", "Low", "Info"],
+                                    key="alert_center_severity", help="Show only alerts at this severity level.")
+    with ac_col2:
+        ac_search = st.text_input("Search by IP, hostname, CVE, or alert type",
+                                   key="alert_center_search", placeholder="e.g. 192.168.1.12, CVE-2024-…, RISK_INCREASE",
+                                   help="Matches against the asset, title, description, and alert type fields.")
+    with ac_col3:
+        ac_show_acked = st.checkbox("Show acknowledged alerts", value=False, key="alert_center_show_acked",
+                                     help="Acknowledged alerts are hidden by default but never deleted.")
+
+    ac_results = monitor_db.get_alerts(
+        limit=300,
+        severity=None if ac_severity == "All" else ac_severity.upper(),
+        search=ac_search.strip() if ac_search else None,
+        acknowledged=None if ac_show_acked else False,
+    )
+
+    st.markdown(
+        f"<div style='font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin-bottom:6px'>"
+        f"{len(ac_results)} alert(s) matching current filters</div>", unsafe_allow_html=True)
+
+    if not ac_results:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+            'No alerts match these filters.</div>', unsafe_allow_html=True)
+    else:
+        for a in ac_results[:50]:
+            sev = a.get("severity", "INFO")
+            color = _ALERT_SEVERITY_COLOR.get(sev, "#3d6a8a")
+            icon = _ALERT_TYPE_ICON.get(a.get("alert_type"), "🔔")
+            ts = (a.get("timestamp") or "")[:19].replace("T", " ")
+            is_acked = bool(a.get("acknowledged"))
+            card_col, btn_col = st.columns([5, 1])
+            with card_col:
+                delta_html = ""
+                if a.get("old_value") and a.get("new_value"):
+                    delta_html = (f"<div style='color:#e0f4ff;font-family:Orbitron,monospace;font-size:0.75rem;margin-top:3px'>"
+                                   f"{html_lib.escape(str(a['old_value']))} → {html_lib.escape(str(a['new_value']))}</div>")
+                ack_badge = (f"<span style='color:#00ff88;font-size:0.6rem;margin-left:8px'>✔ ACKNOWLEDGED "
+                             f"{(a.get('acknowledged_at') or '')[:16].replace('T',' ')}</span>") if is_acked else ""
+                st.markdown(f"""
+                <div style='background:#0d1f2d;border:1px solid {color};border-left:4px solid {color};
+                     padding:9px 12px;margin:4px 0;font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+                     opacity:{0.6 if is_acked else 1}'>
+                    <div style='display:flex;justify-content:space-between;align-items:center'>
+                        <span style='color:{color};font-weight:bold'>{icon} {sev} — {a.get("title","")}</span>
+                        <span style='color:#3d6a8a;font-size:0.6rem'>{ts}</span>
+                    </div>
+                    <div style='color:#e0f4ff;margin-top:2px'>Asset: {html_lib.escape(str(a.get("asset") or "—"))}
+                        <span style='color:#3d6a8a'>· {a.get("alert_type","")}</span>{ack_badge}</div>
+                    <div style='margin-top:2px'>{html_lib.escape(str(a.get("description") or ""))}</div>
+                    {delta_html}
+                </div>
+                """, unsafe_allow_html=True)
+            with btn_col:
+                if not is_acked:
+                    if st.button("✅ Ack", key=f"ack_alert_{a['id']}", use_container_width=True,
+                                 help="Mark this alert acknowledged — it stays in history, never deleted."):
+                        monitor_db.acknowledge_alert(a["id"])
+                        st.toast("Alert acknowledged", icon="✅")
+                        st.rerun()
+
+    st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-header">📤 EXECUTIVE REPORTING &amp; DATA EXPORT</div>', unsafe_allow_html=True)
     rep1, rep2, rep3, rep4 = st.columns(4)
     with rep1:
         st.download_button("⬇ Asset Inventory (CSV)", export_asset_inventory_csv(st.session_state.G),
@@ -5522,115 +5322,78 @@ if st.session_state.simulation_done:
             st.button("⬇ Executive Report (PDF)", disabled=True, use_container_width=True,
                        help="reportlab is not installed — run: pip install reportlab")
 
-else:
-    if st.session_state.network_mode == "Real Network Scan":
-        ready_note = (
-            "1. Click <span style='color:#ff8c00'>📡 SCAN NETWORK</span> in the sidebar to discover all LAN devices<br>"
-            "2. The tool grabs real service banners and checks them against live NVD CVE data<br>"
-            "3. Review each node's open ports, confirmed CVEs, inferred OS/device/criticality with evidence<br>"
-            "4. Select which system is <b>initially compromised</b> (attacker foothold)<br>"
-            "5. Click <span style='color:#00d4ff'>▶ RUN ATTACK SIMULATION</span> to see modeled lateral movement<br>"
-            "6. Review the risk breakdown, apply defenses, and compare Before vs After"
-        )
-    else:
-        ready_note = (
-            "1. Select an entry node (attacker's foothold) from the sidebar<br>"
-            "2. Click <span style='color:#00d4ff'>▶ RUN ATTACK SIMULATION</span> to begin<br>"
-            "3. Watch simulated attack propagation on the network exposure model<br>"
-            "4. Review risk analysis and defense recommendations"
-        )
+    st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+    col_scanlog, col_history = st.columns([1, 1], gap="medium")
 
-    st.markdown(f"""
-    <div style='background:#0a1520;border:1px solid #1a3a5c;border-left:3px solid #00d4ff;
-         padding:20px 24px;font-family:Share Tech Mono;font-size:0.78rem;line-height:2;
-         text-align:center;margin-top:20px'>
-        <div style='color:#00d4ff;font-size:0.9rem;font-family:Orbitron,monospace;letter-spacing:3px;margin-bottom:12px'>
-            SYSTEM READY
-        </div>
-        <div style='color:#7ab8d4'>{ready_note}</div>
-        <div style='color:#3d6a8a;margin-top:16px;font-size:0.65rem'>
-            PASSIVE SCANNING ONLY — NO EXPLOITS PERFORMED<br>
-            REAL CVE DATA FROM NIST NVD WHERE AVAILABLE<br>
-            ALIGNED WITH MITRE ATT&CK FRAMEWORK
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if st.session_state.scan_timeline:
+    with col_scanlog:
         with st.expander("🕒 SCAN TIMELINE (actual operations performed)", expanded=False):
-            for ev in st.session_state.scan_timeline[-60:]:
-                st.markdown(
-                    f'<div class="log-entry"><span style="color:#3d6a8a">{ev["timestamp"]}</span> '
-                    f'<span style="color:#00d4ff">{ev["event"]}</span> — '
-                    f'<span style="color:#7ab8d4">{ev["target"]}</span> '
-                    f'<span style="color:#00ff88">[{ev["status"]}]</span></div>',
-                    unsafe_allow_html=True,
-                )
-    if st.session_state.scan_history:
+            if st.session_state.scan_timeline:
+                for ev in st.session_state.scan_timeline[-60:]:
+                    st.markdown(
+                        f'<div class="log-entry"><span style="color:#3d6a8a">{ev["timestamp"]}</span> '
+                        f'<span style="color:#00d4ff">{ev["event"]}</span> — '
+                        f'<span style="color:#7ab8d4">{ev["target"]}</span> '
+                        f'<span style="color:#00ff88">[{ev["status"]}]</span></div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.markdown('<div style="color:#3d6a8a;font-family:Share Tech Mono;font-size:0.7rem">No scan timeline recorded yet (run a Real Network Scan).</div>', unsafe_allow_html=True)
+
+    with col_history:
         with st.expander("📈 SCAN HISTORY", expanded=False):
-            for h in st.session_state.scan_history[-10:]:
-                st.markdown(f"""
-                <div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;padding:6px 10px;margin:3px 0;background:#0a1520;border-left:3px solid #00d4ff'>
-                    Scan #{h['scan_id']} ({h['scan_type']})<br>
-                    {h['asset_count']} assets · Avg Risk {h['average_risk']} ·
-                    {h['critical_count']}C / {h['high_count']}H / {h['medium_count']}M / {h['low_count']}L
-                </div>
-                """, unsafe_allow_html=True)
-        st.download_button("⬇ Asset Inventory (CSV)", export_asset_inventory_csv(st.session_state.G),
-                            file_name="acds_asset_inventory.csv", mime="text/csv")
+            if st.session_state.scan_history:
+                for h in st.session_state.scan_history[-10:]:
+                    st.markdown(f"""
+                    <div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;padding:6px 10px;margin:3px 0;background:#0a1520;border-left:3px solid #00d4ff'>
+                        Scan #{h['scan_id']} ({h['scan_type']})<br>
+                        {h['asset_count']} assets · Avg Risk {h['average_risk']} ·
+                        {h['critical_count']}C / {h['high_count']}H / {h['medium_count']}M / {h['low_count']}L
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.markdown('<div style="color:#3d6a8a;font-family:Share Tech Mono;font-size:0.7rem">No scans recorded yet this session.</div>', unsafe_allow_html=True)
 
-st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
+    with st.expander("⚙ SYSTEM SETTINGS", expanded=False):
+        _s = monitor_db.get_all_settings()
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a;margin-bottom:10px">'
+            'Changes are saved to SQLite and take effect immediately for the rest of this session.</div>', unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────
-# SPRINT 3 — PHASE 8: SETTINGS PANEL
-# Always visible regardless of network mode / simulation state, since
-# it configures the app itself rather than any one scan. Every field
-# is persisted to SQLite (core.database settings table) and applied
-# live via apply_runtime_settings() the moment Save is clicked — no
-# restart required.
-# ─────────────────────────────────────────────────────────────────
-with st.expander("⚙ SETTINGS", expanded=False):
-    _s = monitor_db.get_all_settings()
-    st.markdown(
-        '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a;margin-bottom:10px">'
-        'Changes are saved to SQLite and take effect immediately for the rest of this session — '
-        'no restart needed.</div>', unsafe_allow_html=True)
+        set_col1, set_col2 = st.columns(2)
+        with set_col1:
+            st.markdown("**Monitoring**")
+            s_interval = st.selectbox("Monitoring Interval", ["30s", "1m", "5m"],
+                                       index=["30s", "1m", "5m"].index(_s["monitoring_interval"]),
+                                       key="settings_monitor_interval",
+                                       help="How often background monitoring re-scans while enabled.")
+            s_scan_timeout = st.slider("Scan Timeout (seconds/port)", 0.2, 5.0,
+                                        float(_s["scan_timeout_seconds"]), 0.1, key="settings_scan_timeout",
+                                        help="Per-port connect timeout during discovery.")
+            s_banner_timeout = st.slider("Banner Read Timeout (seconds)", 0.2, 5.0,
+                                          float(_s["banner_timeout_seconds"]), 0.1, key="settings_banner_timeout",
+                                          help="How long to wait for a service banner before giving up on that port.")
+            s_nvd_cache = st.slider("NVD Cache Duration (hours)", 1, 168,
+                                     int(_s["nvd_cache_hours"]), 1, key="settings_nvd_cache",
+                                     help="How long a CVE lookup result is reused before re-querying NVD.")
 
-    set_col1, set_col2 = st.columns(2)
-    with set_col1:
-        st.markdown("**Monitoring**")
-        s_interval = st.selectbox("Monitoring Interval", ["30s", "1m", "5m"],
-                                   index=["30s", "1m", "5m"].index(_s["monitoring_interval"]),
-                                   key="settings_monitor_interval",
-                                   help="How often background monitoring re-scans while enabled.")
-        s_scan_timeout = st.slider("Scan Timeout (seconds/port)", 0.2, 5.0,
-                                    float(_s["scan_timeout_seconds"]), 0.1, key="settings_scan_timeout",
-                                    help="Per-port connect timeout during discovery.")
-        s_banner_timeout = st.slider("Banner Read Timeout (seconds)", 0.2, 5.0,
-                                      float(_s["banner_timeout_seconds"]), 0.1, key="settings_banner_timeout",
-                                      help="How long to wait for a service banner before giving up on that port.")
-        s_nvd_cache = st.slider("NVD Cache Duration (hours)", 1, 168,
-                                 int(_s["nvd_cache_hours"]), 1, key="settings_nvd_cache",
-                                 help="How long a CVE lookup result is reused before re-querying NVD.")
-
-    with set_col2:
-        st.markdown("**Risk &amp; Alerts**")
-        s_crit = st.slider("Risk Threshold — CRITICAL ≥", 50, 100,
-                            int(_s["risk_threshold_critical"]), 1, key="settings_risk_critical")
-        s_high = st.slider("Risk Threshold — HIGH ≥", 30, int(s_crit) - 1,
-                            min(int(_s["risk_threshold_high"]), int(s_crit) - 1), 1, key="settings_risk_high")
-        s_medium = st.slider("Risk Threshold — MEDIUM ≥", 0, int(s_high) - 1,
-                              min(int(_s["risk_threshold_medium"]), max(int(s_high) - 1, 0)), 1,
-                              key="settings_risk_medium")
-        s_alert_threshold = st.selectbox(
-            "Alert Severity Threshold", ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
-            index=["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"].index(_s["alert_severity_threshold"]),
-            key="settings_alert_threshold",
-            help="Alerts below this severity are not persisted.")
-        s_budget = st.number_input("Default Defense Budget", min_value=10, max_value=500,
-                                    value=int(_s["default_budget"]), step=10, key="settings_default_budget")
-        st.selectbox("Theme", ["cyberpunk"], index=0, key="settings_theme", disabled=True,
-                     help="ACDS currently ships one theme; this preference is persisted for future themes.")
+        with set_col2:
+            st.markdown("**Risk &amp; Alerts**")
+            s_crit = st.slider("Risk Threshold — CRITICAL ≥", 50, 100,
+                                int(_s["risk_threshold_critical"]), 1, key="settings_risk_critical")
+            s_high = st.slider("Risk Threshold — HIGH ≥", 30, int(s_crit) - 1,
+                                min(int(_s["risk_threshold_high"]), int(s_crit) - 1), 1, key="settings_risk_high")
+            s_medium = st.slider("Risk Threshold — MEDIUM ≥", 0, int(s_high) - 1,
+                                  min(int(_s["risk_threshold_medium"]), max(int(s_high) - 1, 0)), 1,
+                                  key="settings_risk_medium")
+            s_alert_threshold = st.selectbox(
+                "Alert Severity Threshold", ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+                index=["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"].index(_s["alert_severity_threshold"]),
+                key="settings_alert_threshold",
+                help="Alerts below this severity are not persisted.")
+            s_budget = st.number_input("Default Defense Budget", min_value=10, max_value=500,
+                                        value=int(_s["default_budget"]), step=10, key="settings_default_budget")
+            st.selectbox("Theme", ["cyberpunk"], index=0, key="settings_theme", disabled=True,
+                         help="ACDS currently ships one theme; this preference is persisted for future themes.")
 
     if st.button("💾 SAVE SETTINGS", use_container_width=True):
         new_settings = {

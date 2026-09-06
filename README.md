@@ -15,37 +15,35 @@ ACDS combines passive network discovery, NIST NVD CVE vulnerability mapping, dyn
 
 ---
 
-## 🚀 Key Features
+## 🚀 Key Features & Dashboard Architecture
 
-- **🌐 Network Discovery & Modeling Engine**:
-  - ICMP / ARP / TCP-based active/passive network scanning.
-  - MAC Address OUI vendor fingerprinting (Apple, Samsung, Intel, Cisco, etc.).
-  - Passive banner grabbing for open services (SSH, HTTP, FTP, MySQL, SMTP, etc.).
-  - Automatic asset role and criticality inference with confidence scoring.
-- **🔍 NIST NVD CVE Vulnerability Intelligence**:
-  - Live query integration with the NIST National Vulnerability Database (NVD) REST API 2.0.
-  - Real CVSS v3.x scoring and vulnerability descriptions with automated offline database fallback.
-  - Multi-host CVE deduplication across the entire network.
-- **🎯 Dynamic Risk Intelligence Engine**:
-  - **Overall ACDS Risk Score**: Explainable formula weighting Asset Risk (40%), Blast Radius (30%), Critical Asset Exposure (15%), and Network Exposure (15%).
-  - Graph-topology network exposure scoring (reachable assets, degree centrality, sensitive lateral paths).
-  - Continuous risk history logging and trend visualizer.
-- **⚔️ Attack Path Simulation**:
-  - BFS-based lateral movement and simulated privilege escalation.
-  - Granular step-by-step MITRE ATT&CK technique mapping (T1021, T1078, T1068, T1190, etc.).
-  - Real-time animated attack path visualization with interactive PyVis topology graphs.
-  - Honeypot decoy integration with adaptive threat frequency alerting.
-- **🛡️ Adaptive Defense Optimizer**:
-  - Greedy knapsack optimization maximizing risk reduction under SME budget constraints.
-  - Specific, actionable remediation guidance (e.g., specific package patches, isolation, credential hardening).
-  - Before vs. After verification re-simulating the attack to validate defense posture.
-- **🛰️ Persistent Monitoring & Change Detection**:
-  - SQLite persistence layer for lifelong asset lifecycle tracking (`ONLINE` / `OFFLINE`).
-  - Automated diff engine detecting new/removed assets, opened/closed ports, service version updates, and risk deltas.
-  - Background periodic polling (`st.fragment`) with automated alert generation.
-- **📄 Executive Reporting**:
-  - One-click PDF Executive Summary report generation (via ReportLab).
-  - CSV asset inventory and vulnerability data exports.
+ACDS features a streamlined **5-tab command center**:
+
+1. **🏠 Executive Dashboard**:
+   - Executive KPIs (Total Assets, Critical Assets, Active CVEs, Overall ACDS Risk, Active Alerts, Average Risk).
+   - Plain-English Executive Briefing for non-technical stakeholders.
+   - 4-Component Overall Risk Formula Breakdown (`Average Asset Risk × 40% + Blast Radius × 30% + Critical Asset Exposure × 15% + Network Exposure × 15%`).
+   - Risk Trend & Severity Distribution charts, plus Top 10 High-Risk Assets table.
+2. **⚔️ Attack Simulation & Live Map**:
+   - **Unified Side-by-Side Command View**: Real-time interactive PyVis network topology map alongside attack progression.
+   - Foothold / Entry Point selector with instant graph path illumination (simulated lateral movement routes, compromised nodes in red, active targets in orange).
+   - Bounded 0–100 Blast Radius calculator (Spread, Critical Impact, Attack Depth, Systems Controlled, Critical Assets Reached).
+   - Granular step-by-step Attack Timeline cards with MITRE ATT&CK technique tags.
+   - Expandable Asset Intelligence Inspector and simulated attack event log.
+3. **🛡️ Defense & Remediation**:
+   - Greedy knapsack budget optimizer maximizing risk reduction under SME cost constraints.
+   - Specific, actionable remediation guidance (exact patches, host isolation, privilege hardening).
+   - Adaptive Honeypot Decoy feedback and frequency boosting.
+   - Before vs. After Verification matrix re-evaluating risk post-defense.
+4. **🧬 Assets & Vulnerabilities**:
+   - Live asset inventory and real network scanning monitoring panel.
+   - Confirmed CVEs with NIST NVD CVSS scores and confidence ratings.
+   - Cross-host CVE deduplication (unique CVE × affected hosts).
+   - Vulnerability lifecycle tracking and change detection vs. baseline scans.
+5. **🚨 Alerts & Reports**:
+   - Dedicated Alert Center with severity filtering, search, and one-click acknowledgement.
+   - Multi-format exports: Automated PDF Executive Report (via ReportLab), CSV Asset Inventory, CSV Vulnerability Findings, and Plaintext Summaries.
+   - Scan timeline, history audits, and system configuration settings.
 
 ---
 
