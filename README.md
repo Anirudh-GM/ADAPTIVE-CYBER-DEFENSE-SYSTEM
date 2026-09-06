@@ -1,149 +1,161 @@
-# ADAPTIVE CYBER DEFENSE SYSTEM FOR SMEs
+# ADAPTIVE CYBER DEFENSE SYSTEM FOR SMEs (ACDS v3.0)
 
-Cybersecurity Attack Simulation & Defense Platform for Small and Medium Enterprises
+Cybersecurity Attack Simulation, Continuous Risk Intelligence, and Defense Optimization Platform tailored for Small and Medium Enterprises.
 
-## Overview
+---
 
-This system provides an interactive platform for simulating cyber attacks on network infrastructure and optimizing defense strategies. It uses graph-based modeling to represent network topology, BFS-based attack path simulation, and greedy optimization algorithms for defense resource allocation.
+## 🌟 Overview
 
-## Features
+The **Adaptive Cyber Defense System (ACDS)** provides an interactive, graph-based security platform designed to empower SMEs with enterprise-grade threat modeling and automated defensive recommendations. 
 
-- **Network Modeling Engine**: Build and visualize network topologies with node attributes (IP, role, criticality, vulnerability)
-- **Real Network Scan**: Discover live devices on your network via ICMP ping
-- **Attack Simulation**: BFS-based attack path simulation with MITRE ATT&CK technique mapping
-- **Risk Assessment**: Calculate blast radius and risk scores based on spread, critical impact, and attack depth
-- **Defense Optimization**: Greedy knapsack algorithm for optimal defense action selection within budget constraints
-- **Interactive Visualization**: PyVis-powered network graphs with cyberpunk styling
-- **Honeypot Integration**: Decoy systems for attack detection and alerting
+ACDS combines passive network discovery, NIST NVD CVE vulnerability mapping, dynamic network exposure analysis, simulated lateral-movement attack modeling (MITRE ATT&CK mapped), continuous background asset monitoring, and greedy defense knapsack optimization.
 
-## MITRE ATT&CK Alignment
+> [!NOTE]
+> **Safety & Ethics**: Attack simulations are purely probabilistic graph-theoretic models. **No real exploit payloads, credential attacks, or intrusive traffic are ever generated against target hosts.**
 
-- **T1021** - Remote Services (lateral movement via SSH)
-- **T1078** - Valid Accounts (credential reuse)
-- **T1068** - Exploitation for Privilege Escalation
-- **T1005** - Data from Local System (database exfiltration)
-- **T1190** - Exploit Public-Facing Application
-- **T1003** - OS Credential Dumping (honeypot trap)
+---
 
-## Virtual Lab Mapping
+## 🚀 Key Features
 
-This system maps to a real UTM virtual lab environment:
+- **🌐 Network Discovery & Modeling Engine**:
+  - ICMP / ARP / TCP-based active/passive network scanning.
+  - MAC Address OUI vendor fingerprinting (Apple, Samsung, Intel, Cisco, etc.).
+  - Passive banner grabbing for open services (SSH, HTTP, FTP, MySQL, SMTP, etc.).
+  - Automatic asset role and criticality inference with confidence scoring.
+- **🔍 NIST NVD CVE Vulnerability Intelligence**:
+  - Live query integration with the NIST National Vulnerability Database (NVD) REST API 2.0.
+  - Real CVSS v3.x scoring and vulnerability descriptions with automated offline database fallback.
+  - Multi-host CVE deduplication across the entire network.
+- **🎯 Dynamic Risk Intelligence Engine**:
+  - **Overall ACDS Risk Score**: Explainable formula weighting Asset Risk (40%), Blast Radius (30%), Critical Asset Exposure (15%), and Network Exposure (15%).
+  - Graph-topology network exposure scoring (reachable assets, degree centrality, sensitive lateral paths).
+  - Continuous risk history logging and trend visualizer.
+- **⚔️ Attack Path Simulation**:
+  - BFS-based lateral movement and simulated privilege escalation.
+  - Granular step-by-step MITRE ATT&CK technique mapping (T1021, T1078, T1068, T1190, etc.).
+  - Real-time animated attack path visualization with interactive PyVis topology graphs.
+  - Honeypot decoy integration with adaptive threat frequency alerting.
+- **🛡️ Adaptive Defense Optimizer**:
+  - Greedy knapsack optimization maximizing risk reduction under SME budget constraints.
+  - Specific, actionable remediation guidance (e.g., specific package patches, isolation, credential hardening).
+  - Before vs. After verification re-simulating the attack to validate defense posture.
+- **🛰️ Persistent Monitoring & Change Detection**:
+  - SQLite persistence layer for lifelong asset lifecycle tracking (`ONLINE` / `OFFLINE`).
+  - Automated diff engine detecting new/removed assets, opened/closed ports, service version updates, and risk deltas.
+  - Background periodic polling (`st.fragment`) with automated alert generation.
+- **📄 Executive Reporting**:
+  - One-click PDF Executive Summary report generation (via ReportLab).
+  - CSV asset inventory and vulnerability data exports.
 
-```
-VM1 (User-PC)   → 192.168.1.10  → Entry point, simulates attacker's foothold
-VM2 (Server)    → 192.168.1.20  → Apache web server, lateral movement target
-VM3 (Database)  → 192.168.1.30  → MySQL database, high-value target
-```
+---
 
-### UTM Setup Steps (MacBook M4 / Apple Silicon)
+## 🗺️ MITRE ATT&CK Alignment
 
-1. Download UTM from https://mac.getutm.app/
-2. Download Ubuntu 22.04 ARM64 ISO from https://ubuntu.com/download/server/arm
-3. Create VM: New → Virtualize → Linux → Browse ISO
-4. Set RAM: 2048MB, CPU: 2 cores, Storage: 20GB
-5. Repeat for 3 VMs, assign static IPs via /etc/netplan
-6. Enable UTM Shared Network for inter-VM connectivity
-7. Verify: ping 192.168.1.20 from VM1
+| Technique ID | Technique Name | Simulation Context |
+|---|---|---|
+| **T1021** | Remote Services | Lateral movement via SSH/RDP/SMB services |
+| **T1078** | Valid Accounts | Credential reuse across network nodes |
+| **T1068** | Exploitation for Privilege Escalation | Local privilege elevation on vulnerable hosts |
+| **T1190** | Exploit Public-Facing Application | Initial breach on web servers and exposed endpoints |
+| **T1005** | Data from Local System | Targeted exfiltration from high-criticality database hosts |
+| **T1003** | OS Credential Dumping | Honeypot decoy interaction detection |
 
-## Installation
+---
+
+## 🛠️ Installation & Setup
 
 ### Prerequisites
+- **Python 3.8+** (tested on Python 3.10–3.13)
+- `pip` package manager
 
-- Python 3.8 or higher
-- pip package manager
-
-### Setup
-
-1. Clone the repository:
+### 1. Clone the Repository
 ```bash
-git clone <repository-url>
+git clone https://github.com/Anirudh-GM/ADAPTIVE-CYBER-DEFENSE-SYSTEM.git
 cd ADAPTIVE-CYBER-DEFENSE-SYSTEM
 ```
 
-2. Create a virtual environment:
-```bash
-python -m venv .venv
-```
-
-3. Activate the virtual environment:
+### 2. Create and Activate Virtual Environment
 
 **Windows:**
-```bash
+```powershell
+python -m venv .venv
 .venv\Scripts\activate
 ```
 
-**Linux/Mac:**
+**Linux / macOS:**
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-4. Install dependencies:
+### 3. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-## Usage
+---
 
-### Run the Application
+## 💻 Running the Application
 
-**Windows:**
-```bash
-run_app.bat
+### Option 1: Using the Batch Launcher (Windows)
+Double-click `run_app.bat` or run:
+```cmd
+.\run_app.bat
 ```
 
-**Linux/Mac:**
+### Option 2: Using the Streamlit CLI
 ```bash
 streamlit run app.py
 ```
 
-The application will open in your default web browser at `http://localhost:8501`
+The application will open in your default browser at:
+👉 **`http://localhost:8501`**
 
-### Application Modes
+---
 
-1. **Simulation Mode**: Use predefined network topology for attack simulation
-2. **Real Network Mode**: Scan your actual network and build dynamic graph from discovered devices
-
-### Defense Actions
-
-The system recommends defense actions based on:
-- **Patch**: Apply security patches to vulnerable nodes
-- **Isolate**: Network quarantine of compromised nodes
-- **Reduce Privileges**: Enforce least privilege on critical systems
-- **Deploy IDS**: Network-wide intrusion detection
-
-## Requirements
-
-```
-streamlit>=1.57.0
-networkx>=2.8.0
-pyvis>=0.3.2
-pandas>=2.0.0
-numpy>=2.0.0
-```
-
-## Project Structure
+## 📦 Project Structure
 
 ```
 ADAPTIVE-CYBER-DEFENSE-SYSTEM/
-├── app.py                 # Main Streamlit application
-├── requirements.txt       # Python dependencies
-├── run_app.bat           # Windows launch script
-├── lib/                  # PyVis local resources
+├── app.py                 # Main Streamlit web application & UI dashboards
+├── core/
+│   ├── acds_logging.py    # Structured logging infrastructure
+│   ├── alert_engine.py    # Real-time event & threat alert generator
+│   ├── change_detector.py # Network diff engine (assets, ports, services, CVEs)
+│   ├── database.py        # Persistent asset inventory, service & risk history
+│   ├── honeypot_engine.py # Honeypot decoy interaction logger & threat signal
+│   ├── network_exposure.py# Graph centrality & exposure path calculations
+│   └── vuln_dedup.py      # CVE deduplication and cross-host aggregation
+├── data/
+│   ├── database.py        # Scan history persistence layer
+│   └── acds.db            # SQLite database (auto-created on first run)
+├── lib/                   # PyVis interactive visualization dependencies
 │   ├── bindings/
 │   ├── tom-select/
 │   └── vis-9.1.2/
-├── .venv/                # Virtual environment (gitignored)
-└── temp/                 # Temporary files (gitignored)
+├── requirements.txt       # Project Python dependencies
+├── run_app.bat            # Windows startup script
+├── LICENSE                # MIT License
+└── README.md              # Project documentation
 ```
 
-## License
+---
+
+## 📦 Dependencies
+
+- `streamlit>=1.32.0` - Interactive web application framework
+- `pandas>=2.0.0` - Data manipulation and tabular analysis
+- `networkx>=3.2` - Graph data structures and path algorithms
+- `pyvis>=0.3.2` - Interactive network physics visualizer
+- `reportlab>=4.0.0` - Automated PDF Executive Report generation
+- `requests>=2.31.0` - NIST NVD REST API communication
+
+---
+
+## 📜 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Contributing
+## ⚠️ Disclaimer
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Disclaimer
-
-This tool is for educational and defensive purposes only. Always obtain proper authorization before scanning or testing any network infrastructure.
+This software is designed exclusively for authorized network defense, educational research, and internal SME risk posture assessment. Always obtain explicit authorization before scanning networks you do not own.

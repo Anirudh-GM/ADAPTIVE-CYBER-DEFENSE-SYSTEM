@@ -66,6 +66,7 @@ your jurisdiction even though no exploitation occurs.
 """
 
 import streamlit as st
+import pandas as pd
 import networkx as nx
 import time
 import random
@@ -84,6 +85,43 @@ import os
 import html as html_lib
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, HRFlowable,
+    )
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    # Sprint 3 — Phase 7 (operational reliability, applied early): a
+    # missing optional dependency must never crash app startup — the PDF
+    # download button is simply disabled with an explanatory message.
+    REPORTLAB_AVAILABLE = False
+
+# Persistence + adaptive modules (Priority 13/19/8-10 — see data/database.py,
+# core/change_detector.py, core/honeypot_engine.py, core/vuln_dedup.py)
+from data import database
+from core import change_detector, honeypot_engine, vuln_dedup
+
+# Sprint 1 — persistent asset inventory + background monitoring
+# (core/database.py). Imported as monitor_db to avoid clashing with the
+# existing `from data import database` above — the two modules serve
+# different purposes and both stay active side by side.
+from core import database as monitor_db
+
+# Sprint 2 — Dynamic Risk Intelligence: graph-topology network exposure
+# scoring (Phase 2/3) and the real-time alert engine (Phase 7). Both are
+# pure logic modules — persistence goes through monitor_db (core/database.py)
+# above, exactly like Sprint 1's change_detector/honeypot_engine.
+from core import network_exposure, alert_engine
+
+# Sprint 3 — Phase 7: shared rotating-file + console logger (core/acds_logging.py).
+from core.acds_logging import get_logger
+acds_log = get_logger("app")
 
 try:
     import requests
@@ -562,9 +600,16 @@ RISK_WEIGHT_SENSITIVE_SERVICES = 0.15
 RISK_WEIGHT_CRITICALITY = 0.15
 RISK_WEIGHT_NETWORK_EXPOSURE = 0.10
 
-# Overall ACDS Risk aggregation weights (Priority 15) — ACDS design choice
-OVERALL_WEIGHT_ASSET_RISK = 0.60
-OVERALL_WEIGHT_BLAST_RADIUS = 0.40
+# Overall ACDS Risk aggregation weights (Priority 15 / Sprint 2 Phase 3)
+# — ACDS design choice, must sum to 1.0. Sprint 2 extends the original
+# two-component aggregation (Asset Risk 60% / Blast Radius 40%) with two
+# additional documented components so the primary dashboard metric
+# actually reflects Critical Asset Exposure and Network Exposure too,
+# not just averaged per-host risk and simulated blast radius.
+OVERALL_WEIGHT_ASSET_RISK = 0.40
+OVERALL_WEIGHT_BLAST_RADIUS = 0.30
+OVERALL_WEIGHT_CRITICAL_EXPOSURE = 0.15
+OVERALL_WEIGHT_NETWORK_EXPOSURE = 0.15
 
 # Documented cap for the service/port exposure component (Priority 8).
 # SCAN_PORTS currently checks 19 ports, so a host with ~10+ open ports
@@ -590,8 +635,52 @@ SEVERITY_THRESHOLDS = (
     (85, 'CRITICAL'), (65, 'HIGH'), (35, 'MEDIUM'), (0, 'LOW'),
 )
 
+# Sprint 3 — Phase 8: runtime-tunable operational settings. These start
+# as the same hardcoded values Sprint 1/2 always used, and are
+# overwritten from SQLite (core.database settings table) by
+# apply_runtime_settings() once the session starts — see SESSION STATE
+# INITIALIZATION below and the ⚙ SETTINGS panel for where they're edited.
+SCAN_TIMEOUT_SECONDS = 0.6
+BANNER_TIMEOUT_SECONDS = 1.2
+NVD_CACHE_HOURS = 24
+ALERT_SEVERITY_THRESHOLD = "LOW"
+_SEVERITY_RANK = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+
+def apply_runtime_settings(settings=None):
+    """Sprint 3 — Phase 8: pull persisted settings from SQLite and apply
+    them to the module-level knobs the rest of the app reads at call
+    time (scan timeouts, NVD cache TTL, alert severity floor) and to
+    SEVERITY_THRESHOLDS itself. Safe to call repeatedly — the Settings
+    panel calls this immediately after saving so changes take effect
+    without restarting the app."""
+    global SEVERITY_THRESHOLDS, SCAN_TIMEOUT_SECONDS, BANNER_TIMEOUT_SECONDS
+    global NVD_CACHE_HOURS, ALERT_SEVERITY_THRESHOLD
+    if settings is None:
+        settings = monitor_db.get_all_settings()
+    SEVERITY_THRESHOLDS = (
+        (settings.get("risk_threshold_critical", 85), 'CRITICAL'),
+        (settings.get("risk_threshold_high", 65), 'HIGH'),
+        (settings.get("risk_threshold_medium", 35), 'MEDIUM'),
+        (0, 'LOW'),
+    )
+    SCAN_TIMEOUT_SECONDS = float(settings.get("scan_timeout_seconds", 0.6))
+    BANNER_TIMEOUT_SECONDS = float(settings.get("banner_timeout_seconds", 1.2))
+    NVD_CACHE_HOURS = int(settings.get("nvd_cache_hours", 24))
+    ALERT_SEVERITY_THRESHOLD = settings.get("alert_severity_threshold", "LOW")
+
 # Criticality normalization (Priority 10): 2=LOW .. 5=CRITICAL mapped to 0-100
 CRITICALITY_LABELS = {2: 'LOW', 3: 'MEDIUM', 4: 'HIGH', 5: 'CRITICAL'}
+
+
+def _safe_int(value):
+    """SQLite TEXT-affinity columns can hand back numeric levels as
+    strings (e.g. '5'); this normalizes for CRITICALITY_LABELS lookups
+    without blowing up on None/'' from rows that predate this field."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 CRITICALITY_NORMALIZED = {2: 0, 3: 33, 4: 67, 5: 100}
 
 
@@ -728,57 +817,77 @@ def cvss_severity_label(cvss):
 
 
 @functools.lru_cache(maxsize=128)
-def lookup_cves_nvd(version_string):
+def lookup_cves_nvd(version_string, _retries=2):
     """
     Query the public NVD REST API for CVEs matching a free-text keyword
-    (the parsed service/version string). Cached so we don't repeat the
-    same network call during one session. Returns a list of dicts with
-    id, cvss, severity, summary, fix_version, published, modified.
+    (the parsed service/version string). In-process cached via lru_cache
+    so we don't repeat the same network call twice in one run; the
+    persisted, cross-restart cache lives in core.database.cve_cache and
+    is checked by the caller (get_real_cves) before this function is
+    ever invoked. Returns a list of dicts with id, cvss, severity,
+    summary, fix_version, published, modified.
+
+    Sprint 3 — Phase 7 (operational reliability): retries transient
+    network failures (timeout/connection errors) up to `_retries` times
+    with a short backoff before giving up — a single dropped packet to
+    NVD shouldn't silently mean "no CVEs found" for the rest of the
+    session (lru_cache would otherwise memoize that empty result
+    forever). Non-transient failures (bad response, parse error) are
+    NOT retried, since retrying those would just waste time.
     """
     if not REQUESTS_AVAILABLE or not version_string:
         return []
-    try:
-        resp = requests.get(
-            "https://services.nvd.nist.gov/rest/json/cves/2.0",
-            params={"keywordSearch": version_string, "resultsPerPage": 5},
-            timeout=4,
-        )
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-        product, detected_version = split_product_version(version_string)
-        # A banner such as just "Apache" is useful inventory data but is
-        # insufficient evidence for a version-specific CVE finding.
-        if not product or not detected_version:
-            return []
+    last_transient_error = False
+    for attempt in range(_retries + 1):
+        try:
+            resp = requests.get(
+                "https://services.nvd.nist.gov/rest/json/cves/2.0",
+                params={"keywordSearch": version_string, "resultsPerPage": 5},
+                timeout=4,
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            product, detected_version = split_product_version(version_string)
+            # A banner such as just "Apache" is useful inventory data but is
+            # insufficient evidence for a version-specific CVE finding.
+            if not product or not detected_version:
+                return []
 
-        results = []
-        for item in data.get("vulnerabilities", [])[:5]:
-            cve = item.get("cve", {})
-            if not cve_applies_to_detected_version(cve, product, detected_version):
+            results = []
+            for item in data.get("vulnerabilities", [])[:5]:
+                cve = item.get("cve", {})
+                if not cve_applies_to_detected_version(cve, product, detected_version):
+                    continue
+                cve_id = cve.get("id", "UNKNOWN")
+                descs = cve.get("descriptions", [])
+                summary = next((d["value"] for d in descs if d.get("lang") == "en"), "")
+                metrics = cve.get("metrics", {})
+                cvss = None
+                for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                    if key in metrics and metrics[key]:
+                        cvss = metrics[key][0]["cvssData"].get("baseScore")
+                        break
+                results.append({
+                    "id": cve_id,
+                    "cvss": cvss if cvss is not None else 5.0,
+                    "severity": cvss_severity_label(cvss),
+                    "summary": summary[:200],
+                    "fix_version": None,
+                    "published": cve.get("published", "Unknown")[:10] if cve.get("published") else "Unknown",
+                    "modified": cve.get("lastModified", "Unknown")[:10] if cve.get("lastModified") else "Unknown",
+                })
+            results.sort(key=lambda c: c["cvss"], reverse=True)
+            return results
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            last_transient_error = True
+            if attempt < _retries:
+                time.sleep(0.6 * (attempt + 1))
                 continue
-            cve_id = cve.get("id", "UNKNOWN")
-            descs = cve.get("descriptions", [])
-            summary = next((d["value"] for d in descs if d.get("lang") == "en"), "")
-            metrics = cve.get("metrics", {})
-            cvss = None
-            for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-                if key in metrics and metrics[key]:
-                    cvss = metrics[key][0]["cvssData"].get("baseScore")
-                    break
-            results.append({
-                "id": cve_id,
-                "cvss": cvss if cvss is not None else 5.0,
-                "severity": cvss_severity_label(cvss),
-                "summary": summary[:200],
-                "fix_version": None,
-                "published": cve.get("published", "Unknown")[:10] if cve.get("published") else "Unknown",
-                "modified": cve.get("lastModified", "Unknown")[:10] if cve.get("lastModified") else "Unknown",
-            })
-        results.sort(key=lambda c: c["cvss"], reverse=True)
-        return results
-    except (requests.RequestException, ValueError, KeyError):
-        return []
+            return []
+        except (requests.RequestException, ValueError, KeyError):
+            return []
+    return []
 
 
 def split_product_version(version_string):
@@ -865,17 +974,29 @@ def lookup_cves_offline(version_string):
 
 def get_real_cves(service, version_string):
     """
-    Try live NVD lookup first; fall back to the offline table; fall back
-    further to nothing (caller then uses the generic baseline risk).
+    Try the persisted local cache first (Phase 7 — survives restarts and
+    avoids re-hitting NVD's rate limits for a version string we've
+    already resolved); then live NVD lookup; then the offline table;
+    then nothing (caller uses the generic baseline risk).
     Returns (cves, source) where source in {'nvd_live','offline_table','none'}.
     """
     if not version_string:
         return [], "none"
+
+    cached = monitor_db.get_cached_cve_lookup(version_string, max_age_hours=NVD_CACHE_HOURS)
+    if cached is not None:
+        return cached
+
     cves = lookup_cves_nvd(version_string)
     if cves:
+        monitor_db.cache_cve_lookup(version_string, cves, "nvd_live")
         return cves, "nvd_live"
     cves = lookup_cves_offline(version_string)
     if cves:
+        # Offline-table hits are cheap/local already, but caching them too
+        # means a later NVD outage doesn't downgrade a version we already
+        # have a confident offline match for.
+        monitor_db.cache_cve_lookup(version_string, cves, "offline_table")
         return cves, "offline_table"
     return [], "none"
 
@@ -1691,7 +1812,7 @@ def detect_services_and_versions(ip, open_ports):
         if not svc:
             continue
         services.append(svc)
-        banner, raw_version = grab_banner(ip, port)
+        banner, raw_version = grab_banner(ip, port, timeout=BANNER_TIMEOUT_SECONDS)
         clean_version = parse_version_from_banner(svc, raw_version) if raw_version else None
         version_map[svc] = clean_version
         banner_map[svc] = banner
@@ -1867,6 +1988,29 @@ def _now_stamp():
     return datetime.now().strftime("%H:%M:%S")
 
 
+def validate_scan_scope(base_ip, limit):
+    """Sprint 3 — Phase 7: Scan Scope Validation. Rejects a malformed IPv4
+    prefix or an out-of-range host count BEFORE any network operation
+    starts, rather than silently generating garbage IP strings that
+    would each individually fail deep inside scan_network(). Returns
+    (True, None) if valid, else (False, human-readable reason)."""
+    if not base_ip:
+        return False, "Base IP prefix is empty."
+    if not re.match(r'^(\d{1,3}\.){3}$', base_ip):
+        return False, (f"'{base_ip}' doesn't look like a valid IPv4 prefix "
+                        f"(expected e.g. '192.168.1.').")
+    octets = base_ip.rstrip('.').split('.')
+    if any(not (0 <= int(o) <= 255) for o in octets):
+        return False, f"'{base_ip}' contains an octet outside 0–255."
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return False, "Scan range must be a number."
+    if not (1 <= limit <= 254):
+        return False, "Scan range must be between 1 and 254 hosts."
+    return True, None
+
+
 def scan_network(base_ip=None, limit=254, progress_cb=None):
     """
     Full discovery pipeline: ping sweep -> ARP/MAC -> hostname -> port scan
@@ -1927,7 +2071,7 @@ def scan_network(base_ip=None, limit=254, progress_cb=None):
         vendor = mac_vendor(mac)
 
         try:
-            open_ports = scan_ports(ip, SCAN_PORTS) if ip in ping_results else []
+            open_ports = scan_ports(ip, SCAN_PORTS, timeout=SCAN_TIMEOUT_SECONDS) if ip in ping_results else []
         except Exception as exc:
             open_ports = []
             host_events.append({'timestamp': _now_stamp(), 'event': 'Port scan failed', 'target': ip, 'status': f'Unavailable ({type(exc).__name__})'})
@@ -2088,6 +2232,13 @@ def build_dynamic_graph(devices):
                            access_vector=edge_info['vector'], access_port=edge_info['port'],
                            mitre_code=edge_info['mitre_code'], mitre_desc=edge_info['mitre_desc'],
                            success_prob=edge_info['success_prob'], reachability='POTENTIAL REACHABILITY')
+
+    # Sprint 2 — Phase 2: now that the full exposure graph (nodes + lateral
+    # edges) exists, recompute each asset's Network Exposure component from
+    # real graph topology (reachable assets, degree centrality, sensitive
+    # lateral services) instead of the placeholder "other asset count" used
+    # while building nodes above, then reflow that into Asset Risk (Priority 18).
+    network_exposure.apply_network_exposure_scores(G, SENSITIVE_PORTS, recompute_node_risk)
     return G
 
 
@@ -2152,6 +2303,10 @@ def build_network():
                        access_vector=edge_info['vector'], access_port=edge_info['port'],
                        mitre_code=edge_info['mitre_code'], mitre_desc=edge_info['mitre_desc'],
                        success_prob=edge_info['success_prob'], reachability='POTENTIAL REACHABILITY')
+
+    # Sprint 2 — Phase 2: same graph-topology exposure recompute as the real
+    # scan path, so the simulated lab demo also shows non-placeholder numbers.
+    network_exposure.apply_network_exposure_scores(G, SENSITIVE_PORTS, recompute_node_risk)
     return G
 
 
@@ -2350,28 +2505,39 @@ def calculate_risk(G, compromised_nodes, timeline, honeypot_triggered, attack_st
 
 
 def calculate_overall_acds_risk(G, blast_radius_score):
-    """Priority 15: OVERALL ACDS RISK.
+    """Priority 15 / Sprint 2 Phase 3: OVERALL ACDS RISK.
 
-    Keeps Asset Risk (per-host, Priority 6) and Network/Blast-Radius
-    Simulation (Priority 3 module) as two SEPARATE internal concepts,
+    Keeps Asset Risk (per-host, Priority 6), the Blast-Radius Simulation
+    (Module 3), Critical Asset Exposure, and Network Exposure (Sprint 2
+    Phase 2, core/network_exposure.py) as four SEPARATE internal concepts,
     then combines them with a documented, non-industry-standard
     aggregation:
 
-        Overall ACDS Risk = Asset Risk Component * 0.60
-                           + Network Blast Radius Component * 0.40
+        Overall ACDS Risk = Average Asset Risk        * 0.40
+                           + Network Blast Radius       * 0.30
+                           + Critical Asset Exposure     * 0.15
+                           + Network Exposure            * 0.15
 
-    Asset Risk Component = mean of all real (non-honeypot) assets'
-    Priority-6 risk_score values, i.e. an organization-wide asset risk
-    figure built from the same transparent weighted model as each
-    individual host.
+    Average Asset Risk = mean of all real (non-honeypot) assets'
+    Priority-6 risk_score values. Critical Asset Exposure and Network
+    Exposure both come from core/network_exposure.py, which derives them
+    from the live exposure-graph topology (Phase 2) — not observed traffic.
 
-    If no simulation has been run yet, blast_radius_score is None and
-    this returns a PARTIAL result rather than inventing a blast-radius
-    number.
+    If no simulation has been run yet, blast_radius_score is None and this
+    returns a PARTIAL result rather than inventing a blast-radius number.
     """
     real_nodes = [n for n, d in G.nodes(data=True) if d.get("node_type") != "honeypot"]
     asset_scores = [G.nodes[n].get("risk_score", 0.0) for n in real_nodes]
     asset_component = round(sum(asset_scores) / len(asset_scores), 1) if asset_scores else 0.0
+
+    critical_exposure = network_exposure.calculate_critical_asset_exposure(G)
+    network_component = network_exposure.calculate_network_exposure_component(G)
+
+    weighted_partial = (
+        asset_component * OVERALL_WEIGHT_ASSET_RISK
+        + critical_exposure['score'] * OVERALL_WEIGHT_CRITICAL_EXPOSURE
+        + network_component['score'] * OVERALL_WEIGHT_NETWORK_EXPOSURE
+    )
 
     if blast_radius_score is None:
         return {
@@ -2379,15 +2545,27 @@ def calculate_overall_acds_risk(G, blast_radius_score):
             'overall_score': None, 'severity': None,
             'asset_component': asset_component, 'asset_weight': OVERALL_WEIGHT_ASSET_RISK,
             'blast_component': None, 'blast_weight': OVERALL_WEIGHT_BLAST_RADIUS,
+            'critical_exposure_component': critical_exposure['score'],
+            'critical_exposure_weight': OVERALL_WEIGHT_CRITICAL_EXPOSURE,
+            'critical_exposure_detail': critical_exposure,
+            'network_exposure_component': network_component['score'],
+            'network_exposure_weight': OVERALL_WEIGHT_NETWORK_EXPOSURE,
+            'network_exposure_detail': network_component,
         }
 
-    overall = round(asset_component * OVERALL_WEIGHT_ASSET_RISK + blast_radius_score * OVERALL_WEIGHT_BLAST_RADIUS, 1)
+    overall = round(weighted_partial + blast_radius_score * OVERALL_WEIGHT_BLAST_RADIUS, 1)
     overall = max(0.0, min(100.0, overall))
     return {
         'status': 'COMPLETE',
         'overall_score': overall, 'severity': severity_from_score(overall),
         'asset_component': asset_component, 'asset_weight': OVERALL_WEIGHT_ASSET_RISK,
         'blast_component': blast_radius_score, 'blast_weight': OVERALL_WEIGHT_BLAST_RADIUS,
+        'critical_exposure_component': critical_exposure['score'],
+        'critical_exposure_weight': OVERALL_WEIGHT_CRITICAL_EXPOSURE,
+        'critical_exposure_detail': critical_exposure,
+        'network_exposure_component': network_component['score'],
+        'network_exposure_weight': OVERALL_WEIGHT_NETWORK_EXPOSURE,
+        'network_exposure_detail': network_component,
     }
 
 
@@ -2429,6 +2607,7 @@ def get_defense_actions(G, compromised_nodes, risk_score):
                 "risk_reduction": fix_reduction,
                 "efficiency": round(fix_reduction / fix_cost, 3),
                 "description": fix, "state": DEFENSE_STATE_RECOMMENDED,
+                "mitre_tactic": "Initial Access / Exploitation for Privilege Escalation — T1190, T1068",
             })
 
         for weakness in nd.get("weaknesses", [])[:2]:
@@ -2444,6 +2623,7 @@ def get_defense_actions(G, compromised_nodes, risk_score):
                 "efficiency": round(isolate_reduction / isolate_cost, 3),
                 "description": f"Segment or firewall {display} to block: {weakness}",
                 "state": DEFENSE_STATE_RECOMMENDED,
+                "mitre_tactic": "Lateral Movement — T1021 (Remote Services)",
             })
 
         if crit >= 4:
@@ -2456,6 +2636,62 @@ def get_defense_actions(G, compromised_nodes, risk_score):
                 "efficiency": round(priv_reduction / priv_cost, 3),
                 "description": f"Remove admin rights on {display}; enforce MFA and PAM",
                 "state": DEFENSE_STATE_RECOMMENDED,
+                "mitre_tactic": "Privilege Escalation / Persistence — T1078 (Valid Accounts)",
+            })
+
+        # Sprint 3 — Phase 1: port/service-specific hardening actions so the
+        # optimizer can recommend the exact SME-facing controls the sprint
+        # asked for (disable SMB, restrict RDP, close unused ports), derived
+        # from THIS node's actually-observed open_ports — never invented.
+        open_ports = nd.get("open_ports", []) or []
+
+        if 445 in open_ports:
+            key = f"SMB: {node}"
+            if key not in seen_fixes:
+                seen_fixes.add(key)
+                smb_cost = int(14 + crit * 3)
+                smb_reduction = round(max(vuln, 1) * crit * 2.0, 1)
+                actions.append({
+                    "action": f"Disable SMB on {display[:30]}", "node": node, "type": "disable_smb",
+                    "cost": smb_cost, "risk_reduction": smb_reduction,
+                    "efficiency": round(smb_reduction / smb_cost, 3),
+                    "description": f"Disable SMBv1/legacy SMB (port 445) or restrict it to trusted hosts on {display}",
+                    "state": DEFENSE_STATE_RECOMMENDED,
+                    "mitre_tactic": "Lateral Movement — T1021.002 (SMB/Windows Admin Shares)",
+                })
+
+        if 3389 in open_ports:
+            key = f"RDP: {node}"
+            if key not in seen_fixes:
+                seen_fixes.add(key)
+                rdp_cost = int(14 + crit * 3)
+                rdp_reduction = round(max(vuln, 1) * crit * 2.0, 1)
+                actions.append({
+                    "action": f"Restrict RDP on {display[:30]}", "node": node, "type": "restrict_rdp",
+                    "cost": rdp_cost, "risk_reduction": rdp_reduction,
+                    "efficiency": round(rdp_reduction / rdp_cost, 3),
+                    "description": f"Restrict RDP (port 3389) to a VPN/jump-host and enforce MFA on {display}",
+                    "state": DEFENSE_STATE_RECOMMENDED,
+                    "mitre_tactic": "Lateral Movement — T1021.001 (Remote Desktop Protocol)",
+                })
+
+        other_sensitive = [p for p in open_ports if p in SENSITIVE_PORTS and p not in (445, 3389)]
+        for port in other_sensitive[:2]:
+            key = f"CLOSEPORT: {node}:{port}"
+            if key in seen_fixes:
+                continue
+            seen_fixes.add(key)
+            svc_name = PORT_SERVICE_MAP.get(port, f"port {port}")
+            close_cost = int(8 + crit * 2)
+            close_reduction = round(max(vuln, 1) * 1.6, 1)
+            actions.append({
+                "action": f"Close unused port {port} ({svc_name}) on {display[:24]}",
+                "node": node, "type": "close_port", "cost": close_cost,
+                "risk_reduction": close_reduction,
+                "efficiency": round(close_reduction / close_cost, 3),
+                "description": f"Close or firewall unused {svc_name} service (port {port}) exposed on {display}",
+                "state": DEFENSE_STATE_RECOMMENDED,
+                "mitre_tactic": "Initial Access — T1190 (Exploit Public-Facing Application) / attack-surface reduction",
             })
 
     ids_cost = 30
@@ -2466,6 +2702,7 @@ def get_defense_actions(G, compromised_nodes, risk_score):
         "efficiency": round(ids_reduction / ids_cost, 3),
         "description": "Detect lateral movement (Snort/Suricata/Wazuh) across the LAN",
         "state": DEFENSE_STATE_RECOMMENDED,
+        "mitre_tactic": "Discovery / Lateral Movement — T1046, T1021 (detection coverage)",
     })
 
     segment_cost = 25
@@ -2476,7 +2713,52 @@ def get_defense_actions(G, compromised_nodes, risk_score):
         "efficiency": round(segment_reduction / segment_cost, 3),
         "description": "Split workstations, servers, and databases into separate VLANs with ACLs",
         "state": DEFENSE_STATE_RECOMMENDED,
+        "mitre_tactic": "Lateral Movement — T1021 (containment via network segmentation)",
     })
+
+    firewall_cost = 20
+    firewall_reduction = round(risk_score * 0.10, 1)
+    actions.append({
+        "action": "Deploy Perimeter Firewall Rules", "node": "ALL", "type": "firewall_rule",
+        "cost": firewall_cost, "risk_reduction": firewall_reduction,
+        "efficiency": round(firewall_reduction / firewall_cost, 3),
+        "description": "Add default-deny inbound/outbound ACLs at the network edge and between segments",
+        "state": DEFENSE_STATE_RECOMMENDED,
+        "mitre_tactic": "Command and Control / Lateral Movement — network filtering (all tactics)",
+    })
+
+    # Honeypot placement: recommend a decoy near the single highest-value
+    # reachable critical asset, rather than duplicating the existing
+    # simulated Honeypot node already present in the topology.
+    candidate_nodes = [n for n in compromised_nodes if G.nodes[n].get("node_type") != "honeypot"]
+    if candidate_nodes:
+        top_node = max(candidate_nodes, key=lambda n: G.nodes[n].get("criticality", 0))
+        top_nd = G.nodes[top_node]
+        if top_nd.get("criticality", 0) >= 4:
+            hp_cost = 22
+            hp_reduction = round(top_nd.get("criticality", 4) * 1.8, 1)
+            actions.append({
+                "action": f"Honeypot Placement near {top_nd.get('display_name', top_node)[:30]}",
+                "node": top_node, "type": "honeypot_placement", "cost": hp_cost,
+                "risk_reduction": hp_reduction,
+                "efficiency": round(hp_reduction / hp_cost, 3),
+                "description": f"Deploy an additional decoy adjacent to {top_nd.get('display_name', top_node)} to "
+                                f"detect lateral movement toward this critical asset earlier",
+                "state": DEFENSE_STATE_RECOMMENDED,
+                "mitre_tactic": "Detection — deception layer supporting earlier Discovery/Lateral Movement alerts",
+            })
+
+    # Priority ranking (Sprint 3 requirement): relative to this action set's
+    # own risk_reduction distribution — top third HIGH, middle third MEDIUM,
+    # bottom third LOW. Recomputed every call, so it always reflects the
+    # CURRENT network/compromise state rather than a fixed threshold.
+    if actions:
+        ranked = sorted(actions, key=lambda a: a["risk_reduction"], reverse=True)
+        n = len(ranked)
+        high_cut = max(1, n // 3)
+        med_cut = max(high_cut + 1, (2 * n) // 3)
+        for i, a in enumerate(ranked):
+            a["priority"] = "HIGH" if i < high_cut else ("MEDIUM" if i < med_cut else "LOW")
 
     actions.sort(key=lambda x: x["efficiency"], reverse=True)
     return actions
@@ -2509,7 +2791,12 @@ def apply_defense_actions(G, selected_actions):
 
         if atype == "ids" and node == "ALL":
             ids_deployed = True
-        elif atype == "isolate" and node == "ALL":
+        elif atype in ("isolate", "firewall_rule") and node == "ALL":
+            # Both VLAN segmentation and perimeter firewall rules reduce the
+            # same modeled quantity — lateral-movement reachability — so
+            # both feed the existing segmentation_applied flag consumed by
+            # simulate_attack(); this is a deliberate simplification, not a
+            # rewrite of the attack-simulation engine.
             segmentation_applied = True
         elif node in G.nodes:
             nd = G.nodes[node]
@@ -2532,10 +2819,147 @@ def apply_defense_actions(G, selected_actions):
                 # as a 40% reduction of the criticality component.
                 comps['criticality']['normalized_score'] = round(comps['criticality']['normalized_score'] * 0.6, 1)
                 recompute_node_risk(nd)
+            elif atype in ("disable_smb", "restrict_rdp", "close_port"):
+                # Remove the specific hardened port from this node's exposed
+                # surface so the exposure graph / lateral-edge model and the
+                # network_exposure component genuinely reflect the change.
+                port_map = {"disable_smb": 445, "restrict_rdp": 3389}
+                port_to_close = port_map.get(atype)
+                if port_to_close is None:
+                    m = re.search(r"port (\d+)", action.get("action", ""))
+                    port_to_close = int(m.group(1)) if m else None
+                if port_to_close and port_to_close in (nd.get("open_ports") or []):
+                    nd["open_ports"] = [p for p in nd["open_ports"] if p != port_to_close]
+                if comps:
+                    comps['network_exposure']['normalized_score'] = round(
+                        comps['network_exposure']['normalized_score'] * 0.5, 1)
+                    recompute_node_risk(nd)
+            elif atype == "honeypot_placement" and comps:
+                # A nearby decoy shortens detection time rather than closing
+                # an exposure, modeled as a modest deterrent discount on the
+                # vulnerability component (attacker more likely caught early).
+                comps['vulnerability']['normalized_score'] = round(
+                    comps['vulnerability']['normalized_score'] * 0.8, 1)
+                recompute_node_risk(nd)
 
         applied.append({**action, "state": DEFENSE_STATE_APPLIED})
 
     return applied, ids_deployed, segmentation_applied
+
+
+# ─────────────────────────────────────────────────────────────────
+# SPRINT 3 — PHASE 2: DEDICATED BEFORE vs AFTER VERIFICATION PAGE
+# ─────────────────────────────────────────────────────────────────
+# Renders a standalone comparison section (Overall Risk, Blast Radius,
+# Critical Assets Reachable, Attack Depth, Reachable Nodes) using ONLY
+# numbers already produced by the existing Sprint 2 risk pipeline
+# (calculate_risk / calculate_overall_acds_risk / simulate_attack) —
+# no separate/duplicate risk math is introduced here.
+
+def _verification_metric_row(rows):
+    """rows: list of (label, before_val, after_val_or_None, lower_is_better)."""
+    cards = []
+    for label, before_val, after_val, lower_is_better in rows:
+        if after_val is None:
+            cards.append(f"""
+            <div style='flex:1;min-width:150px;background:#0d1f2d;border:1px solid #1a3a5c;padding:14px;text-align:center'>
+                <div style='color:#3d6a8a;font-family:Share Tech Mono;font-size:0.62rem;letter-spacing:1px'>{label}</div>
+                <div style='color:#ffd700;font-family:Orbitron,monospace;font-size:1.3rem;margin-top:4px'>{before_val}</div>
+                <div style='color:#3d6a8a;font-family:Share Tech Mono;font-size:0.6rem;margin-top:2px'>defenses not yet applied</div>
+            </div>""")
+            continue
+        delta = round(after_val - before_val, 1)
+        improved = (delta <= 0) if lower_is_better else (delta >= 0)
+        arrow_color = "#00ff88" if improved else "#ff3355"
+        delta_str = f"{'+' if delta > 0 else ''}{delta}"
+        cards.append(f"""
+        <div style='flex:1;min-width:150px;background:#0d1f2d;border:1px solid {arrow_color};padding:14px;text-align:center'>
+            <div style='color:#3d6a8a;font-family:Share Tech Mono;font-size:0.62rem;letter-spacing:1px'>{label}</div>
+            <div style='font-family:Orbitron,monospace;font-size:1.25rem;margin-top:4px'>
+                <span style='color:#ff3355'>{before_val}</span>
+                <span style='color:#3d6a8a;font-size:0.9rem'> → </span>
+                <span style='color:#00ff88'>{after_val}</span>
+            </div>
+            <div style='color:{arrow_color};font-family:Share Tech Mono;font-size:0.72rem;margin-top:4px'>{delta_str} points</div>
+        </div>""")
+    return "<div style='display:flex;gap:10px;flex-wrap:wrap;margin:10px 0'>" + "".join(cards) + "</div>"
+
+
+def render_before_after_verification():
+    before_overall = st.session_state.overall_acds_risk_before
+    before_bd = st.session_state.blast_before_defense or {}
+    before_risk = st.session_state.risk_before_defense
+
+    has_after = bool(st.session_state.applied_defenses)
+    after_overall_obj = st.session_state.overall_acds_risk if has_after else None
+    after_bd = st.session_state.post_defense_stats if has_after else None
+    after_risk = st.session_state.risk_score if has_after else None
+
+    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">🎯 BEFORE vs AFTER VERIFICATION</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style='background:rgba(255,51,85,0.06);border:1px solid #ff3355;padding:8px 14px;
+         font-family:Share Tech Mono;font-size:0.65rem;color:#ff3355;letter-spacing:1px;margin-bottom:10px'>
+    SIMULATED — NO REAL ATTACK TRAFFIC
+    </div>
+    """, unsafe_allow_html=True)
+
+    if before_risk is None:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.72rem;color:#3d6a8a">'
+            'Run an attack simulation to establish a BEFORE snapshot for verification.</div>',
+            unsafe_allow_html=True)
+        return
+
+    before_overall_score = before_overall.get("overall_score") if before_overall else None
+    after_overall_score = after_overall_obj.get("overall_score") if after_overall_obj else None
+
+    rows = [
+        ("OVERALL RISK", before_overall_score, after_overall_score, True),
+        ("BLAST RADIUS", before_risk, after_risk, True),
+        ("CRITICAL ASSETS REACHABLE", before_bd.get("critical_assets_reached", 0),
+         after_bd.get("critical_assets_reached", 0) if after_bd else None, True),
+        ("ATTACK DEPTH (hops)", before_bd.get("max_lateral_hops", 0),
+         after_bd.get("max_lateral_hops", 0) if after_bd else None, True),
+        ("REACHABLE NODES", before_bd.get("systems_controlled", before_bd.get("compromised_count", 0)),
+         (after_bd.get("systems_controlled", after_bd.get("compromised_count", 0)) if after_bd else None), True),
+    ]
+    # Drop rows where before_val itself is None (overall risk not yet complete)
+    rows = [r for r in rows if r[1] is not None]
+    st.markdown(_verification_metric_row(rows), unsafe_allow_html=True)
+
+    if not has_after:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a;margin-top:6px">'
+            'Apply defenses in the ACDS DEFENSE OPTIMIZATION panel above, then this page re-runs the MITRE '
+            'simulation automatically and fills in the AFTER column.</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin:14px 0 6px 0">'
+                     'MITRE ATT&CK COVERAGE — BEFORE vs AFTER (re-simulated)</div>', unsafe_allow_html=True)
+        before_mitre = st.session_state.mitre_before_defense or {}
+        after_mitre = st.session_state.mitre_after_defense or {}
+        mcol1, mcol2 = st.columns(2)
+        with mcol1:
+            st.markdown("<div style='color:#ff3355;font-family:Share Tech Mono;font-size:0.68rem'>BEFORE</div>", unsafe_allow_html=True)
+            if before_mitre:
+                for code, desc in before_mitre.items():
+                    st.markdown(f'<span class="mitre-tag">{code}</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span style="color:#3d6a8a;font-size:0.68rem">none reached</span>', unsafe_allow_html=True)
+        with mcol2:
+            st.markdown("<div style='color:#00ff88;font-family:Share Tech Mono;font-size:0.68rem'>AFTER</div>", unsafe_allow_html=True)
+            if after_mitre:
+                for code, desc in after_mitre.items():
+                    st.markdown(f'<span class="mitre-tag" style="border-color:#00ff88;color:#00ff88">{code}</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span style="color:#00ff88;font-size:0.68rem">none reached — all techniques blocked</span>', unsafe_allow_html=True)
+
+        mitigated = set(before_mitre) - set(after_mitre)
+        if mitigated:
+            st.markdown(
+                f'<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin-top:8px">'
+                f'Techniques neutralized by applied defenses: {", ".join(sorted(mitigated))}</div>',
+                unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2546,9 +2970,13 @@ def apply_defense_actions(G, selected_actions):
 # derived from exposed services, never OBSERVED COMMUNICATION. The
 # scanner never captures real traffic between hosts.
 
-def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True):
+def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True, new_exposure_edges=None):
     if compromised_set is None:
         compromised_set = set()
+    # Sprint 2 — Phase 5: IP-pair set of edges that appeared since the last
+    # completed recalculation pass (run_dynamic_risk_pipeline). Optional —
+    # existing callers that don't pass it keep the original coloring.
+    new_exposure_edges = new_exposure_edges or set()
 
     net = Network(height="480px", width="100%", bgcolor="#050a0f", font_color="#7ab8d4", directed=True)
     net.set_options("""
@@ -2618,13 +3046,23 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True)
         if not show_honeypot and (G.nodes[src].get("node_type") == "honeypot" or G.nodes[dst].get("node_type") == "honeypot"):
             continue
         src_comp, dst_comp = src in compromised_set, dst in compromised_set
+        src_ip, dst_ip = G.nodes[src].get('ip'), G.nodes[dst].get('ip')
+        is_new_exposure = (src_ip, dst_ip) in new_exposure_edges
+        dst_severity = G.nodes[dst].get('risk_severity')
+
         if src_comp and dst_comp:
-            edge_color, width = "#ff3355", 3
+            edge_color, width, edge_note = "#ff3355", 3, "SIMULATED ATTACK PATH"
         elif src_comp:
-            edge_color, width = "#ff8c00", 2
+            edge_color, width, edge_note = "#ff8c00", 2, "ACTIVE (simulated)"
+        elif is_new_exposure:
+            # Phase 5 legend: Orange = newly exposed (path did not exist in
+            # the previous completed recalculation pass).
+            edge_color, width, edge_note = "#ff8c00", 2.5, "NEWLY EXPOSED PATH"
+        elif dst_severity in ("CRITICAL", "HIGH"):
+            edge_color, width, edge_note = "#ff3355", 1.5, "HIGH-RISK PATH (leads to high-risk asset)"
         else:
-            edge_color, width = "#1a3a5c", 1.5
-        edge_title = f"{data.get('connection','')} — POTENTIAL REACHABILITY (modeled, not observed traffic)"
+            edge_color, width, edge_note = "#1a3a5c", 1.5, "normal"
+        edge_title = f"{data.get('connection','')} — POTENTIAL REACHABILITY (modeled, not observed traffic) — {edge_note}"
         net.add_edge(src, dst, title=edge_title, color=edge_color, width=width)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tempfile.gettempdir())
@@ -2739,37 +3177,63 @@ def get_asset_metrics(G):
 # ─────────────────────────────────────────────────────────────────
 
 def export_asset_inventory_csv(G):
+    """Sprint 3 — Phase 4: Asset Inventory CSV. Prefers the persisted
+    SQLite asset table (IP, MAC, Hostname, Vendor, OS, Device, Risk,
+    Status, First Seen, Last Seen — exactly the sprint's column list)
+    since that's the durable record; falls back to the live in-memory
+    graph only if nothing has been persisted yet."""
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(['IP', 'Hostname', 'MAC', 'Vendor', 'OS', 'OS Confidence', 'Device Type',
-                      'Device Confidence', 'Services', 'Ports', 'Risk', 'Criticality'])
-    for node, d in G.nodes(data=True):
-        writer.writerow([
-            d.get('ip', ''), d.get('hostname') or 'Unknown', d.get('mac') or 'Unknown',
-            d.get('mac_vendor') or 'Unknown', d.get('os', 'unknown'),
-            f"{int((d.get('os_confidence') or 0) * 100)}%" if d.get('os_confidence') is not None else 'N/A',
-            d.get('device_type', 'Unknown'),
-            f"{int((d.get('device_confidence') or 0) * 100)}%" if d.get('device_confidence') is not None else 'N/A',
-            '; '.join(d.get('services', [])), '; '.join(str(p) for p in d.get('open_ports', [])),
-            f"{d.get('risk_score', 0)}/100 ({d.get('risk_severity','?')})",
-            d.get('criticality_label', 'Unknown'),
-        ])
+    writer.writerow(['IP', 'MAC', 'Hostname', 'Vendor', 'OS', 'Device Type', 'Risk',
+                      'Criticality', 'Status', 'First Seen', 'Last Seen'])
+
+    db_assets = monitor_db.get_live_assets()
+    if db_assets:
+        for a in db_assets:
+            crit_label = CRITICALITY_LABELS.get(_safe_int(a.get('criticality')), a.get('criticality') or 'Unknown')
+            writer.writerow([
+                a.get('ip_address') or '', a.get('mac_address') or 'Unknown',
+                a.get('hostname') or 'Unknown', a.get('vendor') or 'Unknown',
+                a.get('operating_system') or 'unknown', a.get('device_type') or 'Unknown',
+                a.get('current_risk') if a.get('current_risk') is not None else 'N/A',
+                crit_label, a.get('status') or 'Unknown',
+                (a.get('first_seen') or '')[:19], (a.get('last_seen') or '')[:19],
+            ])
+    else:
+        for node, d in G.nodes(data=True):
+            if d.get('node_type') == 'honeypot':
+                continue
+            writer.writerow([
+                d.get('ip', ''), d.get('mac') or 'Unknown', d.get('hostname') or 'Unknown',
+                d.get('mac_vendor') or 'Unknown', d.get('os', 'unknown'), d.get('device_type', 'Unknown'),
+                d.get('risk_score', 0), d.get('criticality_label', 'Unknown'), 'ONLINE (this session)',
+                '', '',
+            ])
     return buf.getvalue()
 
 
 def export_vulnerability_report_csv(G):
+    """Sprint 3 — Phase 4: Vulnerability Report CSV. Leads with the
+    sprint's exact column list (CVE, CVSS, Severity, Asset, Service,
+    Version, Remediation, Status), keeping the extra evidence columns
+    the app already tracked as trailing detail rather than dropping them.
+    Status is always OPEN here — a patched CVE is removed from
+    cve_findings the moment apply_defense_actions() runs, so anything
+    still present in the live graph is, by definition, unresolved."""
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(['Asset', 'CVE', 'CVSS', 'Severity', 'Product', 'Version', 'Description',
-                      'Recommendation', 'Detection Confidence', 'Published', 'Modified', 'Source'])
+    writer.writerow(['CVE', 'CVSS', 'Severity', 'Asset', 'Service', 'Version', 'Remediation', 'Status',
+                      'Description', 'Detection Confidence', 'Published', 'Modified', 'Source'])
     for node, d in G.nodes(data=True):
         fixes = d.get('fixes', [])
         for i, c in enumerate(d.get('cve_findings', [])):
             rec = fixes[i] if i < len(fixes) else (fixes[0] if fixes else 'See generic remediation guidance')
             writer.writerow([
-                d.get('display_name', node), c.get('cve_id'), c.get('cvss'), c.get('severity'),
-                c.get('affected_product'), c.get('detected_version') or 'Unknown', c.get('summary'),
-                rec, c.get('detection_confidence'), c.get('published'), c.get('modified'), c.get('source'),
+                c.get('cve_id'), c.get('cvss'), c.get('severity'), d.get('display_name', node),
+                c.get('service') or c.get('affected_product'), c.get('detected_version') or 'Unknown',
+                rec, 'OPEN',
+                c.get('summary'), c.get('detection_confidence'), c.get('published'), c.get('modified'),
+                c.get('source'),
             ])
     return buf.getvalue()
 
@@ -2814,9 +3278,316 @@ def build_executive_report_text(G, risk_score, blast_details, overall_risk, scan
     return "\n".join(lines)
 
 
+def build_executive_report_pdf(
+    G, risk_score, blast_details, overall_risk, scan_history,
+    defense_actions=None, applied_defenses=None,
+    risk_before=None, blast_before=None, overall_before=None,
+    risk_after=None, blast_after=None, overall_after=None,
+    mitre_before=None, mitre_after=None, alerts=None,
+):
+    """Sprint 3 — Phase 4: professional Executive PDF report, built only
+    from numbers the existing Sprint 2 risk pipeline already produced
+    (no new/duplicate risk math). Returns raw PDF bytes.
+
+    Deliberate scope note: the interactive exposure graph (pyvis/JS) has
+    no headless renderer available in this environment, so the "Exposure
+    Graph" section below is a structured reachability table rather than
+    a rendered network diagram — the live interactive graph itself stays
+    on the dashboard, untouched."""
+    if not REPORTLAB_AVAILABLE:
+        return None
+
+    metrics = get_asset_metrics(G)
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+        title="ACDS Executive Security Report",
+    )
+    styles = getSampleStyleSheet()
+    navy = colors.HexColor("#0d1f2d")
+    accent = colors.HexColor("#0a3d5c")
+    green = colors.HexColor("#0a7d4a")
+    red = colors.HexColor("#b3213a")
+    grey_line = colors.HexColor("#c9d6de")
+
+    title_style = ParagraphStyle('ACDSTitle', parent=styles['Title'], textColor=navy, fontSize=20, spaceAfter=2)
+    subtitle_style = ParagraphStyle('ACDSSubtitle', parent=styles['Normal'], textColor=colors.HexColor("#5a7a8c"),
+                                     fontSize=9, spaceAfter=14)
+    h2 = ParagraphStyle('ACDSH2', parent=styles['Heading2'], textColor=navy, fontSize=13,
+                         spaceBefore=14, spaceAfter=6, borderColor=accent, borderWidth=0,
+                         borderPadding=0)
+    body = ParagraphStyle('ACDSBody', parent=styles['Normal'], fontSize=9.5, leading=13.5)
+    small = ParagraphStyle('ACDSSmall', parent=styles['Normal'], fontSize=8, textColor=colors.HexColor("#5a7a8c"))
+
+    def severity_color(sev):
+        return {"CRITICAL": red, "HIGH": colors.HexColor("#c9601c"),
+                "MEDIUM": colors.HexColor("#b3891a"), "LOW": green}.get((sev or "").upper(), colors.grey)
+
+    sev_hex = {"CRITICAL": "#b3213a", "HIGH": "#c9601c", "MEDIUM": "#b3891a", "LOW": "#0a7d4a"}
+
+    elements = []
+
+    # ---- Header / Company Security Posture -------------------------------
+    elements.append(Paragraph("ACDS Executive Security Report", title_style))
+    elements.append(Paragraph(
+        f"Adaptive Cyber Defense System v3.0 &nbsp;|&nbsp; Generated "
+        f"{datetime.now().strftime('%B %d, %Y %H:%M')} &nbsp;|&nbsp; "
+        f"Passive scanning only — no exploitation performed", subtitle_style))
+    elements.append(HRFlowable(width="100%", thickness=1.2, color=accent, spaceAfter=10))
+
+    overall_score = overall_risk.get('overall_score') if overall_risk else None
+    overall_status = overall_risk.get('status', 'N/A') if overall_risk else 'N/A'
+    posture_sev = severity_from_score(overall_score) if overall_score is not None else "N/A"
+    elements.append(Paragraph("Company Security Posture", h2))
+    posture_text = (
+        f"This assessment covers <b>{metrics['assets']}</b> discovered network assets. The current "
+        f"<b>Overall ACDS Risk</b> is <b>{overall_score if overall_score is not None else 'N/A'}/100</b> "
+        f"(<font color='{sev_hex.get(posture_sev, '#333333')}'>{posture_sev}</font>), "
+        f"status: {overall_status}. {metrics['critical']} asset finding(s) rated CRITICAL and "
+        f"{metrics['high']} rated HIGH require prioritized remediation."
+    )
+    elements.append(Paragraph(posture_text, body))
+    elements.append(Spacer(1, 8))
+
+    # ---- Overall Risk table ------------------------------------------------
+    elements.append(Paragraph("Overall Risk", h2))
+    risk_table_data = [["Metric", "Value"],
+                        ["Overall ACDS Risk", f"{overall_score if overall_score is not None else 'N/A'}/100"],
+                        ["Status", overall_status],
+                        ["Network Blast Radius (spread)", f"{blast_details.get('spread', 'N/A')}%"],
+                        ["Critical Assets Reachable", str(blast_details.get('critical_assets_reached', 'N/A'))],
+                        ["Max Attack Depth (hops)", str(blast_details.get('max_lateral_hops', 'N/A'))],
+                        ["Average Asset Risk", f"{metrics['average_risk']}/100"]]
+    t = Table(risk_table_data, colWidths=[2.6 * inch, 3.4 * inch])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), navy), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTSIZE', (0, 0), (-1, -1), 9), ('GRID', (0, 0), (-1, -1), 0.5, grey_line),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f6f8")]),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    elements.append(t)
+    elements.append(Spacer(1, 6))
+
+    # ---- Asset Summary -------------------------------------------------
+    elements.append(Paragraph("Asset Summary", h2))
+    asset_summary_data = [["Total Assets", "Servers", "Other Devices", "Critical", "High", "Medium", "Low"],
+                           [metrics['assets'], metrics['servers'], metrics['other_devices'],
+                            metrics['critical'], metrics['high'], metrics['medium'], metrics['low']]]
+    t = Table(asset_summary_data, colWidths=[0.95 * inch] * 7)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), accent), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTSIZE', (0, 0), (-1, -1), 8.5), ('GRID', (0, 0), (-1, -1), 0.5, grey_line),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    elements.append(t)
+    elements.append(Spacer(1, 6))
+
+    # ---- Critical Findings / Top CVEs --------------------------------
+    elements.append(Paragraph("Critical Findings &amp; Top CVEs", h2))
+    dedup = vuln_dedup.deduplicate_findings(G)
+    top_cves = sorted(dedup, key=lambda x: x.get('cvss') or 0, reverse=True)[:12]
+    if top_cves:
+        rows = [["CVE", "CVSS", "Severity", "Affected Asset(s)"]]
+        for f in top_cves:
+            asset_names = ", ".join(a.get('display_name', '') for a in f.get('affected_assets', []))[:60]
+            rows.append([f.get('cve_id', '—'), str(f.get('cvss', '—')), f.get('severity', '—'), asset_names])
+        t = Table(rows, colWidths=[1.1 * inch, 0.6 * inch, 0.9 * inch, 3.3 * inch], repeatRows=1)
+        style_cmds = [
+            ('BACKGROUND', (0, 0), (-1, 0), navy), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 8), ('GRID', (0, 0), (-1, -1), 0.5, grey_line),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]
+        for i, f in enumerate(top_cves, start=1):
+            style_cmds.append(('TEXTCOLOR', (2, i), (2, i), severity_color(f.get('severity'))))
+        t.setStyle(TableStyle(style_cmds))
+        elements.append(t)
+    else:
+        elements.append(Paragraph("No version-specific CVEs matched during this assessment.", small))
+    elements.append(Spacer(1, 6))
+
+    # ---- MITRE Attack Paths ---------------------------------------------
+    elements.append(Paragraph("MITRE ATT&amp;CK Attack Paths (Simulated)", h2))
+    elements.append(Paragraph(
+        "SIMULATED — NO REAL ATTACK TRAFFIC. Techniques below reflect the last passive attack-path "
+        "simulation run against the discovered topology.", small))
+    if mitre_before:
+        rows = [["MITRE Technique", "Description"]]
+        for code, desc in list(mitre_before.items())[:15]:
+            rows.append([code, (desc or '')[:80]])
+        t = Table(rows, colWidths=[1.3 * inch, 4.6 * inch], repeatRows=1)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), navy), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 8), ('GRID', (0, 0), (-1, -1), 0.5, grey_line),
+            ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(Spacer(1, 4))
+        elements.append(t)
+    else:
+        elements.append(Paragraph("No attack simulation has been run yet.", small))
+    elements.append(Spacer(1, 6))
+
+    # ---- Exposure Graph (structured, since pyvis/JS has no headless render) --
+    elements.append(Paragraph("Exposure Graph Summary", h2))
+    real_nodes = [n for n, d in G.nodes(data=True) if d.get('node_type') != 'honeypot']
+    top_reachable = sorted(
+        [(n, d) for n, d in G.nodes(data=True) if d.get('node_type') != 'honeypot'],
+        key=lambda x: x[1].get('criticality', 0), reverse=True)[:8]
+    graph_rows = [["Asset", "IP", "Criticality", "Open Ports", "Reachable Neighbors"]]
+    for n, d in top_reachable:
+        graph_rows.append([
+            d.get('display_name', n)[:22], d.get('ip', '—'),
+            CRITICALITY_LABELS.get(d.get('criticality'), '—'),
+            str(len(d.get('open_ports', []))), str(len(list(G.neighbors(n)))),
+        ])
+    elements.append(Paragraph(
+        f"{len(real_nodes)} real assets, {G.number_of_edges()} exposure edges modeled. "
+        f"Top nodes by business criticality shown below; the full interactive graph remains "
+        f"available in the live dashboard.", small))
+    t = Table(graph_rows, colWidths=[1.6 * inch, 1.1 * inch, 0.9 * inch, 0.9 * inch, 1.4 * inch], repeatRows=1)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), accent), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTSIZE', (0, 0), (-1, -1), 8), ('GRID', (0, 0), (-1, -1), 0.5, grey_line),
+        ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+    ]))
+    elements.append(Spacer(1, 4))
+    elements.append(t)
+    elements.append(Spacer(1, 10))
+
+    # ---- Alerts Summary -----------------------------------------------
+    elements.append(Paragraph("Alerts Summary", h2))
+    alerts = alerts or []
+    if alerts:
+        sev_counts = {}
+        for a in alerts:
+            sev_counts[a.get('severity', 'INFO')] = sev_counts.get(a.get('severity', 'INFO'), 0) + 1
+        rows = [["Severity", "Count"]] + [[k, str(v)] for k, v in sorted(sev_counts.items(), key=lambda x: -x[1])]
+        t = Table(rows, colWidths=[2 * inch, 1 * inch])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), navy), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 8.5), ('GRID', (0, 0), (-1, -1), 0.5, grey_line),
+        ]))
+        elements.append(t)
+        elements.append(Spacer(1, 6))
+        recent = alerts[:10]
+        rows2 = [["Time", "Severity", "Message"]]
+        for a in recent:
+            msg = a.get('title') or a.get('description') or ''
+            rows2.append([(a.get('timestamp') or '')[:19], a.get('severity', ''), msg[:70]])
+        t2 = Table(rows2, colWidths=[1.3 * inch, 0.9 * inch, 3.8 * inch], repeatRows=1)
+        t2.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), accent), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 7.5), ('GRID', (0, 0), (-1, -1), 0.5, grey_line),
+            ('TOPPADDING', (0, 0), (-1, -1), 2), ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+        ]))
+        elements.append(t2)
+    else:
+        elements.append(Paragraph("No alerts recorded.", small))
+    elements.append(Spacer(1, 6))
+
+    # ---- Recommended Defenses ---------------------------------------
+    elements.append(Paragraph("Recommended Defenses", h2))
+    defense_actions = defense_actions or []
+    if defense_actions:
+        rows = [["Action", "Priority", "Cost", "Risk Reduction", "MITRE Tactic Mitigated"]]
+        for a in defense_actions[:12]:
+            rows.append([a.get('action', '')[:38], a.get('priority', 'MEDIUM'), str(a.get('cost', '')),
+                         f"-{a.get('risk_reduction', 0)}", (a.get('mitre_tactic') or '')[:42]])
+        t = Table(rows, colWidths=[1.9 * inch, 0.7 * inch, 0.5 * inch, 0.8 * inch, 2.2 * inch], repeatRows=1)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), navy), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 7.5), ('GRID', (0, 0), (-1, -1), 0.5, grey_line),
+            ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(t)
+    else:
+        elements.append(Paragraph("Run the Adaptive Defense Optimizer to generate recommendations.", small))
+    elements.append(Spacer(1, 6))
+
+    # ---- Before vs After Comparison ------------------------------------
+    elements.append(Paragraph("Before vs After Verification", h2))
+    if applied_defenses:
+        rows = [["Metric", "Before", "After", "Change"]]
+
+        def _delta(b, a):
+            if b is None or a is None:
+                return "—"
+            d = round(a - b, 1)
+            return f"{'+' if d > 0 else ''}{d}"
+
+        ov_b = overall_before.get('overall_score') if overall_before else None
+        ov_a = overall_after.get('overall_score') if overall_after else None
+        rows.append(["Overall Risk", str(ov_b), str(ov_a), _delta(ov_b, ov_a)])
+        rows.append(["Blast Radius", str(risk_before), str(risk_after), _delta(risk_before, risk_after)])
+        cb = (blast_before or {}).get('critical_assets_reached')
+        ca = (blast_after or {}).get('critical_assets_reached')
+        rows.append(["Critical Assets Reachable", str(cb), str(ca), _delta(cb, ca)])
+        db_ = (blast_before or {}).get('max_lateral_hops')
+        da_ = (blast_after or {}).get('max_lateral_hops')
+        rows.append(["Attack Depth (hops)", str(db_), str(da_), _delta(db_, da_)])
+        rb = (blast_before or {}).get('systems_controlled')
+        ra = (blast_after or {}).get('systems_controlled')
+        rows.append(["Reachable Nodes", str(rb), str(ra), _delta(rb, ra)])
+        t = Table(rows, colWidths=[2.1 * inch, 1.1 * inch, 1.1 * inch, 1.1 * inch])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), navy), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 9), ('GRID', (0, 0), (-1, -1), 0.5, grey_line),
+            ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(t)
+        mitigated = set(mitre_before or {}) - set(mitre_after or {})
+        if mitigated:
+            elements.append(Spacer(1, 4))
+            elements.append(Paragraph(f"Techniques neutralized by applied defenses: {', '.join(sorted(mitigated))}", small))
+    else:
+        elements.append(Paragraph(
+            "No defenses have been applied yet in this session — apply recommendations from the "
+            "Adaptive Defense Optimizer to populate this comparison.", small))
+    elements.append(Spacer(1, 8))
+
+    # ---- Executive Conclusion -------------------------------------------
+    elements.append(Paragraph("Executive Conclusion", h2))
+    if applied_defenses and overall_before and overall_after:
+        ov_b = overall_before.get('overall_score')
+        ov_a = overall_after.get('overall_score')
+        conclusion = (
+            f"Applying the {len(applied_defenses)} selected defense action(s) reduced Overall ACDS Risk "
+            f"from {ov_b} to {ov_a} ({_delta(ov_b, ov_a)} points). "
+            f"Continued monitoring and remediation of the remaining {metrics['critical']} critical and "
+            f"{metrics['high']} high-severity findings is recommended to sustain this posture."
+        )
+    else:
+        conclusion = (
+            f"The network's current Overall ACDS Risk is {overall_score if overall_score is not None else 'N/A'}/100 "
+            f"({posture_sev}). Reviewing and applying the Adaptive Defense Optimizer's recommended controls "
+            f"is the fastest path to a measurable risk reduction, verifiable on the Before vs After page."
+        )
+    elements.append(Paragraph(conclusion, body))
+    elements.append(Spacer(1, 10))
+    elements.append(HRFlowable(width="100%", thickness=0.75, color=grey_line))
+    elements.append(Paragraph(
+        "Generated by ACDS v3.0 — Adaptive Cyber Defense System. Passive scanning only. "
+        "All attack simulations are non-destructive and generate no real network traffic.", small))
+
+    doc.build(elements)
+    return buf.getvalue()
+
+
 # ─────────────────────────────────────────────────────────────────
 # SESSION STATE INITIALIZATION
 # ─────────────────────────────────────────────────────────────────
+
+# Priority 27 / Sprint 1: initialize the SQLite persistence layers FIRST,
+# since the `defaults` dict below seeds a couple of values (budget,
+# monitor_interval) from persisted Settings (Sprint 3 — Phase 8) and
+# needs the `settings` table to already exist.
+database.init_db()
+monitor_db.init_db()
+_persisted_settings = monitor_db.get_all_settings()
 
 defaults = {
     "network_mode": "Real Network Scan", "simulation_done": False, "timeline": [],
@@ -2827,7 +3598,28 @@ defaults = {
     "last_scan_devices": None, "scan_started_at": None, "scan_completed_at": None,
     "scan_error": None, "scan_timeline": [], "scan_history": [], "scan_counter": 0,
     "risk_before_defense": None, "blast_before_defense": {},
-    "post_defense_stats": None, "overall_acds_risk": None, "budget": 50,
+    "post_defense_stats": None, "overall_acds_risk": None,
+    "budget": _persisted_settings["default_budget"],
+    # Sprint 3 — Phase 2: Before vs After Verification page needs the
+    # OVERALL ACDS Risk snapshot too, not just the blast-radius risk_score.
+    "overall_acds_risk_before": None, "mitre_before_defense": {},
+    "mitre_after_defense": {},
+    "change_summary": None, "adaptive_feedback": None,
+    # Sprint 1 — persistent monitoring (core/database.py)
+    "monitoring_enabled": False, "monitor_interval": _persisted_settings["monitoring_interval"],
+    "monitor_base_ip": None, "monitor_scan_limit": 100,
+    "monitor_last_run": None, "monitor_last_error": None,
+    "monitor_run_count": 0, "monitor_last_changes": [],
+    # Sprint 3 — Phase 7: re-entrancy guard shared by the manual scan
+    # button and the background monitoring pass.
+    "scan_in_progress": False,
+    "monitor_last_snapshot_id": None,
+    # Sprint 2 — Dynamic Risk Intelligence (Phases 1-10)
+    "last_entry_node": None, "blast_radius_last_computed": None,
+    "alerts": [], "cve_timeline": [],
+    "prev_asset_snapshot": {}, "prev_graph_edges": set(),
+    "new_exposure_edges": set(), "removed_exposure_edges": set(),
+    "risk_history_last_run": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -2836,9 +3628,269 @@ for k, v in defaults.items():
 if "G" not in st.session_state:
     st.session_state.G = build_network() if st.session_state.network_mode == "Simulated Lab" else nx.DiGraph()
 
+# Sprint 3 — Phase 8: apply persisted settings to the runtime knobs
+# (scan timeouts, NVD cache TTL, risk thresholds, alert severity floor).
+# Called once here at startup; the Settings panel calls it again
+# immediately after a save so changes take effect without a restart.
+apply_runtime_settings(_persisted_settings)
+
+
+def _device_record_to_monitor_dict(rec):
+    """Adapt a _parse_device_record()-shaped dict (already used by
+    build_dynamic_graph) into the flat shape core.database.record_monitoring_scan
+    expects, resolving port -> service name via the existing PORT_SERVICE_MAP
+    so Sprint 1 never duplicates that lookup table."""
+    version_map = rec.get('version_map') or {}
+    banner_map = rec.get('banner_map') or {}
+    ports = []
+    for port in rec.get('open_ports') or []:
+        service = PORT_SERVICE_MAP.get(port, 'unknown')
+        ports.append({
+            'port': port, 'protocol': 'tcp', 'service': service,
+            'version': version_map.get(service), 'banner': banner_map.get(service),
+        })
+    return {
+        'ip': rec.get('ip'), 'mac': rec.get('mac'), 'hostname': rec.get('hostname'),
+        'vendor': rec.get('mac_vendor'), 'os': rec.get('os'), 'device_type': rec.get('device_type'),
+        'criticality': None, 'current_risk': None,
+        'ports': ports,
+    }
+
+
+def run_monitoring_iteration():
+    """Sprint 1 — Phase 5 / Sprint 2 — Phase 10: one passive monitoring pass:
+    Discovery -> Service Scan -> Store Snapshot -> Change Detection, then
+    (Sprint 2) Exposure Graph Update -> Asset Risk Update -> Blast Radius
+    Update -> Overall Risk Update -> Risk History -> Alert Generation —
+    automatically, with no manual "recompute" button.
+
+    Deliberately reuses scan_network() (the exact same passive
+    ping/ARP/port-scan/banner-grab pipeline as the manual "SCAN NETWORK"
+    button) instead of duplicating discovery logic.
+
+    Sprint 3 — Phase 7: guarded against re-entrancy (skips this pass if a
+    manual scan or a previous monitoring pass is still in flight) and
+    validates its own scan scope every run, since monitor_base_ip is
+    saved config that could in principle go stale/invalid between runs."""
+    if st.session_state.get("scan_in_progress"):
+        acds_log.info("Monitoring pass skipped — a scan is already in progress")
+        return
+    base_ip = st.session_state.get("monitor_base_ip") or None
+    scan_limit = st.session_state.get("monitor_scan_limit", 100)
+
+    if base_ip is not None:
+        valid, reason = validate_scan_scope(base_ip, scan_limit)
+        if not valid:
+            st.session_state.monitor_last_error = f"Invalid monitoring scan scope: {reason}"
+            acds_log.warning("Monitoring pass aborted — invalid scope: %s", reason)
+            return
+
+    st.session_state.scan_in_progress = True
+    t0 = time.time()
+    try:
+        devices, _timeline = scan_network(base_ip=base_ip, limit=scan_limit)
+    except Exception as exc:
+        st.session_state.monitor_last_error = f"{type(exc).__name__}: {exc}"
+        acds_log.error("Monitoring scan_network() failed: %s: %s", type(exc).__name__, exc)
+        return
+    finally:
+        st.session_state.scan_in_progress = False
+
+    duration = round(time.time() - t0, 2)
+    parsed = [_parse_device_record(d) for d in devices]
+    monitor_devices = [_device_record_to_monitor_dict(rec) for rec in parsed]
+    subnet = base_ip or (get_local_ip().rsplit('.', 1)[0] + '.')
+
+    try:
+        changes, snapshot_id = monitor_db.record_monitoring_scan(
+            monitor_devices, subnet=subnet, duration=duration)
+    except Exception as exc:
+        st.session_state.monitor_last_error = f"{type(exc).__name__}: {exc}"
+        return
+
+    st.session_state.monitor_last_error = None
+    st.session_state.monitor_last_run = datetime.now(timezone.utc)
+    st.session_state.monitor_run_count += 1
+    st.session_state.monitor_last_changes = changes
+    st.session_state.monitor_last_snapshot_id = snapshot_id
+
+    # Sprint 2 — Phase 10: every monitoring pass that found live devices
+    # rebuilds the exposure graph (Phase 2 network exposure + Priority 6
+    # asset risk are both recomputed inside build_dynamic_graph itself),
+    # then runs the rest of the automatic pipeline. A pass with zero
+    # devices (e.g. transient network blip) is skipped rather than wiping
+    # the live graph down to nothing.
+    if devices:
+        st.session_state.G = build_dynamic_graph(devices)
+        st.session_state.last_scan_devices = devices
+        run_dynamic_risk_pipeline("MONITORING")
+
+
+def _asset_risk_snapshot_from_graph(G):
+    """Sprint 2: flatten the live graph into an IP-keyed snapshot for the
+    alert engine (core/alert_engine.py) and risk history persistence.
+    Skips honeypot decoy nodes — same convention as
+    core.change_detector.graph_to_asset_snapshot()."""
+    snapshot = {}
+    for node, data in G.nodes(data=True):
+        if data.get("node_type") == "honeypot":
+            continue
+        ip = data.get("ip")
+        if not ip:
+            continue
+        cve_findings = data.get("cve_findings") or []
+        cve_ids = sorted({c.get("cve_id") for c in cve_findings if c.get("cve_id")})
+        cve_cvss = {c.get("cve_id"): c.get("cvss") for c in cve_findings if c.get("cve_id")}
+        snapshot[ip] = {
+            "hostname": data.get("hostname"),
+            "risk_score": data.get("risk_score"),
+            "risk_severity": data.get("risk_severity"),
+            "criticality": data.get("criticality"),
+            "cve_ids": cve_ids,
+            "cve_cvss": cve_cvss,
+            "exposed": bool(G.in_degree(node) > 0 or data.get("open_ports")),
+        }
+    return snapshot
+
+
+def _graph_reachability_edges(G):
+    """Sprint 2 — Phase 5: IP-keyed set of modeled POTENTIAL REACHABILITY
+    edges, used to detect newly-created/removed exposure paths."""
+    edges = set()
+    for src, dst in G.edges():
+        sip, dip = G.nodes[src].get("ip"), G.nodes[dst].get("ip")
+        if sip and dip:
+            edges.add((sip, dip))
+    return edges
+
+
+def recompute_blast_radius_for_current_topology():
+    """Sprint 2 — Phase 6: automatically re-run the (still simulated,
+    still non-exploitative) blast-radius simulation against the CURRENT
+    graph topology, reusing the last entry point / deployed defenses this
+    session ever used. If no simulation baseline exists yet (nobody has
+    picked an entry node this session), this is a no-op — Overall ACDS
+    Risk stays PARTIAL, same as before Sprint 2, rather than inventing an
+    entry point no one chose."""
+    G = st.session_state.G
+    entry = st.session_state.get("last_entry_node")
+    if not entry or entry not in G.nodes:
+        return
+
+    for node in G.nodes:
+        G.nodes[node]["compromised"] = False
+
+    timeline, compromised, honeypot_triggered, attack_stats = simulate_attack(
+        G, entry, seed=random.randint(1, 9999),
+        ids_deployed=st.session_state.ids_deployed,
+        segmentation_applied=st.session_state.segmentation_applied,
+    )
+    risk_score, blast_details = calculate_risk(G, compromised, timeline, honeypot_triggered, attack_stats)
+
+    st.session_state.timeline = timeline
+    st.session_state.compromised = compromised
+    st.session_state.honeypot_triggered = honeypot_triggered
+    st.session_state.risk_score = risk_score
+    st.session_state.blast_details = blast_details
+    st.session_state.attack_stats = attack_stats
+    st.session_state.simulation_done = True
+    st.session_state.blast_radius_last_computed = datetime.now(timezone.utc)
+    st.session_state.defense_actions = get_defense_actions(G, compromised, risk_score)
+    selected, _reduction, _remaining = greedy_defense_selection(
+        st.session_state.defense_actions, st.session_state.budget)
+    st.session_state.selected_defenses = selected
+    st.session_state.attack_log = generate_attack_log(timeline, honeypot_triggered)
+
+    if honeypot_triggered:
+        honeypot_engine.record_trigger(
+            source_node=entry, decoy_node="Honeypot (decoy)",
+            event_type="simulated_probe",
+            details="Simulated attacker reached the decoy node during an automatic blast-radius recompute.",
+            risk_before=risk_score - 15 if risk_score is not None else None,
+            risk_after=risk_score,
+        )
+    st.session_state.adaptive_feedback = honeypot_engine.apply_adaptive_feedback(risk_score)
+
+
+def persist_dynamic_risk_pipeline(trigger):
+    """Sprint 2 — Phase 10: the last three stages of the automatic
+    recalculation pipeline — Risk History and Alert Generation — run
+    against whatever is CURRENTLY in st.session_state.G / risk_score /
+    overall_acds_risk. Diffs against the previous pass (stored in
+    st.session_state) to produce RISK_INCREASE/DECREASE, NEW_CVE,
+    CRITICAL_ASSET_EXPOSED, and NEW_EXPOSURE_PATH alerts, plus the CVE
+    lifecycle timeline (Phase 9). Safe to call with no prior baseline —
+    the first pass just seeds the snapshot with no diff-based alerts.
+    """
+    G = st.session_state.G
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    after_snapshot = _asset_risk_snapshot_from_graph(G)
+    after_edges = _graph_reachability_edges(G)
+    before_snapshot = st.session_state.get("prev_asset_snapshot") or {}
+    before_edges = st.session_state.get("prev_graph_edges") or set()
+
+    alerts = alert_engine.generate_change_alerts(
+        before_snapshot, after_snapshot, before_edges, after_edges,
+        st.session_state.get("honeypot_triggered", False), now_iso,
+    )
+    # Sprint 3 — Phase 8: Alert Severity Threshold setting — alerts below
+    # the configured floor are dropped BEFORE they're persisted, so a
+    # noisy LOW/INFO-heavy network doesn't drown out what the user
+    # actually asked to be notified about.
+    min_rank = _SEVERITY_RANK.get(ALERT_SEVERITY_THRESHOLD, 0)
+    alerts = [a for a in alerts if _SEVERITY_RANK.get(a.get("severity", "INFO"), 0) >= min_rank]
+    if alerts:
+        monitor_db.create_alerts(alerts)
+        st.session_state.alerts = (alerts + st.session_state.get("alerts", []))[:200]
+
+    cve_events = alert_engine.build_cve_lifecycle_events(before_snapshot, after_snapshot, now_iso)
+    if cve_events:
+        monitor_db.record_cve_events(cve_events)
+    st.session_state.cve_timeline = (list(reversed(cve_events)) + st.session_state.get("cve_timeline", []))[:100]
+
+    overall = st.session_state.get("overall_acds_risk") or {}
+    blast_score = st.session_state.risk_score if st.session_state.get("simulation_done") else None
+    asset_rows = [{"asset_ip": ip, "asset_risk": d.get("risk_score")} for ip, d in after_snapshot.items()]
+    monitor_db.record_risk_history(asset_rows, overall.get("overall_score"), blast_score, trigger)
+    # Sprint 3 — Phase 3: keep the `assets` table's current_risk/criticality
+    # in sync so the Executive Dashboard works after a manual scan or a
+    # simulation too, not only after background monitoring passes.
+    monitor_db.update_asset_current_state(after_snapshot)
+
+    st.session_state.new_exposure_edges = after_edges - before_edges
+    st.session_state.removed_exposure_edges = before_edges - after_edges
+    st.session_state.prev_asset_snapshot = after_snapshot
+    st.session_state.prev_graph_edges = after_edges
+    st.session_state.risk_history_last_run = now_iso
+
+
+def run_dynamic_risk_pipeline(trigger, recompute_blast=True):
+    """Sprint 2 — Phase 10: AUTOMATIC RECALCULATION PIPELINE.
+
+    Change Detection (already done by the caller) -> Exposure Graph Update
+    (already done by the caller rebuilding st.session_state.G, which itself
+    runs Phase 2 network-exposure + Priority 6 asset-risk recompute) ->
+    Blast Radius Update -> Overall Risk Update -> Risk History -> Alert
+    Generation. No manual "recompute" button anywhere calls this directly
+    for its own sake — it is always triggered BY a topology-changing event
+    (a scan, a monitoring pass, or a simulation run) per the Sprint 2 spec.
+    """
+    if recompute_blast:
+        recompute_blast_radius_for_current_topology()
+
+    st.session_state.overall_acds_risk = calculate_overall_acds_risk(
+        st.session_state.G,
+        st.session_state.risk_score if st.session_state.get("simulation_done") else None,
+    )
+    persist_dynamic_risk_pipeline(trigger)
+
 
 def record_scan_history(G, scan_type):
-    """Priority 21: persistent in-session scan history (no database)."""
+    """Priority 21: in-session scan history (fast UI list) PLUS Priority 13/27:
+    persist the scan + a per-asset snapshot to SQLite, and diff it against the
+    last persisted snapshot so Change Detection survives app restarts instead
+    of only living in st.session_state."""
     metrics = get_asset_metrics(G)
     st.session_state.scan_counter += 1
     st.session_state.scan_history.append({
@@ -2852,6 +3904,15 @@ def record_scan_history(G, scan_type):
         'medium_count': metrics['medium'],
         'low_count': metrics['low'],
     })
+
+    # Only real, non-empty scans of actual discovered assets are meaningful
+    # to persist and diff (skip empty "Simulated Lab" graphs).
+    current_assets = change_detector.graph_to_asset_snapshot(G)
+    if current_assets:
+        prev_scan_id = database.get_latest_scan_id()
+        previous_assets = database.get_snapshot(prev_scan_id)
+        st.session_state.change_summary = change_detector.diff_scans(previous_assets, current_assets)
+        database.save_scan(scan_type, metrics, current_assets)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2932,50 +3993,109 @@ with st.sidebar:
 
         scan_limit = st.slider("Scan Range (last octet up to...)", 10, 254, preset_limit, 10)
 
-        if st.button("📡  SCAN NETWORK", use_container_width=True):
-            progress_bar = st.progress(0, text="Starting scan...")
-
-            def _progress(done, total):
-                if total > 0:
-                    progress_bar.progress(min(done / total, 1.0), text=f"Profiling host {done}/{total}...")
-
-            st.session_state.scan_started_at = datetime.now(timezone.utc)
-            st.session_state.scan_error = None
-            try:
-                with st.spinner("Pinging subnet and discovering hosts..."):
-                    devices, scan_timeline = scan_network(base_ip=base_ip, limit=scan_limit, progress_cb=_progress)
-            except Exception as exc:
-                devices, scan_timeline = [], []
-                st.session_state.scan_error = f"Scan failed safely: {type(exc).__name__}: {exc}"
-            finally:
-                st.session_state.scan_completed_at = datetime.now(timezone.utc)
-                progress_bar.empty()
-
-            if st.session_state.scan_error:
-                st.error(st.session_state.scan_error)
-            elif not devices:
-                st.warning("No active devices found. Check your network prefix or range.")
+        if st.button("📡  SCAN NETWORK", use_container_width=True, disabled=st.session_state.get("scan_in_progress", False)):
+            # Sprint 3 — Phase 7: scan scope validation + duplicate-scan guard.
+            # Auto-detected base_ip is trusted (computed by get_local_ip()
+            # itself, not user-typed) and skips the format check; a manually
+            # typed prefix is validated before any network operation starts.
+            valid, reason = (True, None) if base_ip is None else validate_scan_scope(base_ip, scan_limit)
+            if not valid:
+                st.error(f"Scan not started — invalid scan scope: {reason}")
+            elif st.session_state.get("scan_in_progress"):
+                st.warning("A scan is already in progress — please wait for it to finish.")
             else:
-                st.session_state.simulation_done = False
-                st.session_state.timeline = []
-                st.session_state.compromised = set()
-                st.session_state.risk_score = 0.0
-                st.session_state.blast_details = {}
-                st.session_state.honeypot_triggered = False
-                st.session_state.defense_actions = []
-                st.session_state.selected_defenses = []
-                st.session_state.applied_defenses = []
-                st.session_state.ids_deployed = False
-                st.session_state.segmentation_applied = False
-                st.session_state.attack_log = []
-                st.session_state.current_anim_node = None
-                st.session_state.overall_acds_risk = None
-                st.session_state.G = build_dynamic_graph(devices)
-                st.session_state.last_scan_devices = devices
-                st.session_state.scan_timeline = scan_timeline
-                record_scan_history(st.session_state.G, "Real Network Scan")
-                st.success(f"Found {len(devices)} device(s). Real banners + CVE lookups + ACDS risk model applied.")
+                st.session_state.scan_in_progress = True
+                try:
+                    progress_bar = st.progress(0, text="Starting scan...")
+
+                    def _progress(done, total):
+                        if total > 0:
+                            progress_bar.progress(min(done / total, 1.0), text=f"Profiling host {done}/{total}...")
+
+                    st.session_state.scan_started_at = datetime.now(timezone.utc)
+                    st.session_state.scan_error = None
+                    try:
+                        with st.spinner("Pinging subnet and discovering hosts..."):
+                            devices, scan_timeline = scan_network(base_ip=base_ip, limit=scan_limit, progress_cb=_progress)
+                    except Exception as exc:
+                        devices, scan_timeline = [], []
+                        st.session_state.scan_error = f"Scan failed safely: {type(exc).__name__}: {exc}"
+                        acds_log.error("Manual scan failed: %s: %s", type(exc).__name__, exc)
+                    finally:
+                        st.session_state.scan_completed_at = datetime.now(timezone.utc)
+                        progress_bar.empty()
+
+                    if st.session_state.scan_error:
+                        st.error(st.session_state.scan_error)
+                        st.toast("❌ Scan failed — see details above", icon="❌")
+                    elif not devices:
+                        st.warning("No active devices found. Check your network prefix or range.")
+                        st.toast("No devices found", icon="⚠️")
+                    else:
+                        st.session_state.simulation_done = False
+                        st.session_state.timeline = []
+                        st.session_state.compromised = set()
+                        st.session_state.risk_score = 0.0
+                        st.session_state.blast_details = {}
+                        st.session_state.honeypot_triggered = False
+                        st.session_state.defense_actions = []
+                        st.session_state.selected_defenses = []
+                        st.session_state.applied_defenses = []
+                        st.session_state.ids_deployed = False
+                        st.session_state.segmentation_applied = False
+                        st.session_state.attack_log = []
+                        st.session_state.current_anim_node = None
+                        st.session_state.overall_acds_risk = None
+                        st.session_state.G = build_dynamic_graph(devices)
+                        st.session_state.last_scan_devices = devices
+                        st.session_state.scan_timeline = scan_timeline
+                        record_scan_history(st.session_state.G, "Real Network Scan")
+                        # Sprint 2 — Phase 10: a manual scan is itself a topology-changing
+                        # event (new/removed assets, port changes), so it drives the same
+                        # automatic pipeline as a background monitoring pass.
+                        run_dynamic_risk_pipeline("MANUAL_SCAN")
+                        st.success(f"Found {len(devices)} device(s). Real banners + CVE lookups + ACDS risk model applied.")
+                        st.toast(f"📡 Scan complete — {len(devices)} device(s) found", icon="📡")
+                finally:
+                    st.session_state.scan_in_progress = False
                 st.rerun()
+
+        # ─────────────────────────────────────────────────────
+        # SPRINT 1 — PHASE 5: PERSISTENT / BACKGROUND MONITORING
+        # ─────────────────────────────────────────────────────
+        st.markdown('<div class="section-header">🛰 PERSISTENT MONITORING</div>', unsafe_allow_html=True)
+        st.session_state.monitor_base_ip = base_ip
+        st.session_state.monitor_scan_limit = scan_limit
+
+        interval_choice = st.selectbox(
+            "Monitoring interval", ["30s", "1m", "5m"],
+            index=["30s", "1m", "5m"].index(st.session_state.monitor_interval),
+            help="How often ACDS re-runs discovery + service scan in the background while this tab is open.",
+        )
+        st.session_state.monitor_interval = interval_choice
+
+        mon_col1, mon_col2 = st.columns(2)
+        with mon_col1:
+            if st.button("▶ START MONITORING", use_container_width=True,
+                         disabled=st.session_state.monitoring_enabled):
+                st.session_state.monitoring_enabled = True
+                st.rerun()
+        with mon_col2:
+            if st.button("■ STOP MONITORING", use_container_width=True,
+                         disabled=not st.session_state.monitoring_enabled):
+                st.session_state.monitoring_enabled = False
+                st.rerun()
+
+        if st.session_state.monitoring_enabled:
+            st.markdown(
+                f'<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#00ff88">'
+                f'🟢 LIVE — scanning every {interval_choice}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a">'
+                '⚫ Monitoring stopped</div>', unsafe_allow_html=True)
+        if st.session_state.monitor_last_error:
+            st.warning(f"Last monitoring pass failed safely: {st.session_state.monitor_last_error}")
 
     st.markdown('<div class="section-header">⚙ SIMULATION CONTROLS</div>', unsafe_allow_html=True)
 
@@ -3050,24 +4170,461 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
+# ─────────────────────────────────────────────────────────────────
+# SPRINT 3 — PHASE 3: EXECUTIVE CYBER DASHBOARD (top KPI row)
+# Reads Total Assets / Critical Assets / Active Alerts from the
+# persisted SQLite layer (core/database.py) so these numbers are
+# meaningful even before this session has run a scan — falling back
+# to the live in-memory graph only when the DB has nothing yet (e.g.
+# a brand-new install). Active Vulnerabilities and Overall ACDS Risk
+# come from the live model, same as the rest of the app.
+# ─────────────────────────────────────────────────────────────────
 asset_metrics = get_asset_metrics(st.session_state.G)
-m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+_db_asset_count = monitor_db.get_asset_count()
+_db_live_assets = monitor_db.get_live_assets()
+
+_total_assets = _db_asset_count["total"] or asset_metrics["assets"]
+_critical_assets = (sum(1 for a in _db_live_assets if (_safe_int(a.get("criticality")) or 0) >= 4)
+                     if _db_live_assets else
+                     sum(1 for _, d in st.session_state.G.nodes(data=True) if (d.get("criticality") or 0) >= 4))
+_active_vulns = len(vuln_dedup.deduplicate_findings(st.session_state.G))
+_overall_obj = st.session_state.get("overall_acds_risk")
+_overall_display = f"{_overall_obj['overall_score']}/100" if _overall_obj and _overall_obj.get("overall_score") is not None else "—"
+_active_alerts = len(monitor_db.get_alerts(limit=500))
+
+st.markdown('<div class="section-header">🏠 EXECUTIVE CYBER DASHBOARD</div>', unsafe_allow_html=True)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
+with k1:
+    st.metric("TOTAL ASSETS", _total_assets)
+with k2:
+    st.metric("CRITICAL ASSETS", _critical_assets)
+with k3:
+    st.metric("ACTIVE VULNERABILITIES", _active_vulns)
+with k4:
+    st.metric("OVERALL ACDS RISK", _overall_display)
+with k5:
+    st.metric("ACTIVE ALERTS", _active_alerts)
+with k6:
+    st.metric("AVERAGE RISK", f"{asset_metrics['average_risk']}")
+
+m1, m2, m3, m4, m5 = st.columns(5)
 with m1:
-    st.metric("ASSETS", asset_metrics["assets"])
-with m2:
-    st.metric("CRITICAL", asset_metrics["critical"])
-with m3:
     st.metric("HIGH", asset_metrics["high"])
-with m4:
+with m2:
     st.metric("MEDIUM", asset_metrics["medium"])
-with m5:
+with m3:
     st.metric("LOW", asset_metrics["low"])
-with m6:
+with m4:
     st.metric("SERVERS", asset_metrics["servers"])
-with m7:
+with m5:
     st.metric("OTHER DEVICES", asset_metrics["other_devices"])
-with m8:
-    st.metric("AVG. RISK", f"{asset_metrics['average_risk']}")
+
+st.markdown('<hr style="border-color:#1a3a5c;margin:8px 0 20px 0">', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────
+# SPRINT 1 — PHASES 6/7: LIVE ASSET INVENTORY + NETWORK CHANGES
+# Persists independently of attack simulation / defense state, so it
+# stays visible and current for as long as monitoring has ever run —
+# even before a simulation is started (Phases 5/6/7 are pure
+# discovery + change detection, no attack/risk logic here).
+# ─────────────────────────────────────────────────────────────────
+if st.session_state.network_mode == "Real Network Scan":
+
+    _CHANGE_ICONS = {
+        "NEW_ASSET": "🟢", "REMOVED_ASSET": "⚫", "NEW_PORT": "🟠",
+        "CLOSED_PORT": "🔵", "SERVICE_CHANGED": "🟡", "VERSION_CHANGED": "🟣",
+    }
+
+    def _render_change_entry(c):
+        icon = _CHANGE_ICONS.get(c["type"], "⚪")
+        if c["type"] == "NEW_ASSET":
+            body = f"New device detected<br><b>{c['asset']}</b>" + (f" &middot; {c['hostname']}" if c.get('hostname') else "")
+            label = "New device detected"
+        elif c["type"] == "REMOVED_ASSET":
+            body = f"Device offline<br><b>{c['asset']}</b>"
+            label = "Device offline"
+        elif c["type"] == "NEW_PORT":
+            body = f"New port opened<br><b>{c['asset']}</b><br>{c['port']} / {c.get('service') or 'unknown'}"
+            label = "New port opened"
+        elif c["type"] == "CLOSED_PORT":
+            body = f"Port closed<br><b>{c['asset']}</b><br>{c['port']} / {c.get('service') or 'unknown'}"
+            label = "Port closed"
+        elif c["type"] == "SERVICE_CHANGED":
+            body = f"Service changed<br><b>{c['asset']}</b><br>port {c['port']}: {c.get('before_service')} → {c.get('after_service')}"
+            label = "Service changed"
+        else:  # VERSION_CHANGED
+            body = f"Version changed<br><b>{c['asset']}</b><br>{c.get('service')} {c.get('before_version')} → {c.get('after_version')}"
+            label = "Version changed"
+        sev = c.get("severity", "LOW")
+        sev_color = {"HIGH": "#ff3355", "MEDIUM": "#ff8c00", "LOW": "#3d6a8a"}.get(sev, "#3d6a8a")
+        st.markdown(f"""
+        <div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+             padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid {sev_color}">
+            <span style="font-size:0.9rem">{icon}</span>
+            <span style="color:#e0f4ff;margin-left:4px">{label}</span>
+            <span style="float:right;color:{sev_color};font-size:0.6rem">{sev}</span>
+            <div style="margin-top:4px;color:#7ab8d4">{body}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    def _render_monitoring_panel():
+        if st.session_state.monitoring_enabled:
+            run_monitoring_iteration()
+
+        counts = monitor_db.get_asset_count()
+        last_run = st.session_state.monitor_last_run
+        last_run_txt = last_run.strftime("%Y-%m-%d %H:%M:%S UTC") if last_run else "never"
+        st.markdown(
+            f'<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin-bottom:6px">'
+            f'Tracked assets: <span style="color:#00d4ff">{counts["total"]}</span> total, '
+            f'<span style="color:#00ff88">{counts["online"]}</span> online &middot; '
+            f'last monitoring pass: <span style="color:#7ab8d4">{last_run_txt}</span> &middot; '
+            f'passes run this session: {st.session_state.monitor_run_count}</div>',
+            unsafe_allow_html=True,
+        )
+
+        live_col, changes_col = st.columns([3, 2], gap="medium")
+
+        with live_col:
+            st.markdown('<div class="section-header">📡 LIVE ASSET INVENTORY</div>', unsafe_allow_html=True)
+            live_assets = monitor_db.get_live_assets()
+            if not live_assets:
+                st.markdown(
+                    '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+                    'No assets tracked yet — run SCAN NETWORK or START MONITORING.</div>',
+                    unsafe_allow_html=True)
+            else:
+                rows_html = []
+                for a in live_assets:
+                    dot = "🟢" if a["status"] == "ONLINE" else "⚫"
+                    rows_html.append(
+                        f"<tr style='border-bottom:1px solid #1a3a5c'>"
+                        f"<td style='padding:4px 6px'>{dot} {a['status']}</td>"
+                        f"<td style='padding:4px 6px'>{a['ip_address'] or '—'}</td>"
+                        f"<td style='padding:4px 6px'>{a['hostname'] or '—'}</td>"
+                        f"<td style='padding:4px 6px'>{a['device_type'] or '—'}</td>"
+                        f"<td style='padding:4px 6px'>{a['operating_system'] or '—'}</td>"
+                        f"<td style='padding:4px 6px'>{a['vendor'] or '—'}</td>"
+                        f"<td style='padding:4px 6px'>{(a['first_seen'] or '')[:19]}</td>"
+                        f"<td style='padding:4px 6px'>{(a['last_seen'] or '')[:19]}</td>"
+                        f"</tr>"
+                    )
+                st.markdown(f"""
+                <div style="max-height:340px;overflow-y:auto">
+                <table style="width:100%;border-collapse:collapse;font-family:Share Tech Mono;
+                       font-size:0.62rem;color:#7ab8d4">
+                <thead><tr style="color:#00d4ff;border-bottom:1px solid #00d4ff">
+                <th style='text-align:left;padding:4px 6px'>Status</th>
+                <th style='text-align:left;padding:4px 6px'>IP</th>
+                <th style='text-align:left;padding:4px 6px'>Hostname</th>
+                <th style='text-align:left;padding:4px 6px'>Device</th>
+                <th style='text-align:left;padding:4px 6px'>OS</th>
+                <th style='text-align:left;padding:4px 6px'>Vendor</th>
+                <th style='text-align:left;padding:4px 6px'>First Seen</th>
+                <th style='text-align:left;padding:4px 6px'>Last Seen</th>
+                </tr></thead>
+                <tbody>{''.join(rows_html)}</tbody>
+                </table>
+                </div>
+                """, unsafe_allow_html=True)
+
+        with changes_col:
+            st.markdown('<div class="section-header">🔔 NETWORK CHANGES</div>', unsafe_allow_html=True)
+            changes = st.session_state.monitor_last_changes
+            if not changes:
+                st.markdown(
+                    '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+                    'No changes detected since the last monitoring pass.</div>',
+                    unsafe_allow_html=True)
+            else:
+                for c in changes[:25]:
+                    _render_change_entry(c)
+
+    if st.session_state.monitoring_enabled:
+        # st.fragment(run_every=...) reruns ONLY this function on the chosen
+        # interval — no manual threads, no blocking loops, and the rest of
+        # the Streamlit app (sidebar, simulation controls) stays fully
+        # responsive in between (Phase 5 requirements).
+        st.fragment(run_every=st.session_state.monitor_interval)(_render_monitoring_panel)()
+    else:
+        _render_monitoring_panel()
+
+    st.markdown('<hr style="border-color:#1a3a5c;margin:8px 0 20px 0">', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────
+# SPRINT 3 — PHASE 5: LIVE RECENT CHANGES PANEL (read entirely from
+# SQLite via monitor_db.get_recent_timeline() — a scrolling history
+# across restarts, not just this session's last monitoring pass).
+# Shown regardless of network mode, same as Alerts/Risk Trend below.
+# ─────────────────────────────────────────────────────────────────
+_TIMELINE_ICONS = {
+    "NEW_ASSET": "🟢", "REMOVED_ASSET": "⚫", "NEW_PORT": "🟠", "CLOSED_PORT": "🔵",
+    "SERVICE_CHANGED": "🟡", "VERSION_CHANGED": "🟣",
+    "RISK_INCREASE": "🔴", "RISK_DECREASE": "🟢",
+}
+_TIMELINE_LABELS = {
+    "NEW_ASSET": "New Asset", "REMOVED_ASSET": "Device Offline",
+    "NEW_PORT": "Port Opened", "CLOSED_PORT": "Port Closed",
+    "SERVICE_CHANGED": "Service Changed", "VERSION_CHANGED": "Version Changed",
+    "RISK_INCREASE": "Overall Risk Increased", "RISK_DECREASE": "Risk Reduced",
+}
+
+
+def render_recent_changes_timeline():
+    st.markdown('<div class="section-header">📜 RECENT CHANGES</div>', unsafe_allow_html=True)
+    rows = monitor_db.get_recent_timeline(limit=30)
+    if not rows:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+            'No changes recorded yet. Enable monitoring or run a scan to start building history.</div>',
+            unsafe_allow_html=True)
+        return
+
+    entries_html = []
+    for r in rows:
+        ts = (r.get("timestamp") or "")
+        time_label = ts[11:16] if len(ts) >= 16 else ts
+        icon = _TIMELINE_ICONS.get(r["kind"], "⚪")
+        label = _TIMELINE_LABELS.get(r["kind"], r["kind"])
+        asset = html_lib.escape(str(r.get("asset") or ""))
+        detail = html_lib.escape(str(r.get("detail") or ""))
+        entries_html.append(f"""
+        <div style='padding:8px 4px;border-bottom:1px solid #142a3a'>
+            <span style='color:#3d6a8a;font-family:Share Tech Mono;font-size:0.68rem'>{time_label}</span>
+            <span style='margin-left:10px;font-size:0.85rem'>{icon}</span>
+            <span style='color:#e0f4ff;font-family:Share Tech Mono;font-size:0.72rem;margin-left:4px'>{label}</span>
+            <div style='color:#7ab8d4;font-family:Share Tech Mono;font-size:0.68rem;margin:2px 0 0 62px'>
+                {asset}{' — ' + detail if detail and detail != label else ''}
+            </div>
+        </div>""")
+
+    st.markdown(
+        f"<div style='max-height:340px;overflow-y:auto;background:#0a1520;border:1px solid #1a3a5c;padding:4px 10px'>"
+        f"{''.join(entries_html)}</div>", unsafe_allow_html=True)
+
+
+render_recent_changes_timeline()
+st.markdown('<hr style="border-color:#1a3a5c;margin:8px 0 20px 0">', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────
+# SPRINT 2 — PHASE 7: REAL-TIME ALERT ENGINE (UI)
+# PHASE 8: RISK TREND VISUALIZATION (UI)
+# PHASE 9: CVE / VULNERABILITY LIFECYCLE (UI)
+# Shown regardless of network mode (Simulated Lab produces alerts/history
+# too, once a scan or simulation has fed the pipeline at least once).
+# ─────────────────────────────────────────────────────────────────
+
+_ALERT_SEVERITY_COLOR = {
+    "CRITICAL": "#ff3355", "HIGH": "#ff8c00", "MEDIUM": "#ffd700",
+    "LOW": "#3d6a8a", "INFO": "#00d4ff",
+}
+_ALERT_TYPE_ICON = {
+    "NEW_CVE": "🧬", "RISK_INCREASE": "📈", "RISK_DECREASE": "📉",
+    "CRITICAL_ASSET_EXPOSED": "🚨", "NEW_EXPOSURE_PATH": "🛣", "HONEYPOT_PATH": "🍯",
+}
+
+
+def _render_alert_card(a):
+    sev = a.get("severity", "INFO")
+    color = _ALERT_SEVERITY_COLOR.get(sev, "#3d6a8a")
+    icon = _ALERT_TYPE_ICON.get(a.get("alert_type"), "🔔")
+    delta_html = ""
+    if a.get("old_value") and a.get("new_value"):
+        delta_html = (f"<div style='color:#e0f4ff;font-family:Orbitron,monospace;font-size:0.8rem;margin-top:4px'>"
+                      f"{html_lib.escape(str(a['old_value']))} → {html_lib.escape(str(a['new_value']))}</div>")
+    ts = (a.get("timestamp") or "")[:19].replace("T", " ")
+    st.markdown(f"""
+    <div style='background:#0d1f2d;border:1px solid {color};border-left:4px solid {color};
+         padding:10px 14px;margin:6px 0;font-family:Share Tech Mono;font-size:0.7rem;color:#7ab8d4'>
+        <div style='display:flex;justify-content:space-between;align-items:center'>
+            <span style='color:{color};font-weight:bold'>{icon} {sev} — {a.get("title","")}</span>
+            <span style='color:#3d6a8a;font-size:0.6rem'>{ts}</span>
+        </div>
+        <div style='color:#e0f4ff;margin-top:2px'>Asset: {html_lib.escape(str(a.get("asset") or "—"))}</div>
+        <div style='margin-top:2px'>{html_lib.escape(str(a.get("description") or ""))}</div>
+        {delta_html}
+    </div>
+    """, unsafe_allow_html=True)
+
+
+st.markdown('<div class="section-header">🚨 REAL-TIME ALERTS</div>', unsafe_allow_html=True)
+alerts_to_show = st.session_state.get("alerts") or monitor_db.get_alerts(limit=25)
+if not alerts_to_show:
+    st.markdown(
+        '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+        'No alerts yet — alerts fire automatically the first time a scan, monitoring pass, or '
+        'simulation detects a risk increase, a new CVE, a newly exposed critical asset, a new '
+        'exposure path, or a honeypot hit.</div>', unsafe_allow_html=True)
+else:
+    sev_filter = st.multiselect("Filter by severity", ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+                                 default=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"], key="alert_sev_filter")
+    shown = [a for a in alerts_to_show if a.get("severity") in sev_filter][:25]
+    for a in shown:
+        _render_alert_card(a)
+
+st.markdown('<hr style="border-color:#1a3a5c;margin:14px 0 20px 0">', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────
+# SPRINT 3 — PHASE 6: DEDICATED ALERT CENTER
+# Full history (not capped to the last 25 like the live glance above),
+# with severity filter, free-text search (IP / hostname / CVE / alert
+# type all live in asset/title/description/alert_type, so one search
+# box covers all four per the sprint spec), and acknowledgement that
+# is stored in SQLite and never deletes the underlying alert.
+# ─────────────────────────────────────────────────────────────────
+st.markdown('<div class="section-header">🎯 ALERT CENTER</div>', unsafe_allow_html=True)
+
+ac_col1, ac_col2, ac_col3 = st.columns([1.3, 2, 1.3])
+with ac_col1:
+    ac_severity = st.selectbox("Filter", ["All", "Critical", "High", "Medium", "Low", "Info"],
+                                key="alert_center_severity", help="Show only alerts at this severity level.")
+with ac_col2:
+    ac_search = st.text_input("Search by IP, hostname, CVE, or alert type",
+                               key="alert_center_search", placeholder="e.g. 192.168.1.12, CVE-2024-…, RISK_INCREASE",
+                               help="Matches against the asset, title, description, and alert type fields.")
+with ac_col3:
+    ac_show_acked = st.checkbox("Show acknowledged", value=False, key="alert_center_show_acked",
+                                 help="Acknowledged alerts are hidden by default but never deleted.")
+
+ac_results = monitor_db.get_alerts(
+    limit=300,
+    severity=None if ac_severity == "All" else ac_severity.upper(),
+    search=ac_search.strip() if ac_search else None,
+    acknowledged=None if ac_show_acked else False,
+)
+
+st.markdown(
+    f"<div style='font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin-bottom:6px'>"
+    f"{len(ac_results)} alert(s) matching current filters</div>", unsafe_allow_html=True)
+
+if not ac_results:
+    st.markdown(
+        '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+        'No alerts match these filters.</div>', unsafe_allow_html=True)
+else:
+    for a in ac_results[:100]:
+        sev = a.get("severity", "INFO")
+        color = _ALERT_SEVERITY_COLOR.get(sev, "#3d6a8a")
+        icon = _ALERT_TYPE_ICON.get(a.get("alert_type"), "🔔")
+        ts = (a.get("timestamp") or "")[:19].replace("T", " ")
+        is_acked = bool(a.get("acknowledged"))
+        card_col, btn_col = st.columns([5, 1])
+        with card_col:
+            delta_html = ""
+            if a.get("old_value") and a.get("new_value"):
+                delta_html = (f"<div style='color:#e0f4ff;font-family:Orbitron,monospace;font-size:0.75rem;margin-top:3px'>"
+                               f"{html_lib.escape(str(a['old_value']))} → {html_lib.escape(str(a['new_value']))}</div>")
+            ack_badge = (f"<span style='color:#00ff88;font-size:0.6rem;margin-left:8px'>✔ ACKNOWLEDGED "
+                         f"{(a.get('acknowledged_at') or '')[:16].replace('T',' ')}</span>") if is_acked else ""
+            st.markdown(f"""
+            <div style='background:#0d1f2d;border:1px solid {color};border-left:4px solid {color};
+                 padding:9px 12px;margin:4px 0;font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+                 opacity:{0.6 if is_acked else 1}'>
+                <div style='display:flex;justify-content:space-between;align-items:center'>
+                    <span style='color:{color};font-weight:bold'>{icon} {sev} — {a.get("title","")}</span>
+                    <span style='color:#3d6a8a;font-size:0.6rem'>{ts}</span>
+                </div>
+                <div style='color:#e0f4ff;margin-top:2px'>Asset: {html_lib.escape(str(a.get("asset") or "—"))}
+                    <span style='color:#3d6a8a'>· {a.get("alert_type","")}</span>{ack_badge}</div>
+                <div style='margin-top:2px'>{html_lib.escape(str(a.get("description") or ""))}</div>
+                {delta_html}
+            </div>
+            """, unsafe_allow_html=True)
+        with btn_col:
+            if not is_acked:
+                if st.button("✅ Ack", key=f"ack_alert_{a['id']}", use_container_width=True,
+                             help="Mark this alert acknowledged — it stays in history, never deleted."):
+                    monitor_db.acknowledge_alert(a["id"])
+                    st.toast("Alert acknowledged", icon="✅")
+                    st.rerun()
+
+st.markdown('<hr style="border-color:#1a3a5c;margin:14px 0 20px 0">', unsafe_allow_html=True)
+
+st.markdown('<div class="section-header">📈 RISK TREND &amp; DISTRIBUTION</div>', unsafe_allow_html=True)
+trend_col, dist_col = st.columns([1, 1], gap="medium")
+
+with trend_col:
+    st.markdown("<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin-bottom:4px'>Overall Risk Trend</div>", unsafe_allow_html=True)
+    trend_rows = monitor_db.get_overall_risk_trend(limit=100)
+    if trend_rows:
+        trend_df = pd.DataFrame(trend_rows)
+        trend_df["timestamp"] = pd.to_datetime(trend_df["timestamp"]).dt.strftime("%m-%d %H:%M")
+        trend_df = trend_df.set_index("timestamp")[["overall_risk"]].rename(columns={"overall_risk": "Overall ACDS Risk"})
+        st.line_chart(trend_df, height=220)
+    else:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a">'
+            'No risk history yet — run a scan or simulation to seed the trend.</div>', unsafe_allow_html=True)
+
+with dist_col:
+    st.markdown("<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin-bottom:4px'>Asset Risk Distribution</div>", unsafe_allow_html=True)
+    latest_rows = monitor_db.get_latest_asset_risk_rows()
+    if latest_rows:
+        buckets = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        for r in latest_rows:
+            if r.get("asset_risk") is None:
+                continue
+            buckets[severity_from_score(r["asset_risk"])] += 1
+        dist_df = pd.DataFrame({"Assets": buckets}, index=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
+        st.bar_chart(dist_df, height=220)
+    else:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a">'
+            'No risk history yet.</div>', unsafe_allow_html=True)
+
+st.markdown("<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin:14px 0 4px'>Top 10 Highest Risk Assets</div>", unsafe_allow_html=True)
+latest_rows = monitor_db.get_latest_asset_risk_rows()
+if latest_rows:
+    top10 = sorted([r for r in latest_rows if r.get("asset_risk") is not None],
+                    key=lambda r: r["asset_risk"], reverse=True)[:10]
+    rows_html = "".join(
+        f"<tr style='border-bottom:1px solid #1a3a5c'>"
+        f"<td style='padding:4px 6px'>{r.get('asset_ip') or '—'}</td>"
+        f"<td style='padding:4px 6px'>{r.get('hostname') or '—'}</td>"
+        f"<td style='padding:4px 6px;color:{_ALERT_SEVERITY_COLOR.get(severity_from_score(r['asset_risk']), '#7ab8d4')}'>{r['asset_risk']} ({severity_from_score(r['asset_risk'])})</td>"
+        f"<td style='padding:4px 6px'>{CRITICALITY_LABELS.get(_safe_int(r.get('criticality')), '—')}</td>"
+        f"<td style='padding:4px 6px'>{(r.get('last_seen') or '')[:19]}</td>"
+        f"</tr>" for r in top10
+    )
+    st.markdown(f"""
+    <table style="width:100%;border-collapse:collapse;font-family:Share Tech Mono;
+           font-size:0.65rem;color:#7ab8d4">
+    <thead><tr style="color:#00d4ff;border-bottom:1px solid #00d4ff">
+    <th style='text-align:left;padding:4px 6px'>IP</th>
+    <th style='text-align:left;padding:4px 6px'>Hostname</th>
+    <th style='text-align:left;padding:4px 6px'>Risk</th>
+    <th style='text-align:left;padding:4px 6px'>Criticality</th>
+    <th style='text-align:left;padding:4px 6px'>Last Seen</th>
+    </tr></thead>
+    <tbody>{rows_html}</tbody>
+    </table>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown(
+        '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a">'
+        'No risk history yet.</div>', unsafe_allow_html=True)
+
+st.markdown('<hr style="border-color:#1a3a5c;margin:14px 0 20px 0">', unsafe_allow_html=True)
+
+st.markdown('<div class="section-header">🧬 VULNERABILITY TIMELINE</div>', unsafe_allow_html=True)
+_CVE_EVENT_ICON = {"DISCOVERED": "🔴", "RESOLVED": "🟢", "CVSS_CHANGED": "🟡", "VERSION_CHANGED": "🟣"}
+cve_events = st.session_state.get("cve_timeline") or monitor_db.get_cve_timeline(limit=30)
+if not cve_events:
+    st.markdown(
+        '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+        'No CVE lifecycle events recorded yet.</div>', unsafe_allow_html=True)
+else:
+    for e in cve_events[:30]:
+        icon = _CVE_EVENT_ICON.get(e.get("event_type"), "⚪")
+        ts = (e.get("timestamp") or "")[:16].replace("T", " ")
+        st.markdown(f"""
+        <div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+             padding:6px 10px;margin:3px 0;background:#0a1520;border-left:3px solid #1a3a5c'>
+            <span style='color:#00d4ff'>{ts}</span>
+            &nbsp;{icon}&nbsp;
+            <span style='color:#e0f4ff'>{html_lib.escape(str(e.get("detail") or ""))}</span>
+        </div>
+        """, unsafe_allow_html=True)
 
 st.markdown('<hr style="border-color:#1a3a5c;margin:8px 0 20px 0">', unsafe_allow_html=True)
 
@@ -3082,7 +4639,8 @@ with col_graph:
     """, unsafe_allow_html=True)
     graph_placeholder = st.empty()
     html_graph = render_graph(st.session_state.G, compromised_set=st.session_state.compromised,
-                               current_node=st.session_state.current_anim_node, show_honeypot=show_honeypot)
+                               current_node=st.session_state.current_anim_node, show_honeypot=show_honeypot,
+                               new_exposure_edges=st.session_state.get("new_exposure_edges"))
     with graph_placeholder:
         st.components.v1.html(html_graph, height=500, scrolling=False)
 
@@ -3094,7 +4652,8 @@ with col_graph:
         <span><span style='color:#00ff88'>■</span> ISOLATED (defense applied)</span>
         <span><span style='color:#ffd700'>★</span> HONEYPOT (decoy)</span>
         <span><span style='color:#1a3a5c'>──</span> POTENTIAL REACHABILITY</span>
-        <span><span style='color:#ff3355'>──</span> SIMULATED ATTACK PATH</span>
+        <span><span style='color:#ff8c00'>──</span> NEWLY EXPOSED PATH</span>
+        <span><span style='color:#ff3355'>──</span> SIMULATED ATTACK / HIGH-RISK PATH</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -3299,6 +4858,12 @@ with col_details:
 # ─────────────────────────────────────────────────────────────────
 
 if run_btn and entry_node:
+    # Sprint 2 — Phase 6/10: remember this entry point so future automatic
+    # recalculation passes (a new scan, a monitoring pass) can re-run the
+    # blast-radius simulation against the CHANGED topology without asking
+    # the user to pick an entry node again.
+    st.session_state.last_entry_node = entry_node
+
     for node in st.session_state.G.nodes:
         st.session_state.G.nodes[node]["compromised"] = False
 
@@ -3358,6 +4923,19 @@ if run_btn and entry_node:
     st.session_state.risk_score = risk_score
     st.session_state.blast_details = blast_details
     st.session_state.attack_stats = attack_stats
+
+    # Priority 19: persist the honeypot interaction (if any) and compute the
+    # rule-based adaptive feedback signal from PERSISTENT history, not just
+    # this single run's boolean.
+    if honeypot_triggered:
+        honeypot_engine.record_trigger(
+            source_node=entry_node, decoy_node="Honeypot (decoy)",
+            event_type="simulated_probe",
+            details="Simulated attacker reached the decoy node during attack simulation.",
+            risk_before=risk_score - 15 if risk_score is not None else None,
+            risk_after=risk_score,
+        )
+    st.session_state.adaptive_feedback = honeypot_engine.apply_adaptive_feedback(risk_score)
     st.session_state.overall_acds_risk = calculate_overall_acds_risk(st.session_state.G, risk_score)
 
     # Snapshot BEFORE state the first time a simulation runs after a scan,
@@ -3366,14 +4944,24 @@ if run_btn and entry_node:
     if st.session_state.risk_before_defense is None:
         st.session_state.risk_before_defense = risk_score
         st.session_state.blast_before_defense = blast_details
+        st.session_state.overall_acds_risk_before = st.session_state.overall_acds_risk
+        st.session_state.mitre_before_defense = {
+            e["mitre_code"]: e["mitre_desc"] for e in timeline if e["success"]
+        }
 
     st.session_state.defense_actions = get_defense_actions(st.session_state.G, compromised, risk_score)
     selected, total_reduction, remaining = greedy_defense_selection(st.session_state.defense_actions, st.session_state.budget)
     st.session_state.selected_defenses = selected
     st.session_state.attack_log = generate_attack_log(timeline, honeypot_triggered)
+    st.session_state.blast_radius_last_computed = datetime.now(timezone.utc)
     record_scan_history(st.session_state.G, "Post-simulation")
+    # Sprint 2 — Phase 10: risk_score/blast_details/overall_acds_risk are
+    # already fresh from this exact simulation run above, so just persist
+    # Risk History + generate Alerts (no need to re-run the simulation).
+    persist_dynamic_risk_pipeline("SIMULATION")
 
-    final_html = render_graph(st.session_state.G, compromised_set=compromised, current_node=None, show_honeypot=show_honeypot)
+    final_html = render_graph(st.session_state.G, compromised_set=compromised, current_node=None, show_honeypot=show_honeypot,
+                               new_exposure_edges=st.session_state.get("new_exposure_edges"))
     with graph_placeholder:
         st.components.v1.html(final_html, height=500, scrolling=False)
     node_panel.markdown(f"<div style='padding: 8px;'>{render_node_panel(selected_node=selected_asset)}</div>", unsafe_allow_html=True)
@@ -3401,27 +4989,38 @@ if st.session_state.simulation_done:
     )
     st.markdown(f"<div class='exec-summary'>{summary_html}</div>", unsafe_allow_html=True)
 
-    # PRIORITY 15 — OVERALL ACDS RISK
+    # PRIORITY 15 / SPRINT 2 PHASE 3 — OVERALL ACDS RISK (primary dashboard metric)
     overall = st.session_state.overall_acds_risk or calculate_overall_acds_risk(st.session_state.G, st.session_state.risk_score)
     st.markdown('<div class="section-header">🎯 OVERALL ACDS RISK</div>', unsafe_allow_html=True)
+    blast_ts = st.session_state.get("blast_radius_last_computed")
+    blast_ts_txt = blast_ts.strftime("%Y-%m-%d %H:%M:%S UTC") if blast_ts else "not yet computed"
     if overall['status'] == 'COMPLETE':
         ov_color = "#ff3355" if overall['overall_score'] > 70 else "#ff8c00" if overall['overall_score'] > 40 else "#00ff88"
         st.markdown(f"""
         <div style='background:#0d1f2d;border:1px solid {ov_color};padding:16px;margin-bottom:10px'>
             <div style='font-family:Orbitron,monospace;font-size:2rem;color:{ov_color};text-align:center'>{overall['overall_score']} / 100</div>
             <div style='font-family:Share Tech Mono;font-size:0.65rem;color:{ov_color};text-align:center;letter-spacing:2px'>{overall['severity']}</div>
-            <div style='display:flex;justify-content:space-around;margin-top:10px;font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4'>
-                <div>Asset Risk<br><span style='color:#00d4ff'>{overall['asset_component']} / 60</span></div>
-                <div>Network Blast Radius<br><span style='color:#ff8c00'>{overall['blast_component']} / 40</span></div>
+            <div style='display:flex;justify-content:space-around;margin-top:10px;font-family:Share Tech Mono;font-size:0.62rem;color:#7ab8d4;flex-wrap:wrap;gap:8px'>
+                <div>Avg Asset Risk<br><span style='color:#00d4ff'>{overall['asset_component']} × {int(overall['asset_weight']*100)}%</span></div>
+                <div>Blast Radius<br><span style='color:#ff8c00'>{overall['blast_component']} × {int(overall['blast_weight']*100)}%</span></div>
+                <div>Critical Asset Exposure<br><span style='color:#ff3355'>{overall['critical_exposure_component']} × {int(overall['critical_exposure_weight']*100)}%</span></div>
+                <div>Network Exposure<br><span style='color:#ffd700'>{overall['network_exposure_component']} × {int(overall['network_exposure_weight']*100)}%</span></div>
                 <div>Total<br><span style='color:{ov_color}'>{overall['overall_score']} / 100</span></div>
             </div>
             <div style='font-family:Share Tech Mono;font-size:0.58rem;color:#3d6a8a;text-align:center;margin-top:8px'>
-                Overall ACDS Risk = Asset Risk × 0.60 + Network Blast Radius × 0.40 (ACDS design choice, not an industry-standard formula)
+                Overall ACDS Risk = Avg Asset Risk × {overall['asset_weight']} + Blast Radius × {overall['blast_weight']}
+                + Critical Asset Exposure × {overall['critical_exposure_weight']} + Network Exposure × {overall['network_exposure_weight']}
+                (ACDS design choice, not an industry-standard formula)
+            </div>
+            <div style='font-family:Share Tech Mono;font-size:0.58rem;color:#ff3355;text-align:center;margin-top:6px;letter-spacing:1px'>
+                SIMULATED — NO REAL ATTACK TRAFFIC &nbsp;·&nbsp; Blast Radius last computed: {blast_ts_txt}
             </div>
         </div>
         """, unsafe_allow_html=True)
     else:
-        st.info(f"Overall ACDS Risk: {overall['status']} — Asset Risk component is {overall['asset_component']}/100; run a simulation to compute the Network Blast Radius component.")
+        st.info(f"Overall ACDS Risk: {overall['status']} — Avg Asset Risk {overall['asset_component']}/100, "
+                f"Critical Asset Exposure {overall['critical_exposure_component']}/100, "
+                f"Network Exposure {overall['network_exposure_component']}/100; run a simulation to compute the Blast Radius component.")
 
     st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
     col_timeline, col_risk = st.columns([1, 1], gap="medium")
@@ -3438,24 +5037,28 @@ if st.session_state.simulation_done:
                 border_color = "#ff3355" if is_success else "#00ff88"
                 status_text_val = "✓ POTENTIAL PATH" if is_success else "✗ BLOCKED"
                 status_color = "#ff3355" if is_success else "#00ff88"
-                privilege_html = "<div style='color:#ffd700;font-size:0.65rem'>⬆ Privilege Escalation (simulated)</div>" if entry.get("priv_esc") else ""
+                privilege_html = (
+                    "<div style='color:#ffd700;font-size:0.65rem'>⬆ Privilege Escalation (simulated)</div>"
+                    if entry.get("priv_esc") else ""
+                )
                 vuln_percent = int(entry["vuln"] * 100)
                 criticality_stars = "★" * entry["criticality"]
-                st.markdown(f"""
-                <div style='background:{bg_color};border:1px solid {border_color};
-                     border-left:3px solid {border_color};padding:8px 12px;margin:4px 0;
-                     font-family:Share Tech Mono;font-size:0.72rem;line-height:1.8'>
-                    <div style='display:flex;justify-content:space-between'>
-                        <span style='color:#00d4ff'>T{t}</span>
-                        <span style='color:{status_color}'>{status_text_val}</span>
-                    </div>
-                    <div style='color:#e0f4ff;font-weight:bold'>→ {entry["node"]}</div>
-                    <div style='color:#3d6a8a'>{entry.get("mitre_code","")}: {entry.get("mitre_desc","")}</div>
-                    <div style='color:#ff8c00;font-size:0.65rem'>Reason: {entry.get("access_vector", "network")}</div>
-                    {privilege_html}
-                    <div style='color:#7ab8d4'>Risk: {vuln_percent}/100 | Criticality: {criticality_stars}</div>
-                </div>
-                """, unsafe_allow_html=True)
+                card_html = (
+                    f"<div style='background:{bg_color};border:1px solid {border_color};"
+                    f"border-left:3px solid {border_color};padding:8px 12px;margin:4px 0;"
+                    f"font-family:Share Tech Mono;font-size:0.72rem;line-height:1.8'>"
+                    f"<div style='display:flex;justify-content:space-between'>"
+                    f"<span style='color:#00d4ff'>T{t}</span>"
+                    f"<span style='color:{status_color}'>{status_text_val}</span>"
+                    f"</div>"
+                    f"<div style='color:#e0f4ff;font-weight:bold'>→ {entry['node']}</div>"
+                    f"<div style='color:#3d6a8a'>{entry.get('mitre_code','')}: {entry.get('mitre_desc','')}</div>"
+                    f"<div style='color:#ff8c00;font-size:0.65rem'>Reason: {entry.get('access_vector', 'network')}</div>"
+                    f"{privilege_html}"
+                    f"<div style='color:#7ab8d4'>Risk: {vuln_percent}/100 | Criticality: {criticality_stars}</div>"
+                    f"</div>"
+                )
+                st.markdown(card_html, unsafe_allow_html=True)
 
     with col_risk:
         st.markdown('<div class="section-header">📊 NETWORK BLAST RADIUS (SIMULATION)</div>', unsafe_allow_html=True)
@@ -3524,7 +5127,9 @@ if st.session_state.simulation_done:
         # section now (moved out of the sidebar).
         all_actions_for_budget = get_defense_actions(st.session_state.G, set(st.session_state.G.nodes) - {"Honeypot"}, 50)
         max_budget = sum(a["cost"] for a in all_actions_for_budget) or 100
-        st.slider("Defense Budget (units)", 0, max_budget, key="budget")
+        st.slider("Defense Budget (units)", 0, max_budget, key="budget",
+                   help="Total cost the optimizer can spend selecting recommended controls below. "
+                        "Default comes from ⚙ Settings and can be changed here for this session only.")
 
         defense_actions = st.session_state.defense_actions
         selected, total_reduction_val, remaining = greedy_defense_selection(defense_actions, st.session_state.budget)
@@ -3561,15 +5166,24 @@ if st.session_state.simulation_done:
             card_class = "selected" if is_sel else "unselected"
             badge = DEFENSE_STATE_SELECTED if is_sel else DEFENSE_STATE_RECOMMENDED
             badge_color = "#00ff88" if is_sel else "#3d6a8a"
-            type_icons = {"patch": "🔧", "isolate": "🔒", "privilege": "👤", "ids": "📡"}
+            type_icons = {
+                "patch": "🔧", "isolate": "🔒", "privilege": "👤", "ids": "📡",
+                "disable_smb": "🚫", "restrict_rdp": "🖥", "close_port": "🔌",
+                "firewall_rule": "🧱", "honeypot_placement": "🍯",
+            }
             icon = type_icons.get(action["type"], "⚙")
+            priority = action.get("priority", "MEDIUM")
+            prio_color = {"HIGH": "#ff3355", "MEDIUM": "#ff8c00", "LOW": "#3d6a8a"}.get(priority, "#3d6a8a")
+            mitre_tactic = action.get("mitre_tactic", "")
 
             st.markdown(f"""
             <div class="defense-action {card_class}">
                 <div>
                     <div style='color:#e0f4ff;font-weight:bold'>{icon} {action["action"]}</div>
                     <div style='color:#3d6a8a;font-size:0.68rem;margin-top:3px'>{action["description"]}</div>
+                    {f"<div style='color:#7ab8d4;font-size:0.62rem;margin-top:3px'>MITRE: {mitre_tactic}</div>" if mitre_tactic else ""}
                     <div style='margin-top:4px'>
+                        <span class='mitre-tag' style='border-color:{prio_color};color:{prio_color}'>{priority} PRIORITY</span>
                         <span class='mitre-tag'>Cost: {action["cost"]}</span>
                         <span class='mitre-tag' style='border-color:#00ff88;color:#00ff88'>-{action["risk_reduction"]} risk</span>
                         <span class='mitre-tag' style='border-color:#00d4ff;color:#00d4ff'>eff: {action["efficiency"]}</span>
@@ -3606,10 +5220,24 @@ if st.session_state.simulation_done:
             st.session_state.risk_score = new_risk
             st.session_state.blast_details = new_bd
             st.session_state.post_defense_stats = new_bd
+            st.session_state.mitre_after_defense = {
+                e["mitre_code"]: e["mitre_desc"] for e in new_timeline if e["success"]
+            }
+
+            if new_honeypot:
+                honeypot_engine.record_trigger(
+                    source_node=entry_node, decoy_node="Honeypot (decoy)",
+                    event_type="simulated_probe_post_defense",
+                    details="Simulated attacker reached the decoy node after defenses were applied.",
+                    risk_before=new_risk - 15 if new_risk is not None else None,
+                    risk_after=new_risk,
+                )
+            st.session_state.adaptive_feedback = honeypot_engine.apply_adaptive_feedback(new_risk)
             st.session_state.overall_acds_risk = calculate_overall_acds_risk(st.session_state.G, new_risk)
             st.session_state.attack_log = generate_attack_log(new_timeline, new_honeypot)
             record_scan_history(st.session_state.G, "Post-defense")
             st.success(f"Applied {len(applied_actions)} defense action(s) to the simulation model and re-ran the simulation.")
+            st.toast(f"🛡 {len(applied_actions)} defense action(s) applied", icon="🛡")
             st.rerun()
 
         if has_applied:
@@ -3730,6 +5358,99 @@ if st.session_state.simulation_done:
                 unsafe_allow_html=True,
             )
 
+    render_before_after_verification()
+
+    # ─────────────────────────────────────────────────────────
+    # PRIORITY 8/10 — DEDUPLICATED VULNERABILITY FINDINGS
+    # ─────────────────────────────────────────────────────────
+    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">🧬 DEDUPLICATED FINDINGS (unique CVE × affected assets)</div>', unsafe_allow_html=True)
+    grouped_findings = vuln_dedup.deduplicate_findings(st.session_state.G)
+    if grouped_findings:
+        for g in grouped_findings[:15]:
+            asset_list = ", ".join(a["display_name"] for a in g["affected_assets"][:6])
+            if g["affected_count"] > 6:
+                asset_list += f" (+{g['affected_count'] - 6} more)"
+            st.markdown(f"""
+            <div style="font-family:Share Tech Mono;font-size:0.66rem;color:#7ab8d4;
+                 padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid #00d4ff">
+                <span class="cve-tag">{g['cve_id']}</span>
+                <span class="mitre-tag" style="border-color:#ff3355;color:#ff3355">CVSS {g['cvss']} ({g.get('severity','?')})</span>
+                <span style="color:#ffd700;margin-left:6px">Affected Assets: {g['affected_count']}</span>
+                <div style="margin-top:4px;color:#e0f4ff">{asset_list}</div>
+                <div style="margin-top:2px;color:#3d6a8a">Service: {g['service']} · Source: {g['detection_source']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+            'No CVE findings to deduplicate yet.</div>', unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────────────────
+    # PRIORITY 13 — CHANGE DETECTION (persisted across app restarts)
+    # ─────────────────────────────────────────────────────────
+    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">🔁 CHANGE DETECTION (vs last persisted scan)</div>', unsafe_allow_html=True)
+    cs = st.session_state.change_summary
+    if not cs:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+            'Run a Real Network Scan to generate a persisted baseline for comparison.</div>',
+            unsafe_allow_html=True)
+    elif not cs["has_baseline"]:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+            'This is the first persisted scan — no previous snapshot to compare against yet. '
+            'Future scans will diff against this one.</div>', unsafe_allow_html=True)
+    else:
+        cd1, cd2, cd3, cd4 = st.columns(4)
+        cd1.metric("New Assets", len(cs["new_assets"]))
+        cd2.metric("Missing Assets", len(cs["missing_assets"]))
+        cd3.metric("New Vulnerabilities", len(cs["new_vulnerabilities"]))
+        cd4.metric("Resolved Vulnerabilities", len(cs["resolved_vulnerabilities"]))
+
+        if cs["changed_assets"]:
+            for ca in cs["changed_assets"][:10]:
+                field_lines = "".join(
+                    f"<div style='color:#3d6a8a'>&bull; {c['field']}: {c['before']} → {c['after']}</div>"
+                    for c in ca["changes"]
+                )
+                st.markdown(f"""
+                <div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+                     padding:8px 10px;margin:4px 0;background:#0a1520;border-left:3px solid #ff8c00">
+                    <span style="color:#e0f4ff">{ca['hostname'] or ca['ip']} ({ca['ip']})</span>
+                    {f"<span style='color:#ffd700;margin-left:8px'>Risk: {ca['risk_before']} → {ca['risk_after']}</span>" if ca['risk_delta'] is not None else ""}
+                    {field_lines}
+                </div>
+                """, unsafe_allow_html=True)
+        if not (cs["new_assets"] or cs["missing_assets"] or cs["changed_assets"]):
+            st.markdown(
+                '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#00ff88">'
+                'No changes detected since the last scan.</div>', unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────────────────
+    # PRIORITY 19 — ADAPTIVE HONEYPOT FEEDBACK (persistent, rule-based)
+    # ─────────────────────────────────────────────────────────
+    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">🍯 ADAPTIVE HONEYPOT FEEDBACK</div>', unsafe_allow_html=True)
+    af = st.session_state.adaptive_feedback
+    if af:
+        hp1, hp2, hp3 = st.columns(3)
+        hp1.metric("Honeypot Events (24h)", af["event_count"])
+        hp2.metric("Adaptive Boost Applied", f"+{af['boost']}")
+        hp3.metric("Adjusted Risk", f"{af['adjusted_risk']} / 100", delta=f"{af['boost']}")
+        st.markdown(f"""
+        <div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;
+             padding:8px 10px;margin:6px 0;background:#1a1000;border-left:3px solid #ffd700">
+            {af['reason']}<br>
+            <span style="color:#3d6a8a">Method: {af['method']}</span>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a">'
+            'No adaptive feedback computed yet — run an attack simulation.</div>', unsafe_allow_html=True)
+
     # ─────────────────────────────────────────────────────────
     # PRIORITY 20/21/22 — SCAN TIMELINE, SCAN HISTORY, REPORTING
     # ─────────────────────────────────────────────────────────
@@ -3765,7 +5486,7 @@ if st.session_state.simulation_done:
                 st.markdown('<div style="color:#3d6a8a;font-family:Share Tech Mono;font-size:0.7rem">No scans recorded yet this session.</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="section-header">📤 REPORTING / EXPORT</div>', unsafe_allow_html=True)
-    rep1, rep2, rep3 = st.columns(3)
+    rep1, rep2, rep3, rep4 = st.columns(4)
     with rep1:
         st.download_button("⬇ Asset Inventory (CSV)", export_asset_inventory_csv(st.session_state.G),
                             file_name="acds_asset_inventory.csv", mime="text/csv", use_container_width=True)
@@ -3777,6 +5498,29 @@ if st.session_state.simulation_done:
                                                     st.session_state.blast_details, overall, st.session_state.scan_history)
         st.download_button("⬇ Executive Report (TXT)", report_text,
                             file_name="acds_executive_report.txt", mime="text/plain", use_container_width=True)
+    with rep4:
+        if REPORTLAB_AVAILABLE:
+            pdf_bytes = build_executive_report_pdf(
+                st.session_state.G, st.session_state.risk_score, st.session_state.blast_details, overall,
+                st.session_state.scan_history,
+                defense_actions=st.session_state.defense_actions,
+                applied_defenses=st.session_state.applied_defenses,
+                risk_before=st.session_state.risk_before_defense,
+                blast_before=st.session_state.blast_before_defense,
+                overall_before=st.session_state.overall_acds_risk_before,
+                risk_after=st.session_state.risk_score if st.session_state.applied_defenses else None,
+                blast_after=st.session_state.post_defense_stats,
+                overall_after=overall if st.session_state.applied_defenses else None,
+                mitre_before=st.session_state.mitre_before_defense,
+                mitre_after=st.session_state.mitre_after_defense,
+                alerts=monitor_db.get_alerts(limit=200),
+            )
+            st.download_button("⬇ Executive Report (PDF)", pdf_bytes or b"",
+                                file_name="acds_executive_report.pdf", mime="application/pdf",
+                                use_container_width=True, disabled=pdf_bytes is None)
+        else:
+            st.button("⬇ Executive Report (PDF)", disabled=True, use_container_width=True,
+                       help="reportlab is not installed — run: pip install reportlab")
 
 else:
     if st.session_state.network_mode == "Real Network Scan":
@@ -3834,3 +5578,186 @@ else:
                 """, unsafe_allow_html=True)
         st.download_button("⬇ Asset Inventory (CSV)", export_asset_inventory_csv(st.session_state.G),
                             file_name="acds_asset_inventory.csv", mime="text/csv")
+
+st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────
+# SPRINT 3 — PHASE 8: SETTINGS PANEL
+# Always visible regardless of network mode / simulation state, since
+# it configures the app itself rather than any one scan. Every field
+# is persisted to SQLite (core.database settings table) and applied
+# live via apply_runtime_settings() the moment Save is clicked — no
+# restart required.
+# ─────────────────────────────────────────────────────────────────
+with st.expander("⚙ SETTINGS", expanded=False):
+    _s = monitor_db.get_all_settings()
+    st.markdown(
+        '<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#3d6a8a;margin-bottom:10px">'
+        'Changes are saved to SQLite and take effect immediately for the rest of this session — '
+        'no restart needed.</div>', unsafe_allow_html=True)
+
+    set_col1, set_col2 = st.columns(2)
+    with set_col1:
+        st.markdown("**Monitoring**")
+        s_interval = st.selectbox("Monitoring Interval", ["30s", "1m", "5m"],
+                                   index=["30s", "1m", "5m"].index(_s["monitoring_interval"]),
+                                   key="settings_monitor_interval",
+                                   help="How often background monitoring re-scans while enabled.")
+        s_scan_timeout = st.slider("Scan Timeout (seconds/port)", 0.2, 5.0,
+                                    float(_s["scan_timeout_seconds"]), 0.1, key="settings_scan_timeout",
+                                    help="Per-port connect timeout during discovery.")
+        s_banner_timeout = st.slider("Banner Read Timeout (seconds)", 0.2, 5.0,
+                                      float(_s["banner_timeout_seconds"]), 0.1, key="settings_banner_timeout",
+                                      help="How long to wait for a service banner before giving up on that port.")
+        s_nvd_cache = st.slider("NVD Cache Duration (hours)", 1, 168,
+                                 int(_s["nvd_cache_hours"]), 1, key="settings_nvd_cache",
+                                 help="How long a CVE lookup result is reused before re-querying NVD.")
+
+    with set_col2:
+        st.markdown("**Risk &amp; Alerts**")
+        s_crit = st.slider("Risk Threshold — CRITICAL ≥", 50, 100,
+                            int(_s["risk_threshold_critical"]), 1, key="settings_risk_critical")
+        s_high = st.slider("Risk Threshold — HIGH ≥", 30, int(s_crit) - 1,
+                            min(int(_s["risk_threshold_high"]), int(s_crit) - 1), 1, key="settings_risk_high")
+        s_medium = st.slider("Risk Threshold — MEDIUM ≥", 0, int(s_high) - 1,
+                              min(int(_s["risk_threshold_medium"]), max(int(s_high) - 1, 0)), 1,
+                              key="settings_risk_medium")
+        s_alert_threshold = st.selectbox(
+            "Alert Severity Threshold", ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+            index=["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"].index(_s["alert_severity_threshold"]),
+            key="settings_alert_threshold",
+            help="Alerts below this severity are not persisted.")
+        s_budget = st.number_input("Default Defense Budget", min_value=10, max_value=500,
+                                    value=int(_s["default_budget"]), step=10, key="settings_default_budget")
+        st.selectbox("Theme", ["cyberpunk"], index=0, key="settings_theme", disabled=True,
+                     help="ACDS currently ships one theme; this preference is persisted for future themes.")
+
+    if st.button("💾 SAVE SETTINGS", use_container_width=True):
+        new_settings = {
+            "monitoring_interval": s_interval,
+            "scan_timeout_seconds": s_scan_timeout,
+            "banner_timeout_seconds": s_banner_timeout,
+            "nvd_cache_hours": s_nvd_cache,
+            "risk_threshold_critical": s_crit,
+            "risk_threshold_high": s_high,
+            "risk_threshold_medium": s_medium,
+            "alert_severity_threshold": s_alert_threshold,
+            "default_budget": s_budget,
+            "theme": "cyberpunk",
+        }
+        for key, value in new_settings.items():
+            monitor_db.set_setting(key, value)
+        apply_runtime_settings(monitor_db.get_all_settings())
+        st.session_state.monitor_interval = s_interval
+        st.session_state.budget = s_budget
+        acds_log.info("Settings saved: %s", new_settings)
+        st.success("Settings saved and applied.")
+        st.toast("⚙ Settings saved", icon="⚙")
+        st.rerun()
+
+# ─────────────────────────────────────────────────────────────────
+# SPRINT 3 — PHASE 9: ABOUT ACDS
+# Every number and formula quoted below is copied verbatim from the
+# actual functions that compute it (calculate_risk,
+# calculate_overall_acds_risk, core/network_exposure.py) — nothing here
+# is a simplified/marketing restatement, so this page stays accurate
+# as a demo reference even as the rest of the app evolves.
+# ─────────────────────────────────────────────────────────────────
+with st.expander("ℹ ABOUT ACDS", expanded=False):
+    st.markdown("""
+    <div style='font-family:Orbitron,monospace;color:#00d4ff;font-size:1.1rem;letter-spacing:2px'>
+        ADAPTIVE CYBER DEFENSE SYSTEM — ACDS v3.0
+    </div>
+    <div style='font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a;margin-bottom:14px'>
+        An SME network defense simulation platform: passive discovery, real CVE matching,
+        graph-based exposure modeling, MITRE-aligned attack-path simulation, and an adaptive
+        defense optimizer — built for demonstration and training, not production SOC use.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("**🏗 Architecture**")
+    st.markdown("""
+    <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4;line-height:1.9;margin-bottom:14px'>
+    • <b>app.py</b> — Streamlit UI + orchestration (single entry point: <code>streamlit run app.py</code>)<br>
+    • <b>core/database.py</b> — persistent asset inventory, alerts, risk history, settings, CVE cache (SQLite)<br>
+    • <b>core/network_exposure.py</b> — Phase 2/3 graph-topology exposure &amp; critical-asset scoring<br>
+    • <b>core/alert_engine.py</b> — diff-based alerting (RISK_INCREASE/DECREASE, NEW_CVE, exposure changes)<br>
+    • <b>core/change_detector.py</b> — asset/port/service diffing between scans<br>
+    • <b>core/vuln_dedup.py</b> — collapses repeated CVE findings into unique CVE × affected-asset groups<br>
+    • <b>core/honeypot_engine.py</b> — adaptive honeypot feedback loop<br>
+    • <b>core/acds_logging.py</b> — shared rotating-file + console logger<br>
+    • <b>data/</b> — SQLite database files live here (<code>acds.db</code>, <code>acds.log</code>)
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("**🔍 Passive Scanning**")
+    st.markdown("""
+    <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4;line-height:1.9;margin-bottom:14px'>
+    ACDS only ever OBSERVES: ICMP ping sweep, ARP table reads, reverse DNS/NetBIOS name
+    resolution, TCP connect-scans against a fixed port list, and reading whatever a service
+    hands back when a connection is opened (a "banner"). It never sends exploit payloads,
+    brute-forces credentials, or performs any offensive action — this is a hard constraint of
+    the tool, not a configurable setting.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("**🕸 Network Exposure**")
+    st.markdown("""
+    <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4;line-height:1.9;margin-bottom:14px'>
+    Every discovered asset gets a <b>network_exposure</b> risk component, and the
+    organization-wide figure is the mean of that component across all non-honeypot assets.
+    Separately, <b>Critical Asset Exposure</b> is the percentage of CRITICAL/HIGH-criticality
+    assets (criticality level ≥ 4) that are either reachable from another discovered asset on
+    the exposure graph or expose at least one open port themselves.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("**💥 Blast Radius**")
+    st.markdown("""
+    <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4;line-height:1.9;margin-bottom:14px'>
+    Computed only after an attack-path simulation runs, from three weighted factors:<br><br>
+    &nbsp;&nbsp;Blast Radius = 0.3 × <i>Spread</i> + 0.5 × <i>Critical Impact</i> + 0.2 × <i>Depth</i><br><br>
+    — <b>Spread</b>: fraction of real (non-honeypot) assets compromised<br>
+    — <b>Critical Impact</b>: compromised assets' share of total criticality-weighted value<br>
+    — <b>Depth</b>: how many simulation timesteps the attack reached, relative to network size<br><br>
+    A successful honeypot trigger adds a flat +15 (capped at 100), since triggering a decoy
+    signals the attacker took a path a real defender would want flagged regardless of
+    "technical" blast radius.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("**🎯 Overall ACDS Risk Formula**")
+    st.markdown(f"""
+    <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4;line-height:1.9;margin-bottom:14px'>
+    A documented, non-industry-standard aggregation of four independently-computed components:<br><br>
+    &nbsp;&nbsp;Overall ACDS Risk =&nbsp;
+    Average Asset Risk × {OVERALL_WEIGHT_ASSET_RISK}<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;+ Network Blast Radius × {OVERALL_WEIGHT_BLAST_RADIUS}<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;+ Critical Asset Exposure × {OVERALL_WEIGHT_CRITICAL_EXPOSURE}<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;+ Network Exposure × {OVERALL_WEIGHT_NETWORK_EXPOSURE}<br><br>
+    If no attack simulation has been run yet, Blast Radius is unknown — ACDS reports a
+    <b>PARTIAL</b> result built from the other three components rather than inventing a number
+    for the missing one. Risk Thresholds (the CRITICAL/HIGH/MEDIUM/LOW cutoffs applied to any
+    0-100 score) are configurable in ⚙ Settings.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("**🔖 MITRE ATT&CK Methodology**")
+    st.markdown("""
+    <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4;line-height:1.9;margin-bottom:14px'>
+    Every step of a simulated attack's lateral movement is tagged with the MITRE ATT&CK
+    technique it best represents (e.g. T1021 Remote Services, T1078 Valid Accounts, T1190
+    Exploit Public-Facing Application). The Adaptive Defense Optimizer's recommendations each
+    carry the specific technique(s) they mitigate, and the Before vs After Verification page
+    re-runs the simulation to show which techniques were actually neutralized. All of this is
+    <b>SIMULATED — NO REAL ATTACK TRAFFIC</b> is generated at any point.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div style="text-align:center;font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;'
+        'margin-top:6px;border-top:1px solid #1a3a5c;padding-top:10px">'
+        'ACDS v3.0 — for security education, training, and internal SME risk demonstrations.'
+        '</div>', unsafe_allow_html=True)
+
+
