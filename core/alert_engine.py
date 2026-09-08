@@ -147,17 +147,18 @@ def generate_change_alerts(before_assets, after_assets, before_edges, after_edge
             })
 
     # ---- NEW_EXPOSURE_PATH ---------------------------------------------
-    new_edges = after_edges - before_edges
-    for src, dst in sorted(new_edges):
-        after_dst = after_assets.get(dst, {})
-        label = _asset_label(after_dst, None, dst)
-        alerts.append({
-            "timestamp": now_iso, "severity": "MEDIUM",
-            "alert_type": "NEW_EXPOSURE_PATH", "asset": label,
-            "title": "New exposure path",
-            "description": f"New modeled reachability path: {src} → {dst}.",
-            "old_value": None, "new_value": f"{src} -> {dst}",
-        })
+    if before_edges:
+        new_edges = after_edges - before_edges
+        for src, dst in sorted(new_edges):
+            after_dst = after_assets.get(dst, {})
+            label = _asset_label(after_dst, None, dst)
+            alerts.append({
+                "timestamp": now_iso, "severity": "MEDIUM",
+                "alert_type": "NEW_EXPOSURE_PATH", "asset": label,
+                "title": "New exposure path",
+                "description": f"New modeled reachability path: {src} → {dst}.",
+                "old_value": None, "new_value": f"{src} -> {dst}",
+            })
 
     # ---- HONEYPOT_PATH ----------------------------------------------------
     if honeypot_triggered:

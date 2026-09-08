@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║         ADAPTIVE CYBER DEFENSE SYSTEM FOR SMEs  (v2.0)           ║
@@ -78,6 +79,7 @@ import platform
 import functools
 import csv
 import io
+import json
 from collections import deque
 from pyvis.network import Network
 import tempfile
@@ -3002,38 +3004,246 @@ def render_before_after_verification():
 
 
 # ─────────────────────────────────────────────────────────────────
-# MODULE 5: GRAPH VISUALIZATION ENGINE
+# MODULE 5: ASSET INTELLIGENCE & GRAPH VISUALIZATION ENGINE
 # ─────────────────────────────────────────────────────────────────
-# Priority 16: this is a NETWORK EXPOSURE & ATTACK PATH MODEL, not a
-# "network topology" — edges represent modeled POTENTIAL REACHABILITY
-# derived from exposed services, never OBSERVED COMMUNICATION. The
-# scanner never captures real traffic between hosts.
 
-def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True, new_exposure_edges=None):
+def _evidence_block(title, evidence_list, color="#3d6a8a"):
+    if not evidence_list:
+        return ""
+    items = "".join(f"<div>✓ {html_lib.escape(str(e))}</div>" for e in evidence_list[:4])
+    return f"<div style='margin:2px 0 6px 70px;font-size:0.62rem;color:{color};line-height:1.6'>{items}</div>"
+
+def render_node_panel(active_node=None, selected_node=None, G=None):
+    if G is None:
+        G = st.session_state.G
+    html = ""
+    for node, data in G.nodes(data=True):
+        if selected_node and node != selected_node:
+            continue
+        is_comp = data.get("compromised", False)
+        ntype = data.get("node_type", "endpoint")
+        is_honey = ntype == "honeypot"
+        is_active = node == active_node
+        is_isolated = data.get("isolated", False)
+
+        card_class = "compromised" if is_comp else "honeypot" if is_honey else "safe"
+        if is_active:
+            card_class = "compromised"
+
+        status_icon = ("🔴 COMPROMISED (simulated)" if is_comp else
+                        "🟢 ISOLATED (defense applied)" if is_isolated else
+                        "⚠ ALERT" if (is_honey and st.session_state.get("honeypot_triggered", False)) else
+                        "🟡 DECOY" if is_honey else "🔵 OBSERVED SECURE")
+        if is_active:
+            status_icon = "💥 UNDER SIMULATED ATTACK"
+
+        crit_label = data.get('criticality_label', 'Unknown')
+        crit_val = data.get("criticality", 1)
+        crit_stars = "★" * crit_val + "☆" * (5 - crit_val)
+        crit_conf = data.get('criticality_confidence')
+        conf_str = f" ({int(crit_conf*100)}% confidence)" if isinstance(crit_conf, (int, float)) else ""
+
+        ip = data.get('ip', '')
+        hostname = data.get('hostname', '')
+        mac_addr = data.get('mac_address', '')
+        mac_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>MAC Address:</span><span style='color:#e0f4ff;font-family:Share Tech Mono,monospace'>{mac_addr}</span></div>" if mac_addr else ""
+        hostname_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Hostname:</span><span style='color:#e0f4ff'>{hostname}</span></div>" if hostname else ""
+
+        os_type = data.get('os', 'unknown')
+        os_confidence = data.get('os_confidence')
+        os_evidence = data.get('os_evidence') or []
+        os_icon = {'windows': '🪟', 'linux': '🐧', 'macos': '🍎', 'ios': '📱', 'android': '🤖', 'unknown': '❓'}.get(os_type.lower(), '❓')
+        conf_suffix = f" · {int(round(os_confidence * 100))}% confidence" if isinstance(os_confidence, (int, float)) else ""
+        os_label = {'windows': 'Windows', 'linux': 'Linux', 'macos': 'macOS', 'ios': 'iOS', 'android': 'Android'}.get(os_type.lower(), os_type.upper() if os_type else 'Unknown')
+        os_html = (
+            f"<div style='display:flex;align-items:center;margin:4px 0'>"
+            f"<span style='color:#3d6a8a;width:105px'>Inferred OS:</span>"
+            f"<span style='color:#e0f4ff'>{os_icon} {os_label}{conf_suffix}</span></div>"
+            + _evidence_block("", os_evidence)
+        )
+
+        device_type = data.get('device_type', '')
+        device_evidence = data.get('device_evidence') or []
+        device_conf = data.get('device_confidence')
+        dconf_str = f" · {int(device_conf*100)}% confidence" if isinstance(device_conf, (int, float)) else ""
+        vendor = data.get('mac_vendor')
+        device_icon = {
+            'Mobile Device': '📱', 'Tablet': '📱', 'Network Device': '🌐',
+            'Web Server': '🖥️', 'Database Server': '🗄️', 'Linux Server': '🖥️',
+            'Windows Server': '🖥️', 'Windows Workstation': '💻', 'Linux Workstation': '💻',
+            'Mac Computer': '🍎', 'Decoy System': '🍯',
+        }.get(device_type, '💻' if os_type == 'windows' else '🖥️' if os_type == 'linux' else '📦')
+        vendor_suffix = f" ({vendor})" if vendor else ""
+        device_html = (
+            f"<div style='display:flex;align-items:center;margin:4px 0'>"
+            f"<span style='color:#3d6a8a;width:105px'>Inferred Device:</span>"
+            f"<span style='color:#e0f4ff'>{device_icon} {device_type or 'Network Host'}{vendor_suffix}{dconf_str}</span>"
+            f"</div>" + _evidence_block("", device_evidence)
+        )
+
+        version_map = data.get('version_map', {})
+        services = data.get('services', [])
+        if version_map:
+            svc_strs = [f"{s} ({version_map[s]})" if version_map.get(s) else s for s in services[:4]]
+        else:
+            svc_strs = services[:4]
+        services_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Services:</span><span style='color:#e0f4ff'>{', '.join(svc_strs)}{'...' if len(services) > 4 else ''}</span></div>" if services else ""
+        open_ports = data.get('open_ports', [])
+        ports_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Ports:</span><span style='color:#e0f4ff'>{', '.join(str(p) for p in open_ports) or 'None detected'}</span></div>"
+
+        risk_score = data.get('risk_score', int(data.get('vulnerability', 0) * 100))
+        risk_severity = data.get('risk_severity', 'LOW')
+        comps = data.get('risk_components') or {}
+
+        def comp_row(key, label, cap):
+            c = comps.get(key, {})
+            contrib = c.get('contribution', 0)
+            return f"<div style='display:flex;justify-content:space-between;color:#7ab8d4;margin:2px 0;'><span>{label}</span><span style='color:#e0f4ff'>{contrib:.1f} / {cap}</span></div>"
+
+        risk_breakdown_html = ""
+        if comps:
+            risk_breakdown_html = (
+                "<div style='margin:6px 0;padding:8px 10px;background:rgba(0,212,255,0.04);border:1px solid #1a3a5c;border-radius:4px;font-size:0.65rem'>"
+                "<div style='color:#00d4ff;font-weight:bold;margin-bottom:6px;letter-spacing:1px'>RISK CALCULATION BREAKDOWN</div>"
+                + comp_row('vulnerability', 'Vulnerability / CVSS', 40)
+                + comp_row('service_exposure', 'Service Exposure', 20)
+                + comp_row('sensitive_services', 'Sensitive Services', 15)
+                + comp_row('criticality', 'Asset Criticality', 15)
+                + comp_row('network_exposure', 'Network Exposure', 10)
+                + f"<div style='border-top:1px solid #1a3a5c;margin-top:6px;padding-top:4px;display:flex;justify-content:space-between;color:#00d4ff;font-weight:bold'><span>TOTAL SCORE</span><span style='color:#00ff88'>{risk_score} / 100</span></div>"
+                "</div>"
+            )
+        risk_color = "#ff3355" if risk_score > 70 else "#ff8c00" if risk_score > 40 else "#00ff88"
+        risk_html = (
+            f"<div style='margin:6px 0;padding:6px 10px;background:rgba(0,212,255,0.05);border-left:3px solid {risk_color};border-radius:2px'>"
+            f"<div style='color:{risk_color};font-size:0.72rem;font-weight:bold;'>ASSET RISK: {risk_score}/100 — {risk_severity}</div></div>"
+            + risk_breakdown_html
+        )
+
+        sensitive_detected = (data.get('asset_risk') or {}).get('sensitive_detected', [])
+        sensitive_html = ""
+        if sensitive_detected:
+            sens_strs = [f"{s[0]} ({s[1]})" if isinstance(s, (list, tuple)) and len(s) >= 2 else str(s) for s in sensitive_detected]
+            sensitive_html = (
+                f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Sensitive:</span>"
+                f"<span style='color:#ff3355'>{', '.join(sens_strs)}</span></div>"
+            )
+
+        cve_findings = data.get('cve_findings', [])
+        cve_html = ""
+        if cve_findings:
+            cve_badges = "".join(
+                f"<span class='cve-tag' title='{c.get('summary','')[:80]}'>{c['cve_id']} (CVSS {c['cvss']})</span>"
+                for c in cve_findings[:4]
+            )
+            cve_html = f"<div style='margin:4px 0'><div style='color:#3d6a8a;font-size:0.65rem;margin-bottom:2px'>MATCHED CVEs:</div>{cve_badges}</div>"
+
+        fixes = data.get('fixes', [])
+        recommendation_html = ""
+        if fixes:
+            recommendation_html = "".join(f"<div style='color:#00ff88;font-size:0.65rem;margin:2px 0;'>• {fix}</div>" for fix in fixes[:3])
+            recommendation_html = f"<div style='margin:6px 0;padding:8px 10px;background:rgba(0,255,136,0.04);border:1px solid #1a3a5c;border-left:3px solid #00ff88;border-radius:4px'><div style='color:#00ff88;font-size:0.65rem;font-weight:bold;margin-bottom:4px'>RECOMMENDED ACTIONS</div>{recommendation_html}</div>"
+
+        node_color = "#ff3355" if is_comp else "#00ff88" if is_isolated else "#ffd700" if is_honey else "#00d4ff"
+        disp_title = data.get('display_name', node)
+        html += (
+            f"<div class='node-card {card_class}'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;border-bottom:1px solid #1a3a5c;padding-bottom:4px'>"
+            f"<span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.82rem;font-weight:700'>{disp_title}</span>"
+            f"<span style='font-size:0.62rem;opacity:0.9'>{status_icon}</span></div>"
+            f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>IP:</span><span style='color:#e0f4ff'>{ip}</span></div>"
+            f"{mac_html}{hostname_html}{os_html}{device_html}{ports_html}{services_html}{risk_html}{sensitive_html}{cve_html}{recommendation_html}"
+            f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Role:</span><span style='color:#e0f4ff'>{data.get('role', 'Node')}</span></div>"
+            f"<div style='margin:4px 0'><span style='color:#3d6a8a;width:105px;display:inline-block;'>Criticality:</span><span style='color:#ffd700'>{crit_label}{conf_str} ({crit_stars})</span>"
+            + _evidence_block("", data.get('criticality_evidence') or [])
+            + "</div></div>"
+        )
+    return html
+
+
+def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True, new_exposure_edges=None,
+                 edge_filter="Clean View", layout_mode="Force-Directed (Dynamic)"):
     if compromised_set is None:
         compromised_set = set()
-    # Sprint 2 — Phase 5: IP-pair set of edges that appeared since the last
-    # completed recalculation pass (run_dynamic_risk_pipeline). Optional —
-    # existing callers that don't pass it keep the original coloring.
     new_exposure_edges = new_exposure_edges or set()
+    num_nodes = len(G.nodes)
 
-    net = Network(height="480px", width="100%", bgcolor="#050a0f", font_color="#7ab8d4", directed=True)
-    net.set_options("""
-    {
-      "nodes": { "borderWidth": 2, "shadow": {"enabled": true, "size": 15},
-                 "font": {"size": 13, "face": "Share Tech Mono"} },
-      "edges": { "arrows": {"to": {"enabled": true, "scaleFactor": 0.8}},
-                 "color": {"color": "#1a3a5c", "highlight": "#00d4ff"},
-                 "smooth": {"type": "curvedCW", "roundness": 0.2}, "width": 1.5,
-                 "shadow": {"enabled": false} },
-      "physics": { "enabled": true, "barnesHut": {"gravitationalConstant": -4000,
-                   "centralGravity": 0.4, "springLength": 140, "springConstant": 0.04, "damping": 0.09} },
-      "interaction": { "hover": true, "tooltipDelay": 100 }
-    }
-    """)
+    net = Network(height="570px", width="100%", bgcolor="#050a0f", font_color="#7ab8d4", directed=True)
+
+    if layout_mode == "Hierarchical (Tiered)":
+        layout_json = """
+        "layout": {
+            "hierarchical": {
+                "enabled": true,
+                "direction": "UD",
+                "sortMethod": "directed",
+                "nodeSpacing": 180,
+                "levelSeparation": 140
+            }
+        },
+        "physics": { "enabled": false }
+        """
+    else:
+        spring_len = max(180, min(360, 160 + num_nodes * 6))
+        grav_const = min(-120, -50 - num_nodes * 6)
+        layout_json = f"""
+        "physics": {{
+            "enabled": true,
+            "solver": "forceAtlas2Based",
+            "forceAtlas2Based": {{
+                "gravitationalConstant": {grav_const},
+                "centralGravity": 0.008,
+                "springLength": {spring_len},
+                "springConstant": 0.04,
+                "damping": 0.45,
+                "avoidOverlap": 1.0
+            }},
+            "stabilization": {{
+                "enabled": true,
+                "iterations": 180,
+                "updateInterval": 25
+            }}
+        }}
+        """
+
+    options_str = f"""
+    {{
+      "nodes": {{
+          "borderWidth": 2,
+          "shadow": {{"enabled": true, "size": 10, "color": "rgba(0,0,0,0.7)"}},
+          "font": {{
+              "size": 11,
+              "face": "Share Tech Mono, Segoe UI, monospace",
+              "color": "#e0f4ff",
+              "strokeWidth": 3,
+              "strokeColor": "#050a0f"
+          }}
+      }},
+      "edges": {{
+          "smooth": {{"type": "curvedCW", "roundness": 0.12}},
+          "shadow": {{"enabled": false}},
+          "selectionWidth": 2.2,
+          "hoverWidth": 1.6
+      }},
+      {layout_json},
+      "interaction": {{
+          "hover": true,
+          "hoverConnectedEdges": true,
+          "selectConnectedEdges": true,
+          "multiselect": false,
+          "tooltipDelay": 70,
+          "zoomView": true,
+          "navigationButtons": true,
+          "keyboard": true,
+          "dragNodes": true
+      }}
+    }}
+    """
+    net.set_options(options_str)
 
     type_shapes = {"perimeter": "diamond", "endpoint": "dot", "server": "square",
                    "database": "database", "honeypot": "star"}
+    level_map = {"perimeter": 1, "endpoint": 2, "server": 3, "database": 4, "honeypot": 2}
 
     for node, data in G.nodes(data=True):
         ntype = data.get("node_type", "endpoint")
@@ -3045,64 +3255,162 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True,
             continue
 
         if is_current:
-            color = {"background": "#ff8c00", "border": "#ffd700", "highlight": {"background": "#ffaa33"}}
-            size = 32
+            color = {"background": "#ff8c00", "border": "#ffd700", "highlight": {"background": "#ffaa33", "border": "#ffffff"}}
+            size = 30
         elif is_compromised and is_honeypot:
-            color = {"background": "#ff3355", "border": "#ffd700", "highlight": {"background": "#ff5577"}}
+            color = {"background": "#ff3355", "border": "#ffd700", "highlight": {"background": "#ff5577", "border": "#ffffff"}}
             size = 28
         elif is_compromised:
-            color = {"background": "#6b0018", "border": "#ff3355", "highlight": {"background": "#cc0033"}}
+            color = {"background": "#6b0018", "border": "#ff3355", "highlight": {"background": "#cc0033", "border": "#ffffff"}}
             size = 26
         elif is_honeypot:
-            color = {"background": "#3d2800", "border": "#ffd700", "highlight": {"background": "#5a3d00"}}
+            color = {"background": "#3d2800", "border": "#ffd700", "highlight": {"background": "#5a3d00", "border": "#ffd700"}}
             size = 22
         elif is_isolated:
-            color = {"background": "#0a2e1a", "border": "#00ff88", "highlight": {"background": "#0f3d22"}}
+            color = {"background": "#0a2e1a", "border": "#00ff88", "highlight": {"background": "#0f3d22", "border": "#00ff88"}}
             size = 22
+        elif ntype in ("server", "database"):
+            color = {"background": "#0b3050", "border": "#00d4ff", "highlight": {"background": "#144e80", "border": "#00ffff"}}
+            size = 26
         else:
-            color = {"background": "#002d4a", "border": "#00d4ff", "highlight": {"background": "#003d60"}}
-            size = 22
+            color = {"background": "#002035", "border": "#00a8cc", "highlight": {"background": "#003d60", "border": "#00ffff"}}
+            size = 20
 
+        ip = data.get('ip', '')
+        hostname = data.get('hostname', '')
+        role = data.get('role', 'Node')
+        os_type = data.get('os', '')
+        os_label = {'ios': 'iOS', 'android': 'Android', 'macos': 'macOS', 'windows': 'Windows', 'linux': 'Linux'}.get(os_type.lower(), os_type.upper() if os_type else 'Unknown')
+        crit = data.get('criticality', 1)
         cves = data.get('cve_findings', [])
         cve_html = ''.join(f"CONFIRMED: {c['cve_id']} (CVSS {c['cvss']})<br>" for c in cves[:2])
         status_label = ('🔴 COMPROMISED (simulated)' if is_compromised else
                          '🟢 ISOLATED (defense applied)' if is_isolated else
                          '🟡 HONEYPOT (decoy)' if is_honeypot else '🔵 OBSERVED ASSET')
+
         tooltip = (
-            f"<div style='font-family:Share Tech Mono;font-size:11px;color:#e0f4ff;background:#0d1f2d;padding:8px;border:1px solid #1a3a5c'>"
-            f"<b style='color:#00d4ff'>{node}</b><br>IP: {data['ip']}<br>Role: {data['role']}<br>"
-            f"Criticality: {data.get('criticality_label','?')} ({'★' * data['criticality']})<br>"
-            f"Asset Risk: {data.get('risk_score', int(data.get('vulnerability',0)*100))}/100 ({data.get('risk_severity','?')})<br>"
+            f"<div style='font-family:Share Tech Mono,Segoe UI,monospace;font-size:11px;color:#e0f4ff;background:#09141f;padding:9px 12px;border:1px solid #00d4ff;border-radius:4px;box-shadow:0 4px 15px rgba(0,0,0,0.85);line-height:1.45'>"
+            f"<b style='color:#00d4ff;font-size:12px'>{data.get('display_name', node)}</b><br>"
+            f"<b>IP:</b> {ip}<br>"
+            f"<b>Inferred OS:</b> {os_label}<br>"
+            f"<b>Role:</b> {role} ({data.get('device_type') or 'Network Host'})<br>"
+            f"<b>Criticality:</b> {data.get('criticality_label','?')} ({'★' * crit})<br>"
+            f"<b>Asset Risk:</b> {data.get('risk_score', int(data.get('vulnerability',0)*100))}/100 ({data.get('risk_severity','?')})<br>"
+            f"<b>Open Ports:</b> {', '.join(str(p) for p in data.get('open_ports', [])) or 'None'}<br>"
             f"{cve_html}"
-            f"Status: {status_label}</div>"
+            f"<b>Status:</b> {status_label}</div>"
         )
 
-        short_label = node if "\n" in node else node.replace("-", "\n")
-        net.add_node(node, label=short_label, title=tooltip, color=color, size=size,
-                     shape=type_shapes.get(ntype, "dot"))
+        if hostname and hostname.lower() not in ('unknown', 'none', ip.lower()):
+            clean_name = hostname if len(hostname) <= 15 else f"{hostname[:13]}…"
+            short_label = f"{clean_name}\n{ip}"
+        else:
+            short_label = f"{role}\n{ip}"
+
+        node_kwargs = {
+            'label': short_label,
+            'title': tooltip,
+            'color': color,
+            'size': size,
+            'shape': type_shapes.get(ntype, "dot"),
+        }
+        if layout_mode == "Hierarchical (Tiered)":
+            node_kwargs['level'] = level_map.get(ntype, 2)
+
+        net.add_node(node, **node_kwargs)
 
     for src, dst, data in G.edges(data=True):
         if not show_honeypot and (G.nodes[src].get("node_type") == "honeypot" or G.nodes[dst].get("node_type") == "honeypot"):
             continue
-        src_comp, dst_comp = src in compromised_set, dst in compromised_set
-        src_ip, dst_ip = G.nodes[src].get('ip'), G.nodes[dst].get('ip')
-        is_new_exposure = (src_ip, dst_ip) in new_exposure_edges
-        dst_severity = G.nodes[dst].get('risk_severity')
 
-        if src_comp and dst_comp:
-            edge_color, width, edge_note = "#ff3355", 3, "SIMULATED ATTACK PATH"
-        elif src_comp:
-            edge_color, width, edge_note = "#ff8c00", 2, "ACTIVE (simulated)"
+        src_data = G.nodes[src]
+        dst_data = G.nodes[dst]
+        src_comp = src in compromised_set
+        dst_comp = dst in compromised_set
+        src_ip = src_data.get('ip')
+        dst_ip = dst_data.get('ip')
+
+        is_new_exposure = (src_ip, dst_ip) in new_exposure_edges
+        dst_severity = dst_data.get('risk_severity', 'LOW')
+        dst_crit = dst_data.get('criticality', 1)
+        src_type = src_data.get('node_type', 'endpoint')
+        dst_type = dst_data.get('node_type', 'endpoint')
+
+        is_attack_path = src_comp and dst_comp
+        is_active_sim = src_comp and not dst_comp
+        is_high_risk = dst_severity in ("CRITICAL", "HIGH") or dst_crit >= 4
+        is_infra_target = dst_type in ('server', 'database', 'honeypot')
+        is_perimeter_source = src_type == 'perimeter'
+
+        if "Clean View" in edge_filter or "Attack Focus" in edge_filter:
+            if compromised_set:
+                if not (is_attack_path or is_active_sim or is_new_exposure or (is_high_risk and (src_comp or dst_comp))):
+                    continue
+            else:
+                if num_nodes > 6 and not (is_high_risk or is_new_exposure or is_infra_target or is_perimeter_source):
+                    continue
+        elif "Attack Paths Only" in edge_filter:
+            if not (is_attack_path or is_active_sim or is_new_exposure):
+                continue
+        elif "High-Risk Paths Only" in edge_filter:
+            if not (is_attack_path or is_active_sim or is_new_exposure or is_high_risk):
+                continue
+
+        if is_attack_path:
+            edge_color = {"color": "#ff3355", "highlight": "#ff5577", "hover": "#ffffff", "opacity": 0.95}
+            width = 2.8
+            arrows = {"to": {"enabled": True, "scaleFactor": 0.55, "type": "arrow"}}
+            dashes = False
+            edge_note = "SIMULATED ATTACK PATH"
+            status_color = "#ff3355"
+        elif is_active_sim:
+            edge_color = {"color": "#ff8c00", "highlight": "#ffaa33", "hover": "#ffffff", "opacity": 0.9}
+            width = 2.0
+            arrows = {"to": {"enabled": True, "scaleFactor": 0.5, "type": "arrow"}}
+            dashes = [5, 5]
+            edge_note = "ACTIVE ATTACK FRONTIER"
+            status_color = "#ff8c00"
         elif is_new_exposure:
-            # Phase 5 legend: Orange = newly exposed (path did not exist in
-            # the previous completed recalculation pass).
-            edge_color, width, edge_note = "#ff8c00", 2.5, "NEWLY EXPOSED PATH"
-        elif dst_severity in ("CRITICAL", "HIGH"):
-            edge_color, width, edge_note = "#ff3355", 1.5, "HIGH-RISK PATH (leads to high-risk asset)"
+            edge_color = {"color": "#ffd700", "highlight": "#ffff55", "hover": "#ffffff", "opacity": 0.85}
+            width = 1.8
+            arrows = {"to": {"enabled": True, "scaleFactor": 0.45, "type": "arrow"}}
+            dashes = False
+            edge_note = "NEWLY EXPOSED PATH"
+            status_color = "#ffd700"
+        elif is_high_risk or is_infra_target:
+            edge_color = {"color": "rgba(0, 212, 255, 0.45)", "highlight": "#00ffff", "hover": "#00ffff", "opacity": 0.75}
+            width = 1.2
+            arrows = {"to": {"enabled": True, "scaleFactor": 0.4, "type": "arrow"}}
+            dashes = False
+            edge_note = "CORE INFRASTRUCTURE REACHABILITY"
+            status_color = "#00d4ff"
         else:
-            edge_color, width, edge_note = "#1a3a5c", 1.5, "normal"
-        edge_title = f"{data.get('connection','')} — POTENTIAL REACHABILITY (modeled, not observed traffic) — {edge_note}"
-        net.add_edge(src, dst, title=edge_title, color=edge_color, width=width)
+            edge_color = {"color": "rgba(45, 95, 140, 0.22)", "highlight": "#00ffff", "hover": "#00ffff", "opacity": 0.35}
+            width = 0.8
+            arrows = {"to": {"enabled": (num_nodes <= 8), "scaleFactor": 0.35, "type": "arrow"}}
+            dashes = False
+            edge_note = "POTENTIAL LATERAL REACHABILITY"
+            status_color = "#3d6a8a"
+
+        src_disp = src_data.get('display_name', src)
+        dst_disp = dst_data.get('display_name', dst)
+        conn = data.get('connection', 'LAN')
+        vec = data.get('access_vector', 'Network Reachability')
+        mitre_code = data.get('mitre_code')
+        mitre_desc = data.get('mitre_desc')
+        mitre_html = f"<div><span style='color:#7ab8d4;'>MITRE:</span> <span style='color:#ffaa33;'>{mitre_code} — {mitre_desc}</span></div>" if mitre_code else ""
+
+        edge_title = (
+            f"<div style='font-family:Share Tech Mono,Segoe UI,monospace;font-size:11px;color:#e0f4ff;background:#09141f;"
+            f"padding:8px 12px;border:1px solid #00d4ff;border-radius:4px;box-shadow:0 4px 15px rgba(0,0,0,0.85);line-height:1.45;'>"
+            f"<div style='color:#00d4ff;font-weight:bold;font-size:12px;margin-bottom:3px;'>➔ {src_disp} &rarr; {dst_disp}</div>"
+            f"<div><span style='color:#7ab8d4;'>Port/Service:</span> <b style='color:#ffffff;'>{conn}</b></div>"
+            f"<div><span style='color:#7ab8d4;'>Vector:</span> <span style='color:#00ff88;'>{vec}</span></div>"
+            f"{mitre_html}"
+            f"<div style='margin-top:4px;padding-top:4px;border-top:1px solid #1a3a5c;color:{status_color};font-weight:bold;font-size:10px;'>● {edge_note}</div>"
+            f"</div>"
+        )
+        net.add_edge(src, dst, title=edge_title, color=edge_color, width=width, arrows=arrows, dashes=dashes)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html", dir=tempfile.gettempdir())
     net.save_graph(tmp.name)
@@ -3114,6 +3422,161 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True,
     except OSError:
         pass
     html = html.replace("body {", "body { background-color: #050a0f !important; margin: 0; padding: 0; ")
+
+    # Pre-generate full intelligence cards for every node in G
+    node_cards = {}
+    default_node = None
+    max_risk = -1
+    for n, d in G.nodes(data=True):
+        card_html = render_node_panel(selected_node=n, G=G)
+        node_cards[n] = card_html
+        r = d.get('risk_score', 0)
+        if r > max_risk or default_node is None:
+            max_risk = r
+            default_node = n
+
+    node_cards_json = json.dumps(node_cards)
+    default_node_json = json.dumps(default_node or "")
+
+    # Replace the pyvis card container with side-by-side flex layout (Map on Left, Inspector on Right)
+    old_card_pattern = r'<div class="card" style="width: 100%">\s*<div id="mynetwork" class="card-body"></div>\s*</div>'
+    side_by_side_html = """
+    <div class="hud-side-by-side-container" style="display: flex; flex-direction: row; gap: 14px; width: 100%; height: 570px; box-sizing: border-box; align-items: stretch; margin: 0; padding: 0;">
+        <div class="hud-map-panel" style="flex: 1.22; min-width: 0; height: 100%; position: relative; background: #050a0f; border: 1px solid #1a3a5c; border-radius: 6px; overflow: hidden; display: flex; flex-direction: column;">
+            <div id="mynetwork" style="width: 100% !important; height: 100% !important; flex: 1; background-color: #050a0f !important; border: none !important;"></div>
+        </div>
+        <div id="inspector-wrapper" style="flex: 0.98; min-width: 0; height: 100%; overflow-y: auto; background: #071019; border: 1px solid #1a3a5c; border-radius: 6px; padding: 12px 14px; box-sizing: border-box; display: flex; flex-direction: column;">
+            <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1a3a5c; padding-bottom: 8px; margin-bottom: 10px; flex-shrink: 0;">
+                <span style="color: #00d4ff; font-weight: bold; font-size: 0.8rem; letter-spacing: 1px; display: flex; align-items: center; gap: 8px;">
+                    <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#00d4ff;box-shadow:0 0 8px #00d4ff;"></span>
+                    🔍 ASSET INTELLIGENCE INSPECTOR
+                </span>
+                <span id="inspector-badge" style="font-size: 0.68rem; color: #00ff88; background: rgba(0,255,136,0.08); padding: 3px 8px; border-radius: 3px; border: 1px solid rgba(0,255,136,0.25);">Click any node in map</span>
+            </div>
+            <div id="inspector-body" style="font-size: 0.78rem; overflow-y: auto; flex: 1; padding-right: 4px;"></div>
+        </div>
+    </div>
+    """
+
+    if re.search(old_card_pattern, html, flags=re.DOTALL):
+        html = re.sub(old_card_pattern, side_by_side_html, html, flags=re.DOTALL)
+    elif '<div id="mynetwork"' in html:
+        html = re.sub(r'<div id="mynetwork"[^>]*></div>', side_by_side_html, html)
+
+    inspector_injection = f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
+    #mynetwork {{
+        width: 100% !important;
+        height: 100% !important;
+        background-color: #050a0f !important;
+        border: none !important;
+        position: relative;
+        float: none !important;
+    }}
+    #inspector-wrapper::-webkit-scrollbar, #inspector-body::-webkit-scrollbar {{
+        width: 6px;
+    }}
+    #inspector-wrapper::-webkit-scrollbar-track, #inspector-body::-webkit-scrollbar-track {{
+        background: #050a0f;
+    }}
+    #inspector-wrapper::-webkit-scrollbar-thumb, #inspector-body::-webkit-scrollbar-thumb {{
+        background: #1a3a5c;
+        border-radius: 3px;
+    }}
+    #inspector-wrapper::-webkit-scrollbar-thumb:hover, #inspector-body::-webkit-scrollbar-thumb:hover {{
+        background: #00d4ff;
+    }}
+    .node-card {{
+        background: #09141f;
+        border: 1px solid #1a3a5c;
+        border-left: 3px solid #00d4ff;
+        padding: 12px 14px;
+        margin: 6px 0;
+        font-family: 'Share Tech Mono', Segoe UI, monospace;
+        font-size: 0.76rem;
+        line-height: 1.7;
+        border-radius: 4px;
+    }}
+    .node-card.safe {{ border-left-color: #00ff88; }}
+    .node-card.compromised {{ border-left-color: #ff3355; animation: pulse-red 1.2s infinite; }}
+    .node-card.honeypot {{ border-left-color: #ffd700; }}
+    @keyframes pulse-red {{
+        0%, 100% {{ border-left-color: #ff3355; box-shadow: 0 0 8px rgba(255, 51, 85, 0.3); }}
+        50% {{ border-left-color: #ff6680; box-shadow: 0 0 18px rgba(255, 51, 85, 0.5); }}
+    }}
+    .cve-tag {{
+        display: inline-block;
+        background: rgba(255, 51, 85, 0.15);
+        border: 1px solid #ff3355;
+        color: #ff3355;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 0.65rem;
+        padding: 2px 6px;
+        margin: 2px;
+        border-radius: 3px;
+    }}
+    .mitre-tag {{
+        display: inline-block;
+        background: rgba(255, 140, 0, 0.15);
+        border: 1px solid #ff8c00;
+        color: #ff8c00;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 0.65rem;
+        padding: 2px 6px;
+        margin: 2px;
+        border-radius: 3px;
+    }}
+    .risk-bar-container {{
+        background: rgba(255,255,255,0.05);
+        border: 1px solid #1a3a5c;
+        height: 10px;
+        border-radius: 2px;
+        overflow: hidden;
+        margin: 4px 0;
+    }}
+    .risk-bar {{ height: 100%; transition: width 0.4s ease; border-radius: 2px; }}
+    </style>
+
+    <script type="text/javascript">
+    (function() {{
+        var cards = {node_cards_json};
+        var defNode = {default_node_json};
+        var badge = document.getElementById("inspector-badge");
+        var body = document.getElementById("inspector-body");
+
+        function renderInspector(nodeId) {{
+            if (!nodeId || !cards[nodeId]) return;
+            var cleanLabel = nodeId.replace(/\\n/g, ' · ');
+            if (badge) badge.innerText = "INSPECTING: " + cleanLabel;
+            if (body) body.innerHTML = cards[nodeId];
+        }}
+
+        if (typeof network !== "undefined") {{
+            network.on("selectNode", function(params) {{
+                if (params.nodes && params.nodes.length > 0) {{
+                    renderInspector(params.nodes[0]);
+                }}
+            }});
+            network.on("click", function(params) {{
+                if (params.nodes && params.nodes.length > 0) {{
+                    renderInspector(params.nodes[0]);
+                }}
+            }});
+        }}
+
+        if (defNode && cards[defNode]) {{
+            renderInspector(defNode);
+        }}
+    }})();
+    </script>
+    """
+
+    if "</body>" in html:
+        html = html.replace("</body>", inspector_injection + "</body>")
+    else:
+        html = html + inspector_injection
+
     return html
 
 
@@ -4351,155 +4814,11 @@ def _render_alert_card(a):
             <span style='color:{color};font-weight:bold'>{icon} {sev} — {a.get("title","")}</span>
             <span style='color:#3d6a8a;font-size:0.6rem'>{ts}</span>
         </div>
-        <div style='color:#e0f4ff;margin-top:2px'>Asset: {html_lib.escape(str(a.get("asset") or "—"))}</div>
+        <div style='color:#e0f4ff;margin-top:2px'>Asset: {html_lib.escape(str(a.get("asset") or "-"))}</div>
         <div style='margin-top:2px'>{html_lib.escape(str(a.get("description") or ""))}</div>
         {delta_html}
     </div>
     """, unsafe_allow_html=True)
-
-def _evidence_block(title, evidence_list, color="#3d6a8a"):
-    if not evidence_list:
-        return ""
-    items = "".join(f"<div>✓ {html_lib.escape(str(e))}</div>" for e in evidence_list[:4])
-    return (f"<div style='margin:2px 0 6px 70px;font-size:0.62rem;color:{color};line-height:1.6'>{items}</div>")
-
-def render_node_panel(active_node=None, selected_node=None):
-    html = ""
-    for node, data in st.session_state.G.nodes(data=True):
-        if selected_node and node != selected_node:
-            continue
-        is_comp = data["compromised"]
-        ntype = data.get("node_type", "endpoint")
-        is_honey = ntype == "honeypot"
-        is_active = node == active_node
-        is_isolated = data.get("isolated", False)
-
-        card_class = "compromised" if is_comp else "honeypot" if is_honey else "safe"
-        if is_active:
-            card_class = "compromised"
-
-        status_icon = ("🔴 COMPROMISED (simulated)" if is_comp else
-                        "🟢 ISOLATED (defense applied)" if is_isolated else
-                        "⚠ ALERT" if (is_honey and st.session_state.honeypot_triggered) else
-                        "🟡 DECOY" if is_honey else "🔵 OBSERVED SECURE")
-        if is_active:
-            status_icon = "💥 UNDER SIMULATED ATTACK"
-
-        crit_label = data.get('criticality_label', 'Unknown')
-        crit_stars = "★" * data["criticality"] + "☆" * (5 - data["criticality"])
-        crit_conf = data.get('criticality_confidence')
-        conf_str = f" ({int(crit_conf*100)}% confidence)" if isinstance(crit_conf, (int, float)) else ""
-
-        hostname = data.get('hostname', '')
-        hostname_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Hostname:</span><span style='color:#e0f4ff'>{hostname}</span></div>" if hostname else ""
-
-        os_type = data.get('os', 'unknown')
-        os_confidence = data.get('os_confidence')
-        os_evidence = data.get('os_evidence') or []
-        os_icon = {'windows': '🪟', 'linux': '🐧', 'macos': '🍎', 'unknown': '❓'}.get(os_type, '❓')
-        conf_suffix = f" · {int(round(os_confidence * 100))}% confidence" if isinstance(os_confidence, (int, float)) else ""
-        os_html = (
-            f"<div style='display:flex;align-items:center;margin:4px 0'>"
-            f"<span style='color:#3d6a8a;width:90px'>Inferred OS:</span>"
-            f"<span style='color:#e0f4ff'>{os_icon} {os_type.upper()}{conf_suffix}</span></div>"
-            + _evidence_block("", os_evidence)
-        )
-
-        device_type = data.get('device_type', '')
-        device_evidence = data.get('device_evidence') or []
-        device_conf = data.get('device_confidence')
-        dconf_str = f" · {int(device_conf*100)}% confidence" if isinstance(device_conf, (int, float)) else ""
-        vendor = data.get('mac_vendor')
-        device_icon = {
-            'Mobile Device': '📱', 'Tablet': '📱', 'Network Device': '🌐',
-            'Web Server': '🖥️', 'Database Server': '🗄️', 'Linux Server': '🖥️',
-            'Windows Server': '🖥️', 'Windows Workstation': '💻', 'Linux Workstation': '💻',
-            'Mac Computer': '🍎',
-        }.get(device_type, '📦')
-        vendor_suffix = f" ({vendor})" if vendor else ""
-        device_html = (
-            f"<div style='display:flex;align-items:center;margin:4px 0'>"
-            f"<span style='color:#3d6a8a;width:90px'>Inferred Device:</span>"
-            f"<span style='color:#e0f4ff'>{device_icon} {device_type or 'Unknown'}{vendor_suffix}{dconf_str}</span>"
-            f"</div>" + _evidence_block("", device_evidence)
-        )
-
-        version_map = data.get('version_map', {})
-        services = data.get('services', [])
-        if version_map:
-            svc_strs = [f"{s} ({version_map[s]})" if version_map.get(s) else s for s in services[:4]]
-        else:
-            svc_strs = services[:4]
-        services_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Services:</span><span style='color:#e0f4ff'>{', '.join(svc_strs)}{'...' if len(services) > 4 else ''}</span></div>" if services else ""
-        open_ports = data.get('open_ports', [])
-        ports_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Ports:</span><span style='color:#e0f4ff'>{', '.join(str(p) for p in open_ports) or 'None detected'}</span></div>"
-
-        risk_score = data.get('risk_score', int(data.get('vulnerability', 0) * 100))
-        risk_severity = data.get('risk_severity', 'Unknown')
-        comps = data.get('risk_components') or {}
-
-        def comp_row(key, label, cap):
-            c = comps.get(key, {})
-            contrib = c.get('contribution', 0)
-            return f"<div style='display:flex;justify-content:space-between;color:#7ab8d4'><span>{label}</span><span>{contrib:.1f} / {cap}</span></div>"
-
-        risk_breakdown_html = ""
-        if comps:
-            risk_breakdown_html = (
-                "<div style='margin:6px 0;padding:8px;background:rgba(0,212,255,0.05);border-left:2px solid #00d4ff;font-size:0.65rem'>"
-                "<div style='color:#00d4ff;font-weight:bold;margin-bottom:4px'>RISK CALCULATION</div>"
-                + comp_row('vulnerability', 'Vulnerability / CVSS', 40)
-                + comp_row('service_exposure', 'Service Exposure', 20)
-                + comp_row('sensitive_services', 'Sensitive Services', 15)
-                + comp_row('criticality', 'Asset Criticality', 15)
-                + comp_row('network_exposure', 'Network Exposure', 10)
-                + f"<div style='border-top:1px solid #1a3a5c;margin-top:4px;padding-top:4px;display:flex;justify-content:space-between;color:#00d4ff;font-weight:bold'><span>TOTAL</span><span>{risk_score} / 100</span></div>"
-                "</div>"
-            )
-        risk_html = (
-            f"<div style='margin:6px 0;padding:6px;background:rgba(0,212,255,0.05);border-left:2px solid #00d4ff'>"
-            f"<div style='color:#00d4ff;font-size:0.68rem'>RISK: {risk_score}/100 — {risk_severity}</div></div>"
-            + risk_breakdown_html
-        )
-
-        sensitive_detected = (data.get('asset_risk') or {}).get('sensitive_detected', [])
-        sensitive_html = ""
-        if sensitive_detected:
-            sensitive_html = (
-                f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Sensitive:</span>"
-                f"<span style='color:#ff3355'>{', '.join(sensitive_detected)}</span></div>"
-            )
-
-        cve_findings = data.get('cve_findings', [])
-        cve_html = ""
-        if cve_findings:
-            cve_badges = "".join(
-                f"<span class='cve-tag' title='{c.get('summary','')[:80]}'>{c['cve_id']} (CVSS {c['cvss']})</span>"
-                for c in cve_findings[:4]
-            )
-            cve_html = f"<div style='margin:4px 0'><div style='color:#3d6a8a;font-size:0.65rem'>MATCHED CVEs:</div>{cve_badges}</div>"
-
-        fixes = data.get('fixes', [])
-        recommendation_html = ""
-        if fixes:
-            recommendation_html = "".join(f"<div style='color:#00ff88;font-size:0.65rem'>• {fix}</div>" for fix in fixes[:3])
-            recommendation_html = f"<div style='margin:6px 0;padding:6px;background:rgba(0,255,136,0.04);border-left:2px solid #00ff88'><div style='color:#3d6a8a;font-size:0.62rem;margin-bottom:3px'>RECOMMENDED ACTIONS</div>{recommendation_html}</div>"
-
-        node_color = "#ff3355" if is_comp else "#00ff88" if is_isolated else "#ffd700" if is_honey else "#00d4ff"
-        html += (
-            f"<div class='node-card {card_class}'>"
-            f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px'>"
-            f"<span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.8rem;font-weight:700'>{node}</span>"
-            f"<span style='font-size:0.62rem;opacity:0.8'>{status_icon}</span></div>"
-            f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>IP:</span><span style='color:#e0f4ff'>{data['ip']}</span></div>"
-            f"{hostname_html}{os_html}{device_html}{ports_html}{services_html}{risk_html}{sensitive_html}{cve_html}{recommendation_html}"
-            f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:90px'>Role:</span><span style='color:#e0f4ff'>{data['role']}</span></div>"
-            f"<div style='margin:4px 0'><span style='color:#3d6a8a'>Inferred Criticality: </span><span style='color:#ffd700'>{crit_label}{conf_str}</span><br>"
-            f"<span style='color:#ffd700'>{crit_stars}</span>"
-            + _evidence_block("", data.get('criticality_evidence') or [])
-            + "</div></div>"
-        )
-    return html
 
 # ─────────────────────────────────────────────────────────────────
 # 🧭 MODERN TAB-BASED DASHBOARD NAVIGATION
@@ -4563,18 +4882,18 @@ with tab_exec:
             <div style='font-family:Orbitron,monospace;font-size:2rem;color:{ov_color};text-align:center'>{overall['overall_score']} / 100</div>
             <div style='font-family:Share Tech Mono;font-size:0.65rem;color:{ov_color};text-align:center;letter-spacing:2px'>{overall['severity']}</div>
             <div style='display:flex;justify-content:space-around;margin-top:10px;font-family:Share Tech Mono;font-size:0.62rem;color:#7ab8d4;flex-wrap:wrap;gap:8px'>
-                <div>Avg Asset Risk<br><span style='color:#00d4ff'>{overall['asset_component']} × {int(overall['asset_weight']*100)}%</span></div>
-                <div>Blast Radius<br><span style='color:#ff8c00'>{overall['blast_component']} × {int(overall['blast_weight']*100)}%</span></div>
-                <div>Critical Asset Exposure<br><span style='color:#ff3355'>{overall['critical_exposure_component']} × {int(overall['critical_exposure_weight']*100)}%</span></div>
-                <div>Network Exposure<br><span style='color:#ffd700'>{overall['network_exposure_component']} × {int(overall['network_exposure_weight']*100)}%</span></div>
+                <div>Avg Asset Risk<br><span style='color:#00d4ff'>{overall['asset_component']} &times; {int(overall['asset_weight']*100)}%</span></div>
+                <div>Blast Radius<br><span style='color:#ff8c00'>{overall['blast_component']} &times; {int(overall['blast_weight']*100)}%</span></div>
+                <div>Critical Asset Exposure<br><span style='color:#ff3355'>{overall['critical_exposure_component']} &times; {int(overall['critical_exposure_weight']*100)}%</span></div>
+                <div>Network Exposure<br><span style='color:#ffd700'>{overall['network_exposure_component']} &times; {int(overall['network_exposure_weight']*100)}%</span></div>
                 <div>Total<br><span style='color:{ov_color}'>{overall['overall_score']} / 100</span></div>
             </div>
             <div style='font-family:Share Tech Mono;font-size:0.58rem;color:#3d6a8a;text-align:center;margin-top:8px'>
-                Overall ACDS Risk = Avg Asset Risk × {overall['asset_weight']} + Blast Radius × {overall['blast_weight']}
-                + Critical Asset Exposure × {overall['critical_exposure_weight']} + Network Exposure × {overall['network_exposure_weight']}
+                Overall ACDS Risk = Avg Asset Risk &times; {overall['asset_weight']} + Blast Radius &times; {overall['blast_weight']}
+                + Critical Asset Exposure &times; {overall['critical_exposure_weight']} + Network Exposure &times; {overall['network_exposure_weight']}
             </div>
             <div style='font-family:Share Tech Mono;font-size:0.58rem;color:#ff3355;text-align:center;margin-top:6px;letter-spacing:1px'>
-                SIMULATED — NO REAL ATTACK TRAFFIC &nbsp;·&nbsp; Blast Radius last computed: {blast_ts_txt}
+                SIMULATED -- NO REAL ATTACK TRAFFIC &nbsp;&middot;&nbsp; Blast Radius last computed: {blast_ts_txt}
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -4623,10 +4942,10 @@ with tab_exec:
                         key=lambda r: r["asset_risk"], reverse=True)[:10]
         rows_html = "".join(
             f"<tr style='border-bottom:1px solid #1a3a5c'>"
-            f"<td style='padding:4px 6px'>{r.get('asset_ip') or '—'}</td>"
-            f"<td style='padding:4px 6px'>{r.get('hostname') or '—'}</td>"
+            f"<td style='padding:4px 6px'>{r.get('asset_ip') or '-'}</td>"
+            f"<td style='padding:4px 6px'>{r.get('hostname') or '-'}</td>"
             f"<td style='padding:4px 6px;color:{_ALERT_SEVERITY_COLOR.get(severity_from_score(r['asset_risk']), '#7ab8d4')}'>{r['asset_risk']} ({severity_from_score(r['asset_risk'])})</td>"
-            f"<td style='padding:4px 6px'>{CRITICALITY_LABELS.get(_safe_int(r.get('criticality')), '—')}</td>"
+            f"<td style='padding:4px 6px'>{CRITICALITY_LABELS.get(_safe_int(r.get('criticality')), '-')}</td>"
             f"<td style='padding:4px 6px'>{(r.get('last_seen') or '')[:19]}</td>"
             f"</tr>" for r in top10
         )
@@ -4747,50 +5066,59 @@ with tab_sim_map:
 
     st.markdown('<hr style="border-color:#1a3a5c;margin:12px 0 16px 0">', unsafe_allow_html=True)
 
-    # Co-located Live Map (Left) and Attack Results / Timeline (Right)
-    col_map, col_sim_results = st.columns([1.1, 0.9], gap="medium")
+    st.markdown('<div class="section-header">🗺 LIVE EXPOSURE &amp; ATTACK TOPOLOGY MAP &amp; ASSET INTELLIGENCE</div>', unsafe_allow_html=True)
 
-    with col_map:
-        st.markdown('<div class="section-header">🗺 LIVE EXPOSURE &amp; ATTACK TOPOLOGY MAP</div>', unsafe_allow_html=True)
-        st.markdown("""
-        <div style='font-family:Share Tech Mono;font-size:0.6rem;color:#3d6a8a;margin-bottom:6px'>
-        Edges = modeled POTENTIAL REACHABILITY from exposed services. Shows simulated lateral paths live.
-        </div>
-        """, unsafe_allow_html=True)
-        graph_placeholder = st.empty()
-        html_graph = render_graph(st.session_state.G, compromised_set=st.session_state.compromised,
-                                   current_node=st.session_state.current_anim_node, show_honeypot=show_honeypot if 'show_honeypot' in locals() else True,
-                                   new_exposure_edges=st.session_state.get("new_exposure_edges"))
-        with graph_placeholder:
-            st.components.v1.html(html_graph, height=480, scrolling=False)
+    map_c1, map_c2 = st.columns([1.1, 0.9])
+    with map_c1:
+        topo_edge_filter = st.selectbox(
+            "Path Filter",
+            ["Clean View (Focus on Attack & Critical Paths)", "All Potential Paths (Full Mesh)", "Attack Paths Only"],
+            index=0,
+            key="topo_filter_select",
+            help="Clean view prevents visual clutter by focusing on attack vectors, high-risk assets, and active paths."
+        )
+    with map_c2:
+        topo_layout = st.selectbox(
+            "Layout",
+            ["Force-Directed (Dynamic)", "Hierarchical (Tiered)"],
+            index=0,
+            key="topo_layout_select",
+        )
 
-        st.markdown("""
-        <div style='display:flex;gap:12px;font-family:Share Tech Mono;font-size:0.62rem;margin-top:8px;flex-wrap:wrap;background:#050a0f;padding:8px 10px;border:1px solid #1a3a5c'>
-            <span><span style='color:#00d4ff'>■</span> OBSERVED ASSET</span>
-            <span><span style='color:#ff3355'>■</span> COMPROMISED (simulated)</span>
-            <span><span style='color:#ff8c00'>■</span> ACTIVE (simulated)</span>
-            <span><span style='color:#00ff88'>■</span> ISOLATED (defense applied)</span>
-            <span><span style='color:#ffd700'>★</span> HONEYPOT (decoy)</span>
-            <span><span style='color:#1a3a5c'>──</span> POTENTIAL REACHABILITY</span>
-            <span><span style='color:#ff8c00'>──</span> NEWLY EXPOSED PATH</span>
-            <span><span style='color:#ff3355'>──</span> SIMULATED ATTACK PATH</span>
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style='display:flex;justify-content:space-between;font-family:Share Tech Mono;font-size:0.6rem;color:#3d6a8a;margin-bottom:6px'>
+        <span>Edges = modeled potential reachability. Click any node in the map to inspect in real-time.</span>
+        <span style='color:#00d4ff'><b>{len(st.session_state.G.nodes)}</b> Assets • <b>{len(st.session_state.G.edges)}</b> Modeled Paths</span>
+    </div>
+    """, unsafe_allow_html=True)
 
-        with st.expander("🔍 ASSET INTELLIGENCE INSPECTOR", expanded=False):
-            asset_nodes = list(st.session_state.G.nodes)
-            selected_asset = st.selectbox(
-                "Select asset to inspect",
-                asset_nodes,
-                format_func=lambda node: f"{st.session_state.G.nodes[node].get('display_name', node)} — {st.session_state.G.nodes[node].get('ip', '')}",
-                disabled=not asset_nodes,
-                key="tab_sim_map_selected_asset",
-            ) if asset_nodes else None
-            if selected_asset:
-                st.markdown(f"<div style='padding: 4px;'>{render_node_panel(selected_node=selected_asset)}</div>", unsafe_allow_html=True)
+    graph_placeholder = st.empty()
+    html_graph = render_graph(st.session_state.G, compromised_set=st.session_state.compromised,
+                               current_node=st.session_state.current_anim_node, show_honeypot=show_honeypot if 'show_honeypot' in locals() else True,
+                               new_exposure_edges=st.session_state.get("new_exposure_edges"),
+                               edge_filter=topo_edge_filter, layout_mode=topo_layout)
+    with graph_placeholder:
+        st.components.v1.html(html_graph, height=590, scrolling=False)
 
-    with col_sim_results:
-        if st.session_state.simulation_done:
+    st.markdown("""
+    <div style='display:flex;gap:12px;font-family:Share Tech Mono,monospace;font-size:0.62rem;margin-top:8px;margin-bottom:16px;flex-wrap:wrap;background:#050a0f;padding:8px 10px;border:1px solid #1a3a5c;border-radius:4px;'>
+        <span><span style='color:#00d4ff'>■</span> ASSET</span>
+        <span><span style='color:#ff3355'>■</span> COMPROMISED</span>
+        <span><span style='color:#ff8c00'>■</span> ACTIVE ATTACK</span>
+        <span><span style='color:#00ff88'>■</span> ISOLATED</span>
+        <span><span style='color:#ffd700'>★</span> HONEYPOT</span>
+        <span><span style='color:#ff3355'>➔</span> ATTACK VECTOR</span>
+        <span><span style='color:#ff8c00'>┄➔</span> ATTACK FRONTIER</span>
+        <span><span style='color:#ffd700'>➔</span> NEW EXPOSURE</span>
+        <span><span style='color:#00d4ff'>➔</span> CORE INFRA</span>
+        <span><span style='color:#2d5f8c'>➔</span> LATERAL PATH</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.session_state.simulation_done:
+        col_sim_blast, col_sim_timeline = st.columns([1.0, 1.0], gap="large")
+
+        with col_sim_blast:
             st.markdown('<div class="section-header">📊 SIMULATED BLAST RADIUS</div>', unsafe_allow_html=True)
             rs = st.session_state.risk_score
             bd = st.session_state.blast_details
@@ -4842,10 +5170,12 @@ with tab_sim_map:
                             unsafe_allow_html=True,
                         )
 
+        with col_sim_timeline:
             st.markdown('<div class="section-header">⏱ SIMULATED ATTACK TIMELINE</div>', unsafe_allow_html=True)
             ts_groups = {}
             for entry in st.session_state.timeline:
                 ts_groups.setdefault(entry["timestep"], []).append(entry)
+            st.markdown("<div style='max-height: 480px; overflow-y: auto; padding-right: 4px;'>", unsafe_allow_html=True)
             for t, entries in sorted(ts_groups.items()):
                 for entry in entries:
                     is_success = entry["success"]
@@ -4875,21 +5205,22 @@ with tab_sim_map:
                         f"</div>"
                     )
                     st.markdown(card_html, unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div style='background:#0a1520;border:1px solid #1a3a5c;border-left:3px solid #00d4ff;
-                 padding:24px;font-family:Share Tech Mono;font-size:0.78rem;line-height:2;
-                 text-align:center;margin-top:16px'>
-                <div style='color:#00d4ff;font-size:0.95rem;font-family:Orbitron,monospace;letter-spacing:3px;margin-bottom:12px'>
-                    READY TO SIMULATE ATTACK
-                </div>
-                <div style='color:#7ab8d4'>
-                    1. Select an <b>Attacker Foothold / Entry Point</b> in the controls above.<br>
-                    2. Click <b>▶ RUN SIMULATION</b> to model lateral movement.<br>
-                    3. The map on the left will immediately highlight compromised routes (red/orange) and the timeline will populate here with MITRE ATT&CK techniques.
-                </div>
+            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style='background:#0a1520;border:1px solid #1a3a5c;border-left:3px solid #00d4ff;
+             padding:24px;font-family:Share Tech Mono;font-size:0.78rem;line-height:2;
+             text-align:center;margin-top:16px'>
+            <div style='color:#00d4ff;font-size:0.95rem;font-family:Orbitron,monospace;letter-spacing:3px;margin-bottom:12px'>
+                READY TO SIMULATE ATTACK
             </div>
-            """, unsafe_allow_html=True)
+            <div style='color:#7ab8d4'>
+                1. Select an <b>Attacker Foothold / Entry Point</b> in the controls above.<br>
+                2. Click <b>▶ RUN SIMULATION</b> to model lateral movement.<br>
+                3. The map above will highlight compromised routes (red/orange) and the timeline will populate below with MITRE ATT&CK techniques.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     if st.session_state.simulation_done:
         st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
