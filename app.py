@@ -114,6 +114,8 @@ from core import change_detector, honeypot_engine, vuln_dedup
 # existing `from data import database` above — the two modules serve
 # different purposes and both stay active side by side.
 from core import database as monitor_db
+from core.database import generate_asset_id
+from core.network_discovery import detect_network_environment, parse_target_ips
 
 # Sprint 2 — Dynamic Risk Intelligence: graph-topology network exposure
 # scoring (Phase 2/3) and the real-time alert engine (Phase 7). Both are
@@ -124,6 +126,18 @@ from core import network_exposure, alert_engine
 # Sprint 3 — Phase 7: shared rotating-file + console logger (core/acds_logging.py).
 from core.acds_logging import get_logger
 acds_log = get_logger("app")
+
+# Level 2 — Real-Time Defensive Validation Engine (core/live_validation.py)
+from core import live_validation
+from core.live_validation import (
+    validate_host_reachability,
+    validate_tcp_port,
+    validate_service_banner,
+    validate_asset_state,
+    validate_multiple_assets,
+    diff_validation_against_discovery,
+)
+from core import device_fingerprinting
 
 try:
     import requests
@@ -1057,93 +1071,24 @@ def detection_confidence_label(source, has_exact_version):
 # ─────────────────────────────────────────────────────────────────
 
 def get_local_ip():
-    """Detect the local machine's subnet for scanning."""
-    system = platform.system()
-
-    if system == "Windows":
-        try:
-            result = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True, timeout=5)
-            output = result.stdout
-            lines = output.split('\n')
-            adapters, current_adapter = {}, None
-            for line in lines:
-                line = line.strip()
-                if 'adapter' in line and ':' in line:
-                    current_adapter = line
-                    adapters[current_adapter] = {'ipv4': None, 'gateway': False}
-                elif current_adapter:
-                    if 'Media State' in line and 'disconnected' in line.lower():
-                        adapters[current_adapter]['ipv4'] = None
-                        adapters[current_adapter]['gateway'] = False
-                    elif 'IPv4 Address' in line or 'ipv4' in line:
-                        parts = line.split(':')
-                        if len(parts) > 1:
-                            ip = parts[-1].strip().split('(')[0].strip()
-                            adapters[current_adapter]['ipv4'] = ip
-                    elif 'Default Gateway' in line:
-                        gateway = line.split(':')[-1].strip()
-                        if gateway and gateway != '(none)':
-                            adapters[current_adapter]['gateway'] = True
-            all_ips = [(d['ipv4'], d['gateway'], a) for a, d in adapters.items() if d['ipv4']]
-            all_ips.sort(key=lambda x: x[1], reverse=True)
-            for ip, has_gw, adapter in all_ips:
-                if not any(vm in ip for vm in ['192.168.93.', '192.168.193.', '10.0.0.']):
-                    octets = ip.split('.')
-                    if len(octets) == 4:
-                        return f"{octets[0]}.{octets[1]}.{octets[2]}."
-            if all_ips:
-                octets = all_ips[0][0].split('.')
-                if len(octets) == 4:
-                    return f"{octets[0]}.{octets[1]}.{octets[2]}."
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-    else:
-        try:
-            result = subprocess.run(
-                ["ifconfig" if system == "Darwin" else "ip", "addr", "show"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.split('\n'):
-                if 'inet ' in line and '127.0.0.1' not in line:
-                    for part in line.split():
-                        if '.' in part and part.count('.') == 3:
-                            octets = part.split('.')
-                            if len(octets) == 4:
-                                return f"{octets[0]}.{octets[1]}.{octets[2]}."
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-    return "192.168.1."
+    """Dynamically detect the local machine's base IP prefix for scanning."""
+    env = detect_network_environment()
+    return env.get('base_ip_prefix') or "192.168.1."
 
 
 def get_local_system_context():
-    """Identify the scanning machine's own IP, hostname and OS.
-
-    This is cross-platform (Darwin/macOS, Linux, Windows) and is used as
-    ONE piece of supporting evidence in infer_os_type() — if a discovered
-    IP during a scan turns out to be this same machine, that is very
-    strong (but not automatically 100%) evidence of its OS. Nothing here
-    sends network traffic other than a UDP socket "connect" used purely
-    to ask the OS which local interface would be used to reach the
-    internet — no packets are actually transmitted by that call.
-    """
-    system = platform.system()
-    local_os = {'Darwin': 'macos', 'Windows': 'windows', 'Linux': 'linux'}.get(system, 'unknown')
-
-    local_ip = None
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(1)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-    except OSError:
-        local_ip = None
-
-    try:
-        local_hostname = socket.gethostname()
-    except OSError:
-        local_hostname = None
-
-    return {'os': local_os, 'ip': local_ip, 'hostname': local_hostname, 'system': system}
+    """Identify the scanning machine's own IP, hostname, OS and network environment dynamically."""
+    env = detect_network_environment()
+    return {
+        'os': env.get('os', 'unknown'),
+        'ip': env.get('controller_ip'),
+        'hostname': env.get('controller_hostname'),
+        'system': env.get('system', platform.system()),
+        'adapter_name': env.get('adapter_name'),
+        'subnet_cidr': env.get('subnet_cidr'),
+        'gateway_ip': env.get('gateway_ip'),
+        'netmask': env.get('netmask')
+    }
 
 
 def _clean_hostname(name, ip):
@@ -1301,17 +1246,14 @@ _WINDOWS_HOSTNAME_HINTS = (
 
 
 def infer_os_type(ip, ttl, hostname, mac, mac_vendor_, services,
-                   banner_map=None, local_system_context=None):
+                   banner_map=None, local_system_context=None, protocol_hints=None):
     """Evidence-based OS inference (Priority 2).
 
     TTL is only ever ONE of several supporting signals — it is never
     treated as decisive on its own. macOS and Linux both commonly reply
-    with TTL 64, so TTL alone cannot separate them (this was the root
-    cause of Macs being reported as Linux). Instead, every available
-    signal — TTL, MAC vendor, hostname, exposed services, service
-    banners, and (when the discovered IP is the scanning machine itself)
-    local system identity — contributes weighted evidence toward one of
-    'macos', 'linux', 'windows', or 'unknown'.
+    with TTL 64, so TTL alone cannot separate them. Signals include:
+    TTL, MAC vendor/LAA, hostname, protocol discovery (mDNS, NetBIOS, SSDP),
+    exposed services, service banners, and local system identity.
 
     Returns:
         {
@@ -1331,20 +1273,36 @@ def infer_os_type(ip, ttl, hostname, mac, mac_vendor_, services,
         scores[os_name] += weight
         evidence[os_name].append(reason)
 
-    # 1) Local machine identity — only fires for the scanner's own host,
-    #    and only ever contributes evidence, never an unconditional 100%,
-    #    because the scanner may itself run inside a VM/container later.
+    # 1) Local machine identity
     if local_system_context and local_system_context.get('ip') and ip == local_system_context['ip']:
         local_os = local_system_context.get('os')
         if local_os in scores:
             add(local_os, 0.90, "This IP matches the scanning machine's own local IP")
 
-    # 2) MAC vendor (OUI) — explicit Apple-vendor evidence (Priority 2:
-    #    "Improve Apple vendor/OUI detection where appropriate").
-    if mac_vendor_ == 'Apple' or is_apple_vendor(mac):
+    # 2) Real-Time Protocol Discovery Probes (NetBIOS, mDNS, SSDP)
+    if protocol_hints:
+        if protocol_hints.get('netbios', {}).get('success'):
+            add('windows', 0.55, "NetBIOS Name Service query confirmed Windows host stack")
+        if protocol_hints.get('mdns', {}).get('is_apple'):
+            add('macos', 0.55, "mDNS service discovery confirmed Apple device signature")
+        if protocol_hints.get('mdns', {}).get('is_android_cast'):
+            add('linux', 0.45, "mDNS service discovery confirmed Google Cast / Android stack")
+        if protocol_hints.get('ssdp', {}).get('device_type') == 'Windows Host':
+            add('windows', 0.45, "UPnP/SSDP device announcement indicated Windows")
+        elif protocol_hints.get('ssdp', {}).get('device_type') in ('Android Device', 'Linux Host'):
+            add('linux', 0.45, "UPnP/SSDP device announcement indicated Android/Linux")
+        elif protocol_hints.get('ssdp', {}).get('device_type') == 'Apple Device':
+            add('macos', 0.45, "UPnP/SSDP device announcement indicated Apple/Darwin")
+
+    # 3) MAC vendor (OUI) — extended vendor resolution
+    mac_vendor_resolved = mac_vendor_
+    if not mac_vendor_resolved and mac:
+        mac_vendor_resolved = device_fingerprinting.resolve_mac_vendor_extended(mac).get('vendor')
+
+    if mac_vendor_resolved == 'Apple' or is_apple_vendor(mac):
         add('macos', 0.30, "Apple MAC vendor (also used by iPhone/iPad — cross-checked against hostname/services)")
 
-    # 3) Hostname patterns
+    # 4) Hostname patterns
     if any(h in hl for h in _MACOS_HOSTNAME_HINTS):
         add('macos', 0.35, "Hostname resembles a macOS device")
     if any(h in hl for h in _LINUX_HOSTNAME_HINTS):
@@ -1352,16 +1310,13 @@ def infer_os_type(ip, ttl, hostname, mac, mac_vendor_, services,
     if any(h in hl for h in _WINDOWS_HOSTNAME_HINTS):
         add('windows', 0.25, "Hostname resembles a Windows device")
 
-    # 4) Service exposure fingerprints
+    # 5) Service exposure fingerprints
     if any(s in services for s in ('SMB', 'RDP')):
         add('windows', 0.30, "SMB/RDP exposed — Windows-specific services")
     if 'NetBIOS' in services:
         add('windows', 0.10, "NetBIOS exposed — common on Windows")
 
-    # 5) Service banner fingerprints (passive banners already grabbed
-    #    elsewhere in the pipeline — no extra probing here). Generic
-    #    OpenSSH must NOT automatically favor Linux over macOS (Priority
-    #    2) — it contributes equally small evidence to both.
+    # 6) Service banner fingerprints
     ssh_banner = banner_map.get('SSH') or ''
     if ssh_banner:
         if re.search(r'ubuntu|debian', ssh_banner, re.IGNORECASE):
@@ -1380,9 +1335,7 @@ def infer_os_type(ip, ttl, hostname, mac, mac_vendor_, services,
             add('macos', 0.05, "HTTP server banner reports generic Unix (compatible with macOS, not decisive)")
             add('linux', 0.05, "HTTP server banner reports generic Unix (compatible with Linux, not decisive)")
 
-    # 6) TTL — SUPPORTING EVIDENCE ONLY. Windows' ~128 TTL is fairly
-    #    distinctive, but the ~64 band is shared by both macOS and Linux,
-    #    so it can only nudge the score, never decide macOS vs Linux.
+    # 7) TTL — SUPPORTING EVIDENCE ONLY.
     if ttl is not None:
         if 110 <= ttl <= 130:
             add('windows', 0.20, f"TTL {ttl} is consistent with Windows (supporting evidence only)")
@@ -1397,10 +1350,6 @@ def infer_os_type(ip, ttl, hostname, mac, mac_vendor_, services,
         return {'os': 'unknown', 'confidence': 0.0,
                 'evidence': ['No distinguishing OS evidence was collected for this host']}
 
-    # If two or more OSes are genuinely tied at the top score (e.g. TTL 64
-    # alone, with no other signal to separate Linux from macOS), do not
-    # arbitrarily pick one — report 'unknown' rather than a coin-flip
-    # 'linux' the way the old TTL-only classifier effectively did.
     tied = [os_name for os_name, sc in scores.items() if sc == best_score]
     if len(tied) > 1:
         combined_evidence = []
@@ -1479,19 +1428,27 @@ def is_tablet_device(hostname):
     return any(p in hl for p in ['ipad', 'tablet', 'tab-', 'tab_', 'sm-t', 'sm-x', 'lenovo tab', 'surface'])
 
 
-def is_mobile_device(hostname, ip, mac=None):
+def is_mobile_device(hostname, ip, mac=None, protocol_hints=None):
     """
-    Real mobile detection: combine MAC-vendor lookup (most reliable, works
-    even with no/generic hostname) with hostname pattern matching.
+    Real mobile detection: combine real-time protocol probing (mDNS, SSDP),
+    MAC-vendor lookup, LAA privacy MAC recognition, and hostname pattern matching.
     """
     if is_tablet_device(hostname):
         return True
 
+    if protocol_hints:
+        if protocol_hints.get("is_mobile") or protocol_hints.get("mdns", {}).get("is_apple") or protocol_hints.get("mdns", {}).get("is_android_cast"):
+            return True
+
     vendor = mac_vendor(mac)
-    if vendor in PHONE_VENDORS:
-        # Apple vendor MACs can be laptops too — only trust this alone if
-        # the hostname doesn't look like a Mac/computer; otherwise let the
-        # hostname check below confirm it.
+    if not vendor and mac:
+        ext = device_fingerprinting.resolve_mac_vendor_extended(mac)
+        vendor = ext.get("vendor")
+        if ext.get("is_randomized"):
+            # Privacy MAC typical of smartphones on Wi-Fi
+            return True
+
+    if vendor in PHONE_VENDORS or (mac and device_fingerprinting.resolve_mac_vendor_extended(mac).get("vendor") in PHONE_VENDORS):
         if vendor != 'Apple':
             return True
         if hostname and any(w in hostname.lower() for w in ['macbook', 'imac', 'mac-mini', 'mac-pro']):
@@ -1499,7 +1456,7 @@ def is_mobile_device(hostname, ip, mac=None):
         if hostname and ('iphone' in hostname.lower() or 'ipad' in hostname.lower()):
             return True
         if not hostname:
-            return True  # unnamed Apple device on LAN — treat as phone/tablet by default, flagged for review
+            return True
 
     if not hostname:
         return False
@@ -1521,83 +1478,92 @@ def is_mobile_device(hostname, ip, mac=None):
     return False
 
 
-def classify_device(hostname, os_type, os_confidence, is_mobile, services, open_ports, mac=None):
+def classify_device(hostname, os_type, os_confidence, is_mobile, services, open_ports, mac=None, protocol_hints=None):
     """Evidence-based device classification (Priority 3).
 
     Returns an "Inferred Device Type" rather than an absolute claim, with
-    a confidence score and the concrete evidence used, so a Mac with SSH
-    open is never silently reported as a Linux server.
+    a confidence score and the concrete evidence used.
     """
     services = services or []
     open_ports = open_ports or []
     hl = (hostname or '').lower()
     evidence = []
 
+    # Check for randomized privacy MAC
+    is_rand_mac = device_fingerprinting.is_randomized_mac(mac) if mac else False
+    if is_rand_mac:
+        evidence.append("Randomized/Private MAC detected (IEEE LAA — typical of iOS/Android/Windows 11 Wi-Fi privacy)")
+
+    if protocol_hints and protocol_hints.get("evidence"):
+        evidence.extend(protocol_hints["evidence"])
+
     if is_tablet_device(hostname):
         return {'device_type': 'Tablet', 'confidence': 0.75,
                 'evidence': ['Hostname matches known tablet naming pattern (e.g. iPad/tablet/Surface)']}
 
     if is_mobile:
-        vendor = mac_vendor(mac)
-        ev = ['Hostname or MAC vendor matches a known mobile-phone pattern']
-        if vendor:
+        vendor_info = device_fingerprinting.resolve_mac_vendor_extended(mac)
+        vendor = vendor_info.get("vendor")
+        ev = ['Device identified as mobile via protocol/MAC/hostname patterns']
+        if vendor and not is_rand_mac:
             ev.append(f"MAC vendor resolved to {vendor}")
-        return {'device_type': 'Mobile Device', 'confidence': 0.70 if vendor else 0.55, 'evidence': ev}
+        elif is_rand_mac:
+            ev.append("Randomized Private MAC address active (typical of mobile Wi-Fi privacy)")
+        if protocol_hints and protocol_hints.get("device_hint"):
+            ev.append(protocol_hints["device_hint"])
+        return {'device_type': 'Mobile Device', 'confidence': 0.75 if (vendor or is_rand_mac) else 0.55, 'evidence': ev + evidence}
 
     if any(h in hl for h in ['router', 'gateway', 'modem', 'ap-', 'wifi', 'fritz', 'tplink', 'netgear', 'asus']):
         return {'device_type': 'Network Device', 'confidence': 0.65,
-                'evidence': ['Hostname matches known router/gateway/AP naming pattern']}
+                'evidence': ['Hostname matches known router/gateway/AP naming pattern'] + evidence}
 
     db_services = [s for s in services if s in ('MySQL', 'PostgreSQL', 'MongoDB', 'Redis')]
     if db_services:
         db_ports = [p for p in open_ports if PORT_SERVICE_MAP.get(p) in db_services]
-        evidence = [f"{s} detected" for s in db_services] + [f"Port {p} exposed" for p in db_ports]
-        return {'device_type': 'Database Server', 'confidence': 0.90, 'evidence': evidence}
+        ev = [f"{s} detected" for s in db_services] + [f"Port {p} exposed" for p in db_ports]
+        return {'device_type': 'Database Server', 'confidence': 0.90, 'evidence': ev + evidence}
 
     web_services = [s for s in services if s in ('HTTP', 'HTTPS', 'HTTP-Alt', 'HTTPS-Alt')]
     if web_services and os_type != 'macos':
-        evidence = [f"{s} service detected" for s in web_services]
-        return {'device_type': 'Web Server', 'confidence': 0.65, 'evidence': evidence}
+        ev = [f"{s} service detected" for s in web_services]
+        return {'device_type': 'Web Server', 'confidence': 0.65, 'evidence': ev + evidence}
 
-    # macOS host: never label as a "Linux Server" merely because SSH is
-    # open (Priority 3's explicit example). macOS evidence dominates once
-    # os_type == 'macos', regardless of which remote-access service is up.
     if os_type == 'macos':
-        evidence = ['OS inferred as macOS']
+        ev = ['OS inferred as macOS']
         if any(s in services for s in ('SSH', 'HTTP', 'HTTPS')):
-            evidence.append('Remote-access/web service open, but service alone does not override OS evidence')
+            ev.append('Remote-access/web service open, but service alone does not override OS evidence')
         return {'device_type': 'Mac Computer', 'confidence': round(min(0.95, 0.5 + os_confidence * 0.4), 2),
-                'evidence': evidence}
+                'evidence': ev + evidence}
 
     if os_type == 'windows':
-        evidence = ['OS inferred as Windows']
+        ev = ['OS inferred as Windows']
         if any(s in services for s in ('SMB', 'RDP')):
-            evidence.append('SMB/RDP service present (common on Windows workstations/servers)')
+            ev.append('SMB/RDP service present (common on Windows workstations/servers)')
         role_guess = 'Windows Server' if any(s in services for s in ('HTTP', 'HTTPS', 'DNS')) else 'Windows Workstation'
         return {'device_type': role_guess, 'confidence': round(min(0.9, 0.45 + os_confidence * 0.4), 2),
-                'evidence': evidence}
+                'evidence': ev + evidence}
 
     if os_type == 'linux':
-        evidence = ['OS inferred as Linux']
+        ev = ['OS inferred as Linux']
         role_guess = 'Linux Server' if any(s in services for s in ('SSH', 'HTTP', 'HTTPS', 'DNS', 'SMB')) else 'Linux Workstation'
         if role_guess == 'Linux Server':
-            evidence.append('Server-type service exposed (SSH/HTTP/DNS/SMB)')
+            ev.append('Server-type service exposed (SSH/HTTP/DNS/SMB)')
         return {'device_type': role_guess, 'confidence': round(min(0.9, 0.45 + os_confidence * 0.4), 2),
-                'evidence': evidence}
+                'evidence': ev + evidence}
 
     if services:
         return {'device_type': 'Unknown', 'confidence': 0.25,
-                'evidence': [f"Services detected ({', '.join(services[:3])}) but OS evidence was insufficient to classify further"]}
+                'evidence': [f"Services detected ({', '.join(services[:3])}) but OS evidence was insufficient to classify further"] + evidence}
 
     return {'device_type': 'Unknown', 'confidence': 0.10,
-            'evidence': ['No OS or service evidence collected for this host']}
+            'evidence': ['No OS or service evidence collected for this host'] + evidence}
 
 
-def identify_device_type(hostname, os_type, is_mobile, services, mac=None):
+def identify_device_type(hostname, os_type, is_mobile, services, mac=None, protocol_hints=None):
     """Backward-compatible thin wrapper returning just the label string
     (kept because several call sites only need the label). New code
     should call classify_device() directly for confidence + evidence."""
-    return classify_device(hostname, os_type, 0.5, is_mobile, services, [], mac)['device_type']
+    return classify_device(hostname, os_type, 0.5, is_mobile, services, [], mac, protocol_hints=protocol_hints)['device_type']
 
 
 def calculate_criticality(device_type, services, open_ports, os_type):
@@ -2051,26 +2017,26 @@ def validate_scan_scope(base_ip, limit):
     return True, None
 
 
-def scan_network(base_ip=None, limit=254, progress_cb=None):
+def scan_network(base_ip=None, limit=254, target_ips=None, progress_cb=None):
     """
     Full discovery pipeline: ping sweep -> ARP/MAC -> hostname -> port scan
-    -> banner grab -> per-host record. progress_cb(done, total) is called
-    as hosts are enriched, for a live progress bar in the UI.
-
-    Also returns a scan_timeline (Priority 20): a flat, time-ordered list
-    of the ACTUAL operations performed (ping, host discovery, ports,
-    banner, NVD lookup, risk calculated). No synthetic/fake events are
-    ever appended — only operations this function truly executed.
+    -> banner grab -> per-host record. Supports both dynamic subnet sweep and
+    explicit target lists/ranges/CIDRs.
     """
-    if base_ip is None:
-        base_ip = get_local_ip()
+    if target_ips:
+        ips = list(target_ips)
+        subnet_prefix = ips[0].rsplit('.', 1)[0] if ips else "192.168.1"
+        target_desc = f"{len(ips)} target(s)"
+    else:
+        if base_ip is None:
+            base_ip = get_local_ip()
+        subnet_prefix = base_ip.rstrip('.')
+        ips = [f"{base_ip}{i}" for i in range(1, limit + 1)]
+        target_desc = f"{base_ip}0/{limit}"
 
     system = platform.system()
-    subnet_prefix = base_ip.rstrip('.')
-    ips = [f"{base_ip}{i}" for i in range(1, limit + 1)]
-
     timeline = []
-    timeline.append({'timestamp': _now_stamp(), 'event': 'Ping sweep started', 'target': f"{base_ip}0/{limit}", 'status': 'Running'})
+    timeline.append({'timestamp': _now_stamp(), 'event': 'Ping sweep started', 'target': target_desc, 'status': 'Running'})
 
     ping_results = {}
     with ThreadPoolExecutor(max_workers=50) as executor:
@@ -2084,7 +2050,11 @@ def scan_network(base_ip=None, limit=254, progress_cb=None):
 
     arp_map = read_arp_map(subnet_prefix)
     timeline.append({'timestamp': _now_stamp(), 'event': 'ARP table read', 'target': f"{len(arp_map)} entr(y/ies)", 'status': 'Completed'})
-    candidate_ips = {ip for ip in (set(ping_results) | set(arp_map)) if ip_in_subnet(ip, base_ip)}
+    
+    if target_ips:
+        candidate_ips = set(target_ips)
+    else:
+        candidate_ips = {ip for ip in (set(ping_results) | set(arp_map)) if ip_in_subnet(ip, base_ip)}
 
     total = len(candidate_ips)
 
@@ -2127,26 +2097,38 @@ def scan_network(base_ip=None, limit=254, progress_cb=None):
             if services:
                 host_events.append({'timestamp': _now_stamp(), 'event': 'Banners retrieved', 'target': ', '.join(services), 'status': 'Completed'})
 
-        # OS is inferred AFTER services/banners are collected, so banner
-        # evidence (e.g. an SSH banner naming "Ubuntu") can be used. TTL
-        # alone is never decisive — see infer_os_type().
+        # Real-time protocol device fingerprinting (mDNS, NetBIOS, SSDP, LAA MAC)
+        try:
+            proto_fp = device_fingerprinting.fingerprint_asset_realtime(ip, mac=mac, current_hostname=hostname, open_ports=open_ports, services=services)
+            if proto_fp.get("resolved_hostname") and (not hostname or hostname == "Unknown" or hostname == ip):
+                hostname = proto_fp["resolved_hostname"]
+                host_events.append({'timestamp': _now_stamp(), 'event': 'Protocol discovery hostname', 'target': hostname, 'status': 'Discovered'})
+            if proto_fp.get("mac_vendor") and not vendor:
+                vendor = proto_fp["mac_vendor"]
+        except Exception:
+            proto_fp = None
+
+        # OS is inferred AFTER services/banners & protocol fingerprints are collected
         try:
             os_result = infer_os_type(ip, ttl, hostname, mac, vendor, services,
-                                       banner_map=banner_map, local_system_context=local_ctx)
+                                       banner_map=banner_map, local_system_context=local_ctx,
+                                       protocol_hints=proto_fp)
         except Exception as exc:
             os_result = {'os': 'unknown', 'confidence': 0.0, 'evidence': [f'OS inference failed: {type(exc).__name__}']}
         host_events.append({'timestamp': _now_stamp(), 'event': 'OS inferred', 'target': f"{os_result['os']} ({int(os_result['confidence']*100)}%)", 'status': 'Completed'})
 
-        is_mobile = is_mobile_device(hostname, ip, mac)
-        device_result = classify_device(hostname, os_result['os'], os_result['confidence'], is_mobile, services, open_ports, mac)
+        is_mobile = is_mobile_device(hostname, ip, mac, protocol_hints=proto_fp)
+        device_result = classify_device(hostname, os_result['os'], os_result['confidence'], is_mobile, services, open_ports, mac, protocol_hints=proto_fp)
         host_events.append({'timestamp': _now_stamp(), 'event': 'Asset classified', 'target': device_result['device_type'], 'status': 'Completed'})
         display_name = format_device_display_name(hostname, device_result['device_type'], ip)
+        asset_id = generate_asset_id(mac, ip, hostname, vendor, os_result['os'])
 
         for svc in services:
             if version_map.get(svc):
                 host_events.append({'timestamp': _now_stamp(), 'event': 'NVD lookup completed', 'target': f"{svc} {version_map.get(svc)}", 'status': 'Completed'})
 
         return {
+            'asset_id': asset_id,
             'hostname': hostname, 'os': os_result['os'],
             'os_confidence': os_result['confidence'], 'os_evidence': os_result['evidence'],
             'is_mobile': is_mobile, 'mac': mac,
@@ -2183,19 +2165,135 @@ def scan_network(base_ip=None, limit=254, progress_cb=None):
     ordered = [
         (ip, d['hostname'], d['os'], d['os_confidence'], d['os_evidence'], d['is_mobile'],
          d['mac'], d['mac_vendor'], d['open_ports'], d['services'], d['version_map'],
-         d['banner_map'], d['device_type'], d['display_name'], d['device_confidence'], d['device_evidence'])
+         d['banner_map'], d['device_type'], d['display_name'], d['device_confidence'], d['device_evidence'],
+         d.get('asset_id', generate_asset_id(d['mac'], ip, d['hostname'], d['mac_vendor'], d['os'])))
         for ip, d in sorted(devices.items(), key=lambda item: tuple(map(int, item[0].split('.'))))
     ]
     return ordered, timeline
 
 
+def profile_single_target(target_ip):
+    """
+    Fast discovery and profiling for an explicitly selected target IP.
+    Reuses the real observation pipeline: ICMP ping, ARP/MAC lookup,
+    hostname resolution, native socket port probing, banner grabbing,
+    OS inference, and device classification.
+    """
+    system = platform.system()
+    timeline = []
+    timeline.append({'timestamp': _now_stamp(), 'event': 'Direct probe initiated', 'target': target_ip, 'status': 'Running'})
+
+    # 1. ICMP Ping Probe
+    _, is_alive, ttl = ping_ip(target_ip, system)
+    timeline.append({'timestamp': _now_stamp(), 'event': 'ICMP Ping Probe', 'target': target_ip,
+                     'status': f'Alive (TTL={ttl})' if is_alive else 'No Ping Response (proceeding to ARP/TCP probe)'})
+
+    # 2. ARP / MAC Resolution
+    subnet_prefix = target_ip.rsplit('.', 1)[0]
+    arp_map = read_arp_map(subnet_prefix)
+    mac = arp_map.get(target_ip)
+    if not mac and system == "Windows":
+        mac = lookup_mac_windows(target_ip)
+    if mac:
+        timeline.append({'timestamp': _now_stamp(), 'event': 'ARP/MAC resolved', 'target': f"{target_ip} ({mac})", 'status': 'Resolved'})
+
+    hostname = resolve_hostname(target_ip)
+    vendor = mac_vendor(mac)
+    local_ctx = get_local_system_context()
+
+    # 3. Safe TCP Port Probing
+    try:
+        open_ports = scan_ports(target_ip, SCAN_PORTS, timeout=SCAN_TIMEOUT_SECONDS)
+    except Exception as exc:
+        open_ports = []
+        timeline.append({'timestamp': _now_stamp(), 'event': 'Port scan failed', 'target': target_ip, 'status': f'Unavailable ({type(exc).__name__})'})
+    else:
+        timeline.append({'timestamp': _now_stamp(), 'event': 'Ports probed',
+                         'target': ', '.join(str(p) for p in open_ports) if open_ports else 'None open on tested list',
+                         'status': 'Completed'})
+
+    # 4. Service Identification & Banner Grabbing
+    try:
+        services, version_map, banner_map = detect_services_and_versions(target_ip, open_ports)
+    except Exception as exc:
+        services, version_map, banner_map = [], {}, {}
+        timeline.append({'timestamp': _now_stamp(), 'event': 'Banner grab failed', 'target': target_ip, 'status': f'Unavailable ({type(exc).__name__})'})
+    else:
+        if services:
+            timeline.append({'timestamp': _now_stamp(), 'event': 'Banners retrieved', 'target': ', '.join(services), 'status': 'Completed'})
+
+    # Real-time protocol device fingerprinting (mDNS, NetBIOS, SSDP, LAA MAC)
+    try:
+        proto_fp = device_fingerprinting.fingerprint_asset_realtime(target_ip, mac=mac, current_hostname=hostname, open_ports=open_ports, services=services)
+        if proto_fp.get("resolved_hostname") and (not hostname or hostname == "Unknown" or hostname == target_ip):
+            hostname = proto_fp["resolved_hostname"]
+            timeline.append({'timestamp': _now_stamp(), 'event': 'Protocol discovery hostname', 'target': hostname, 'status': 'Discovered'})
+        if proto_fp.get("mac_vendor") and not vendor:
+            vendor = proto_fp["mac_vendor"]
+    except Exception:
+        proto_fp = None
+
+    # 5. Contextual OS Inference & Device Classification
+    try:
+        os_result = infer_os_type(target_ip, ttl, hostname, mac, vendor, services,
+                                   banner_map=banner_map, local_system_context=local_ctx,
+                                   protocol_hints=proto_fp)
+    except Exception as exc:
+        os_result = {'os': 'unknown', 'confidence': 0.0, 'evidence': [f'OS inference failed: {type(exc).__name__}']}
+    timeline.append({'timestamp': _now_stamp(), 'event': 'OS inferred', 'target': f"{os_result['os']} ({int(os_result['confidence']*100)}%)", 'status': 'Completed'})
+
+    is_mobile = is_mobile_device(hostname, target_ip, mac, protocol_hints=proto_fp)
+    device_result = classify_device(hostname, os_result['os'], os_result['confidence'], is_mobile, services, open_ports, mac, protocol_hints=proto_fp)
+    display_name = format_device_display_name(hostname, device_result['device_type'], target_ip)
+    asset_id = generate_asset_id(mac, target_ip, hostname, vendor, os_result['os'])
+
+    record = {
+        'asset_id': asset_id,
+        'ip': target_ip, 'hostname': hostname, 'os': os_result['os'],
+        'os_confidence': os_result['confidence'], 'os_evidence': os_result['evidence'],
+        'is_mobile': is_mobile, 'mac': mac, 'mac_vendor': vendor,
+        'open_ports': open_ports, 'services': services,
+        'version_map': version_map, 'banner_map': banner_map,
+        'device_type': device_result['device_type'],
+        'device_confidence': device_result['confidence'],
+        'device_evidence': device_result['evidence'],
+        'display_name': display_name, 'events': timeline,
+        'ttl': ttl,
+    }
+
+    device_tuple = (
+        target_ip, hostname, os_result['os'], os_result['confidence'], os_result['evidence'],
+        is_mobile, mac, vendor, open_ports, services, version_map, banner_map,
+        device_result['device_type'], display_name, device_result['confidence'], device_result['evidence'],
+        asset_id
+    )
+
+    return record, device_tuple
+
+
 def _parse_device_record(device):
-    (ip, hostname, os_type, os_confidence, os_evidence, is_mobile, mac, mac_vendor_,
-     open_ports, services, version_map, banner_map, device_type, display_name,
-     device_confidence, device_evidence) = device
+    if isinstance(device, dict):
+        rec = dict(device)
+        if not rec.get('asset_id'):
+            rec['asset_id'] = generate_asset_id(rec.get('mac'), rec.get('ip'), rec.get('hostname'), rec.get('mac_vendor'), rec.get('os'))
+        if not rec.get('display_name'):
+            rec['display_name'] = format_device_display_name(rec.get('hostname'), rec.get('device_type'), rec.get('ip'))
+        return rec
+
+    if len(device) >= 17:
+        (ip, hostname, os_type, os_confidence, os_evidence, is_mobile, mac, mac_vendor_,
+         open_ports, services, version_map, banner_map, device_type, display_name,
+         device_confidence, device_evidence, asset_id) = device[:17]
+    else:
+        (ip, hostname, os_type, os_confidence, os_evidence, is_mobile, mac, mac_vendor_,
+         open_ports, services, version_map, banner_map, device_type, display_name,
+         device_confidence, device_evidence) = device[:16]
+        asset_id = generate_asset_id(mac, ip, hostname, mac_vendor_, os_type)
+
     if not display_name:
         display_name = format_device_display_name(hostname, device_type, ip)
     return {
+        'asset_id': asset_id,
         'ip': ip, 'hostname': hostname, 'os': os_type,
         'os_confidence': os_confidence, 'os_evidence': os_evidence or [],
         'is_mobile': is_mobile,
@@ -2245,6 +2343,7 @@ def build_dynamic_graph(devices):
         node_names.append(node_name)
         G.add_node(
             node_name,
+            asset_id=rec.get('asset_id'),
             ip=rec['ip'], hostname=rec['hostname'], os=rec['os'],
             os_confidence=rec['os_confidence'], os_evidence=rec['os_evidence'],
             is_mobile=rec['is_mobile'], mac=rec['mac'], mac_vendor=rec['mac_vendor'],
@@ -2376,134 +2475,601 @@ def recompute_node_risk(node_data):
 
 
 # ─────────────────────────────────────────────────────────────────
-# MODULE 2: ATTACK SIMULATION ENGINE (probabilistic — no real exploitation)
+# MODULE 2: DECISION-BASED ATTACK PROPAGATION SIMULATION ENGINE
+# (probabilistic, empirical graph physics — no real exploitation)
 # ─────────────────────────────────────────────────────────────────
 # PRIORITY 26 BOUNDARY: everything below operates ONLY on the in-memory
 # NetworkX graph built from passive scan data. It never sends network
 # traffic, never authenticates anywhere, and never performs real
 # exploitation, credential attacks, or data exfiltration.
 
-def simulate_attack(G, entry_node, seed=42, ids_deployed=False, segmentation_applied=False):
+def simulate_decision_based_propagation(G, entry_node, seed=42, ids_deployed=False, segmentation_applied=False, applied_rules=None, live_validation=None):
+    """
+    Dynamic Decision-Based Attack Propagation Simulator (ACDS Level 2).
+    Combines:
+      1. Real Discovery Observation (discovered topology & services)
+      2. Real-Time Defensive Validation (live TCP port / host reachability)
+      3. Decision-Based Attack Propagation (candidate-by-candidate evaluation)
+
+    Evaluates whether an attack can propagate from a compromised source to neighboring targets based on:
+      - Live Target Reachability (verified non-destructively)
+      - Live Exposed Service / TCP Port Acceptance (verified non-destructively)
+      - Valid Vulnerability (CVE) or Sensitive Access Condition (e.g. SMB, RDP, SSH, DB port) or Honeypot Trap
+      - Defensive Controls (host containment/isolation, firewall ACLs, VLAN segmentation)
+      - Modeled Propagation Probability
+
+    Chaining: Newly compromised assets dynamically become subsequent attack sources.
+    Every evaluated candidate target produces an explicit decision:
+      - ✓ COMPROMISE POSSIBLE (Simulated)
+      - ✗ COMPROMISE NOT POSSIBLE (Simulated)
+      - 🛡 BLOCKED BY DEFENSE (Simulated)
+      - ✗ NO VALID PATH (Simulated)
+    along with exact explanations, MITRE ATT&CK techniques, probability calculations,
+    and clear distinction between Observation, Validation, and Simulation.
+    """
     random.seed(seed)
     timeline = []
+    decision_log = []
     compromised = set()
     priv_escalated = set()
     attack_paths = []
+    successful_paths = []
+    blocked_failed_paths = []
     honeypot_triggered = False
 
     if entry_node not in G.nodes:
-        return timeline, compromised, honeypot_triggered, {}
+        return timeline, decision_log, compromised, set(G.nodes), successful_paths, blocked_failed_paths, {}
 
     entry_data = G.nodes[entry_node]
     compromised.add(entry_node)
     G.nodes[entry_node]["compromised"] = True
+
+    entry_display = entry_data.get("display_name") or entry_node
+    entry_asset_id = entry_data.get("asset_id") or entry_node
+    entry_ip = entry_data.get("ip") or ""
+
+    # Check if entry node was evaluated in live validation
+    entry_val = None
+    if live_validation and isinstance(live_validation, dict):
+        entry_val = live_validation.get(entry_asset_id) or live_validation.get(entry_ip) or live_validation.get(entry_node)
+
+    entry_live_txt = " (Live Validated: ONLINE)" if (entry_val and entry_val.get("reachable")) else ""
+
     timeline.append({
         "node": entry_node, "from_node": None, "timestep": 1,
-        "mitre_code": "T1078", "mitre_desc": "Initial Access — foothold on entry system",
-        "access_vector": "Initial compromise / phishing / stolen credentials",
-        "success": True, "vuln": entry_data["vulnerability"],
-        "criticality": entry_data["criticality"], "ntype": entry_data.get("node_type", "endpoint"),
+        "mitre_code": "T1078", "mitre_desc": "Initial Access — simulated foothold on entry system",
+        "access_vector": f"Simulated initial access on {entry_display}{entry_live_txt}",
+        "success": True, "vuln": entry_data.get("vulnerability", 0.5),
+        "criticality": entry_data.get("criticality", 1), "ntype": entry_data.get("node_type", "endpoint"),
         "priv_esc": False,
     })
     attack_paths.append([entry_node])
 
-    visited = {entry_node}
-    queue = deque([(entry_node, 1, [entry_node])])
+    # Initial Compromise Entry in Decision Log
+    decision_log.append({
+        "step": 1,
+        "source": "EXTERNAL ATTACKER",
+        "source_node": None,
+        "source_id": "EXTERNAL",
+        "target": entry_display,
+        "target_node": entry_node,
+        "target_id": entry_asset_id,
+        "target_ip": entry_ip,
+        "path": f"EXTERNAL → INITIAL FOOTHOLD → {entry_display}",
+        "service": f"{', '.join(entry_data.get('services', [])) or 'Host Access'}",
+        "vulnerability": f"{entry_data.get('cve_findings', [{}])[0].get('cve_id') if entry_data.get('cve_findings') else 'Assumed Foothold'}",
+        "technique": "T1078 — Valid Accounts / Initial Access",
+        "decision": "✓ COMPROMISE POSSIBLE",
+        "probability": "100%",
+        "prob_float": 1.0,
+        "reason": f"✓ Modeled entry point foothold initialized on target asset{entry_live_txt}",
+        "result_status": "SIMULATED COMPROMISED",
+        "is_compromised": True,
+        "live_validated": bool(entry_val),
+        "live_host_reachable": entry_val.get("reachable") if entry_val else None,
+        "live_port_state": "OPEN" if entry_val else None,
+        "live_snapshot_used": not bool(entry_val),
+    })
 
-    # Deployed global defenses (Priority 18/19) reduce lateral-movement
-    # success probability across the whole simulation — this is how
-    # "Deploy IDS/SIEM" and "Network Segmentation" actually change the
-    # re-simulated outcome rather than only being cosmetic.
+    # Active evaluation queue of newly compromised attack sources
+    queue = deque([(entry_node, 1, [entry_node])])
+    step_counter = 2
+
+    # Global defense dampeners
     global_dampener = 1.0
     if ids_deployed:
-        global_dampener *= 0.75   # faster detection/response cuts success odds
+        global_dampener *= 0.75   # faster detection/response cuts lateral success odds
     if segmentation_applied:
-        global_dampener *= 0.55   # VLAN ACLs remove many lateral paths
+        global_dampener *= 0.55   # VLAN ACLs remove or heavily restrict lateral paths
 
     while queue:
-        current_node, timestep, path = queue.popleft()
+        current_node, timestep, current_path = queue.popleft()
         if current_node not in compromised:
             continue
 
-        for neighbor in G.successors(current_node):
-            if neighbor in visited:
-                continue
-            nd = G.nodes[neighbor]
+        src_data = G.nodes[current_node]
+        src_display = src_data.get("display_name") or current_node
+        src_asset_id = src_data.get("asset_id") or current_node
+        src_ip = src_data.get("ip") or ""
 
-            # A node marked isolated by an APPLIED defense action is
-            # modeled as unreachable — this is how "Isolate database"
-            # actually removes it from the blast radius on re-simulation.
-            if nd.get("isolated"):
-                visited.add(neighbor)
-                timeline.append({
-                    "node": neighbor, "from_node": current_node, "timestep": timestep + 1,
-                    "mitre_code": "T1599", "mitre_desc": "Network Boundary Bridging — blocked",
-                    "access_vector": "Blocked by applied isolation/segmentation defense",
-                    "success": False, "vuln": nd["vulnerability"], "criticality": nd["criticality"],
-                    "ntype": nd.get("node_type", "endpoint"), "priv_esc": False,
+        # Candidates: direct successors in graph or all other network assets
+        candidate_targets = [n for n in G.nodes if n != current_node and n not in compromised]
+
+        for target in candidate_targets:
+            if target in compromised:
+                continue
+
+            dst_data = G.nodes[target]
+            dst_display = dst_data.get("display_name") or target
+            dst_asset_id = dst_data.get("asset_id") or target
+            dst_ip = dst_data.get("ip") or ""
+            dst_ntype = dst_data.get("node_type", "endpoint")
+            is_honeypot = (dst_ntype == "honeypot")
+
+            # ─────────────────────────────────────────────────────────────
+            # 0. REAL-TIME DEFENSIVE VALIDATION (LEVEL 2 ENGINE)
+            # ─────────────────────────────────────────────────────────────
+            target_live_val = None
+            if live_validation and isinstance(live_validation, dict):
+                target_live_val = (
+                    live_validation.get(dst_asset_id)
+                    or live_validation.get(dst_ip)
+                    or live_validation.get(target)
+                )
+
+            is_live_validated = target_live_val is not None
+            live_host_reachable = target_live_val.get("reachable") if is_live_validated else None
+            live_ports_map = (target_live_val.get("ports_validated") or target_live_val.get("ports") or {}) if (is_live_validated and target_live_val) else {}
+
+            # If real-time validation explicitly found host to be OFFLINE/UNREACHABLE:
+            if is_live_validated and live_host_reachable is False:
+                decision_log.append({
+                    "step": step_counter,
+                    "source": src_display,
+                    "source_node": current_node,
+                    "source_id": src_asset_id,
+                    "target": dst_display,
+                    "target_node": target,
+                    "target_id": dst_asset_id,
+                    "target_ip": dst_ip,
+                    "path": f"{src_display} ⊘ {dst_display}",
+                    "service": "Host Reachability",
+                    "vulnerability": "N/A (Host Offline)",
+                    "technique": "T1018 — Remote System Discovery [OFFLINE]",
+                    "decision": "✗ NO VALID PATH",
+                    "probability": "0%",
+                    "prob_float": 0.0,
+                    "reason": f"✗ Real-time validation confirms target host {dst_ip} is UNREACHABLE / OFFLINE (validation timestamp: {target_live_val.get('timestamp', 'recent')})",
+                    "result_status": "UNCOMPROMISED",
+                    "is_compromised": False,
+                    "live_validated": True,
+                    "live_host_reachable": False,
+                    "live_port_state": "N/A",
+                    "live_snapshot_used": False,
                 })
+                blocked_failed_paths.append({
+                    "source": src_display, "target": dst_display, "decision": "✗ NO VALID PATH",
+                    "reason": f"Host {dst_ip} is unreachable in real-time validation"
+                })
+                step_counter += 1
                 continue
 
-            edge = G.edges[current_node, neighbor]
-            ntype = nd.get("node_type", "endpoint")
+            # ─────────────────────────────────────────────────────────────
+            # 1. EVALUATE TOPOLOGY REACHABILITY & PATH
+            # ─────────────────────────────────────────────────────────────
+            has_edge = G.has_edge(current_node, target)
+            edge = G.edges[current_node, target] if has_edge else {}
 
-            if ntype == "honeypot":
-                prob = nd["vulnerability"]
-                mitre_code, mitre_desc = "T1003", "OS Credential Dumping [TRAP]"
-                access_vector = edge.get("access_vector", "Honeypot probe")
+            if not has_edge and not dst_data.get("open_ports"):
+                val_note = " (live validated offline)" if (is_live_validated and not live_host_reachable) else " [Using discovery snapshot — live validation not performed]" if not is_live_validated else ""
+                decision_log.append({
+                    "step": step_counter,
+                    "source": src_display,
+                    "source_node": current_node,
+                    "source_id": src_asset_id,
+                    "target": dst_display,
+                    "target_node": target,
+                    "target_id": dst_asset_id,
+                    "target_ip": dst_ip,
+                    "path": f"{src_display} ⊘ {dst_display}",
+                    "service": "None",
+                    "vulnerability": "None",
+                    "technique": "N/A",
+                    "decision": "✗ NO VALID PATH",
+                    "probability": "0%",
+                    "prob_float": 0.0,
+                    "reason": f"No reachable network service or route identified on target asset{val_note}",
+                    "result_status": "UNCOMPROMISED",
+                    "is_compromised": False,
+                    "live_validated": is_live_validated,
+                    "live_host_reachable": live_host_reachable,
+                    "live_port_state": "N/A",
+                    "live_snapshot_used": not is_live_validated,
+                })
+                blocked_failed_paths.append({
+                    "source": src_display, "target": dst_display, "decision": "✗ NO VALID PATH",
+                    "reason": "No reachable network service or route identified"
+                })
+                step_counter += 1
+                continue
+
+            # ─────────────────────────────────────────────────────────────
+            # 2. EVALUATE MODELED DEFENSES (ISOLATION & SEGMENTATION)
+            # ─────────────────────────────────────────────────────────────
+            if dst_data.get("isolated"):
+                decision_log.append({
+                    "step": step_counter,
+                    "source": src_display,
+                    "source_node": current_node,
+                    "source_id": src_asset_id,
+                    "target": dst_display,
+                    "target_node": target,
+                    "target_id": dst_asset_id,
+                    "target_ip": dst_ip,
+                    "path": f"{src_display} ⊘ {dst_display}",
+                    "service": f"{', '.join(dst_data.get('services', [])) or 'Isolated'}",
+                    "vulnerability": "Shielded by Isolation",
+                    "technique": "T1599 — Network Boundary Bridging [BLOCKED]",
+                    "decision": "🛡 BLOCKED",
+                    "probability": "0%",
+                    "prob_float": 0.0,
+                    "reason": "A modeled host isolation defense control prevents any inbound lateral propagation",
+                    "result_status": "UNCOMPROMISED",
+                    "is_compromised": False,
+                    "live_validated": is_live_validated,
+                    "live_host_reachable": live_host_reachable,
+                    "live_port_state": "ISOLATED",
+                    "live_snapshot_used": not is_live_validated,
+                })
+                blocked_failed_paths.append({
+                    "source": src_display, "target": dst_display, "decision": "🛡 BLOCKED",
+                    "reason": "Target isolated by host containment control"
+                })
+                timeline.append({
+                    "node": target, "from_node": current_node, "timestep": timestep + 1,
+                    "mitre_code": "T1599", "mitre_desc": "Network Boundary Bridging — blocked by host isolation",
+                    "access_vector": "Blocked by applied isolation defense control",
+                    "success": False, "vuln": dst_data.get("vulnerability", 0), "criticality": dst_data.get("criticality", 1),
+                    "ntype": dst_ntype, "priv_esc": False,
+                })
+                step_counter += 1
+                continue
+
+            if segmentation_applied and (src_data.get("role") != dst_data.get("role") or dst_data.get("criticality", 1) >= 4):
+                decision_log.append({
+                    "step": step_counter,
+                    "source": src_display,
+                    "source_node": current_node,
+                    "source_id": src_asset_id,
+                    "target": dst_display,
+                    "target_node": target,
+                    "target_id": dst_asset_id,
+                    "target_ip": dst_ip,
+                    "path": f"{src_display} ⊘ {dst_display}",
+                    "service": f"{', '.join(dst_data.get('services', [])) or 'Segmented'}",
+                    "vulnerability": "Segmented by Zone Policy",
+                    "technique": "T1599 — Network Boundary Bridging [BLOCKED]",
+                    "decision": "🛡 BLOCKED",
+                    "probability": "0%",
+                    "prob_float": 0.0,
+                    "reason": "Applied dynamic segmentation blocks lateral movement across security zones",
+                    "result_status": "UNCOMPROMISED",
+                    "is_compromised": False,
+                    "live_validated": is_live_validated,
+                    "live_host_reachable": live_host_reachable,
+                    "live_port_state": "SEGMENTED",
+                    "live_snapshot_used": not is_live_validated,
+                })
+                blocked_failed_paths.append({
+                    "source": src_display, "target": dst_display, "decision": "🛡 BLOCKED",
+                    "reason": "Segmented by zone policy control"
+                })
+                timeline.append({
+                    "node": target, "from_node": current_node, "timestep": timestep + 1,
+                    "mitre_code": "T1599", "mitre_desc": "Network Boundary Bridging — blocked by VLAN segmentation",
+                    "access_vector": "Blocked by applied segmentation defense control",
+                    "success": False, "vuln": dst_data.get("vulnerability", 0), "criticality": dst_data.get("criticality", 1),
+                    "ntype": dst_ntype, "priv_esc": False,
+                })
+                step_counter += 1
+                continue
+
+            # ─────────────────────────────────────────────────────────────
+            # 3. SELECT ACCESS PORT & SERVICE (Observation vs Live Validation)
+            # ─────────────────────────────────────────────────────────────
+            edge_port = edge.get("port")
+            edge_srv = edge.get("service", "TCP")
+            open_ports = dst_data.get("open_ports", [])
+            services = dst_data.get("services", [])
+
+            if edge_port:
+                access_port = edge_port
+                access_service = edge_srv
+            elif open_ports:
+                access_port = open_ports[0]
+                access_service = services[0] if services else f"Port-{access_port}"
             else:
-                prob = min(0.95, edge.get("success_prob", 0.4) * nd["vulnerability"] * global_dampener)
-                if nd["criticality"] >= 4:
-                    prob *= 0.85
-                mitre_code = edge.get("mitre_code", "T1021")
-                mitre_desc = edge.get("mitre_desc", "Lateral Movement")
-                access_vector = edge.get("access_vector", edge.get("connection", "network"))
+                access_port = 80
+                access_service = "HTTP"
 
-            success = random.random() < prob
-            visited.add(neighbor)
+            path_str = f"{src_display} → TCP/{access_port} ({access_service}) → {dst_display}"
+
+            # ── Check Real-Time Live Port State ──
+            live_port_entry = live_ports_map.get(access_port) or live_ports_map.get(str(access_port))
+            live_port_state = None
+            if live_port_entry:
+                if isinstance(live_port_entry, dict):
+                    raw_st = live_port_entry.get("state")
+                    if raw_st is None and "open" in live_port_entry:
+                        raw_st = "open" if live_port_entry["open"] else "closed"
+                    live_port_state = str(raw_st).lower() if raw_st else None
+                elif isinstance(live_port_entry, str):
+                    live_port_state = live_port_entry.lower()
+
+            # If live validation confirms port is CLOSED (e.g. defense applied / service stopped):
+            if live_port_state == "closed":
+                decision_log.append({
+                    "step": step_counter,
+                    "source": src_display,
+                    "source_node": current_node,
+                    "source_id": src_asset_id,
+                    "target": dst_display,
+                    "target_node": target,
+                    "target_id": dst_asset_id,
+                    "target_ip": dst_ip,
+                    "path": path_str,
+                    "service": f"{access_service} (TCP {access_port})",
+                    "vulnerability": "Attack Surface Removed (Port Closed)",
+                    "technique": "T1046 — Network Service Discovery [CLOSED]",
+                    "decision": "✗ COMPROMISE NOT POSSIBLE",
+                    "probability": "0%",
+                    "prob_float": 0.0,
+                    "reason": f"✓ Host reachable (validated live) | ✗ Required port TCP/{access_port} ({access_service}) is CLOSED in real-time validation | ✗ Attack surface no longer exposed",
+                    "result_status": "UNCOMPROMISED",
+                    "is_compromised": False,
+                    "live_validated": True,
+                    "live_host_reachable": True,
+                    "live_port_state": "CLOSED",
+                    "live_snapshot_used": False,
+                })
+                blocked_failed_paths.append({
+                    "source": src_display, "target": dst_display, "decision": "✗ COMPROMISE NOT POSSIBLE",
+                    "reason": f"Required port TCP/{access_port} ({access_service}) verified CLOSED in real-time validation"
+                })
+                timeline.append({
+                    "node": target, "from_node": current_node, "timestep": timestep + 1,
+                    "mitre_code": "T1046", "mitre_desc": f"Service Scanning — port TCP/{access_port} closed (verified live)",
+                    "access_vector": f"Real-time validation: TCP/{access_port} closed",
+                    "success": False, "vuln": 0, "criticality": dst_data.get("criticality", 1),
+                    "ntype": dst_ntype, "priv_esc": False,
+                })
+                step_counter += 1
+                continue
+
+            # ─────────────────────────────────────────────────────────────
+            # 4. EVALUATE VULNERABILITY / ACCESS CONDITION
+            # ─────────────────────────────────────────────────────────────
+            cve_findings = dst_data.get("cve_findings", [])
+            has_cve = bool(cve_findings)
+            has_sensitive = access_port in SENSITIVE_PORTS
+            vuln_score = dst_data.get("vulnerability", 0.3)
+
+            condition_satisfied = False
+            technique_code = "T1021"
+            technique_desc = f"Remote Services ({access_service})"
+            vuln_desc = "Service Exposure"
+
+            if is_honeypot:
+                condition_satisfied = True
+                technique_code = "T1003"
+                technique_desc = "OS Credential Dumping [DECOY TRAP]"
+                vuln_desc = "Adaptive Honeypot Decoy Tripwire"
+            elif has_cve:
+                condition_satisfied = True
+                top_cve = cve_findings[0]
+                technique_code = edge.get("mitre_code", "T1210")
+                technique_desc = f"Exploitation of Remote Services — {top_cve.get('cve_id')}"
+                vuln_desc = f"{top_cve.get('cve_id')} (CVSS {top_cve.get('cvss')})"
+            elif has_sensitive:
+                condition_satisfied = True
+                technique_code = edge.get("mitre_code", "T1021")
+                technique_desc = edge.get("mitre_desc", f"Lateral Movement via {access_service}")
+                vuln_desc = f"Sensitive Lateral Port (TCP {access_port} / {access_service})"
+            elif vuln_score >= 0.25:
+                condition_satisfied = True
+                technique_code = "T1046"
+                technique_desc = "Network Service Exploitation / Weak Config"
+                vuln_desc = "Exposed Unauthenticated Listener"
+            else:
+                condition_satisfied = False
+
+            val_label = (
+                "✓ Real-time validated: Host reachable & port OPEN"
+                if (is_live_validated and live_port_state == "open")
+                else "[Using discovery snapshot — live validation not performed]"
+            )
+
+            if not condition_satisfied:
+                decision_log.append({
+                    "step": step_counter,
+                    "source": src_display,
+                    "source_node": current_node,
+                    "source_id": src_asset_id,
+                    "target": dst_display,
+                    "target_node": target,
+                    "target_id": dst_asset_id,
+                    "target_ip": dst_ip,
+                    "path": path_str,
+                    "service": f"{access_service} (TCP {access_port})",
+                    "vulnerability": "Hardened / No Exploit Vector",
+                    "technique": "N/A",
+                    "decision": "✗ COMPROMISE NOT POSSIBLE",
+                    "probability": "0%",
+                    "prob_float": 0.0,
+                    "reason": f"{val_label} | ✗ No matching vulnerability or sensitive access condition satisfied",
+                    "result_status": "UNCOMPROMISED",
+                    "is_compromised": False,
+                    "live_validated": is_live_validated and live_port_state == "open",
+                    "live_host_reachable": live_host_reachable,
+                    "live_port_state": (live_port_state.upper() if live_port_state else ("OPEN" if not is_live_validated else "UNKNOWN")),
+                    "live_snapshot_used": not (is_live_validated and live_port_state == "open"),
+                })
+                blocked_failed_paths.append({
+                    "source": src_display, "target": dst_display, "decision": "✗ COMPROMISE NOT POSSIBLE",
+                    "reason": "No matching vulnerability or sensitive access condition"
+                })
+                step_counter += 1
+                continue
+
+            # ─────────────────────────────────────────────────────────────
+            # 5. EVALUATE MODELED PROPAGATION PROBABILITY
+            # ─────────────────────────────────────────────────────────────
+            if is_honeypot:
+                prob = max(0.85, vuln_score)
+            else:
+                base_prob = edge.get("success_prob", 0.45) * vuln_score * global_dampener
+                if dst_data.get("criticality", 1) >= 4:
+                    base_prob *= 0.85
+                prob = min(0.95, max(0.05, base_prob))
+
+            success = (random.random() < prob)
             actual_timestep = timestep + 1
-            did_priv_esc = False
 
             if success:
-                compromised.add(neighbor)
-                G.nodes[neighbor]["compromised"] = True
-                new_path = path + [neighbor]
+                compromised.add(target)
+                G.nodes[target]["compromised"] = True
+                new_path = current_path + [target]
                 attack_paths.append(new_path)
-                queue.append((neighbor, actual_timestep, new_path))
+                successful_paths.append({
+                    "source": src_display, "source_id": src_asset_id,
+                    "target": dst_display, "target_id": dst_asset_id,
+                    "path": path_str, "service": access_service, "port": access_port,
+                    "technique": f"{technique_code} — {technique_desc}", "probability": prob
+                })
+                # Add to evaluation queue to continue propagation from this newly compromised asset!
+                queue.append((target, actual_timestep, new_path))
 
-                if nd["criticality"] >= 4 and neighbor not in priv_escalated:
-                    priv_escalated.add(neighbor)
-                    G.nodes[neighbor]["priv_escalated"] = True
-                    did_priv_esc = True
-                    timeline.append({
-                        "node": neighbor, "from_node": current_node, "timestep": actual_timestep + 1,
-                        "mitre_code": "T1068", "mitre_desc": "Privilege Escalation — admin/root on high-value system",
-                        "access_vector": "Credential dump / sudo / token theft", "success": True,
-                        "vuln": nd["vulnerability"], "criticality": nd["criticality"],
-                        "ntype": ntype, "priv_esc": True,
-                    })
-                if ntype == "honeypot":
+                if is_honeypot:
                     honeypot_triggered = True
 
-            timeline.append({
-                "node": neighbor, "from_node": current_node, "timestep": actual_timestep,
-                "mitre_code": mitre_code, "mitre_desc": mitre_desc, "access_vector": access_vector,
-                "success": success, "vuln": nd["vulnerability"], "criticality": nd["criticality"],
-                "ntype": ntype, "priv_esc": did_priv_esc,
-            })
+                did_priv_esc = False
+                if dst_data.get("criticality", 1) >= 4 and target not in priv_escalated:
+                    priv_escalated.add(target)
+                    G.nodes[target]["priv_escalated"] = True
+                    did_priv_esc = True
+                    timeline.append({
+                        "node": target, "from_node": current_node, "timestep": actual_timestep + 1,
+                        "mitre_code": "T1068", "mitre_desc": "Privilege Escalation — elevated rights on critical system",
+                        "access_vector": "Credential dump / token theft on high-value asset", "success": True,
+                        "vuln": vuln_score, "criticality": dst_data.get("criticality", 1),
+                        "ntype": dst_ntype, "priv_esc": True,
+                    })
+
+                timeline.append({
+                    "node": target, "from_node": current_node, "timestep": actual_timestep,
+                    "mitre_code": technique_code, "mitre_desc": technique_desc,
+                    "access_vector": path_str, "success": True, "vuln": vuln_score,
+                    "criticality": dst_data.get("criticality", 1), "ntype": dst_ntype, "priv_esc": did_priv_esc,
+                })
+
+                decision_log.append({
+                    "step": step_counter,
+                    "source": src_display,
+                    "source_node": current_node,
+                    "source_id": src_asset_id,
+                    "target": dst_display,
+                    "target_node": target,
+                    "target_id": dst_asset_id,
+                    "target_ip": dst_ip,
+                    "path": path_str,
+                    "service": f"{access_service} (TCP {access_port})",
+                    "vulnerability": vuln_desc,
+                    "technique": f"{technique_code} — {technique_desc}",
+                    "decision": "✓ COMPROMISE POSSIBLE",
+                    "probability": f"{int(prob * 100)}%",
+                    "prob_float": prob,
+                    "reason": f"{val_label} | ✓ Attack condition satisfied | ✓ Defense not blocking | ✓ Probability threshold met (P={prob:.2f})",
+                    "result_status": "SIMULATED COMPROMISED",
+                    "is_compromised": True,
+                    "live_validated": is_live_validated and live_port_state == "open",
+                    "live_host_reachable": live_host_reachable,
+                    "live_port_state": (live_port_state.upper() if live_port_state else ("OPEN" if not is_live_validated else "UNKNOWN")),
+                    "live_snapshot_used": not (is_live_validated and live_port_state == "open"),
+                })
+            else:
+                decision_log.append({
+                    "step": step_counter,
+                    "source": src_display,
+                    "source_node": current_node,
+                    "source_id": src_asset_id,
+                    "target": dst_display,
+                    "target_node": target,
+                    "target_id": dst_asset_id,
+                    "target_ip": dst_ip,
+                    "path": path_str,
+                    "service": f"{access_service} (TCP {access_port})",
+                    "vulnerability": vuln_desc,
+                    "technique": f"{technique_code} — {technique_desc}",
+                    "decision": "✗ COMPROMISE NOT POSSIBLE",
+                    "probability": f"{int(prob * 100)}%",
+                    "prob_float": prob,
+                    "reason": f"{val_label} | ✗ Modeled attack resisted / probability threshold not met (P={prob:.2f})",
+                    "result_status": "UNCOMPROMISED",
+                    "is_compromised": False,
+                    "live_validated": is_live_validated and live_port_state == "open",
+                    "live_host_reachable": live_host_reachable,
+                    "live_port_state": (live_port_state.upper() if live_port_state else ("OPEN" if not is_live_validated else "UNKNOWN")),
+                    "live_snapshot_used": not (is_live_validated and live_port_state == "open"),
+                })
+                blocked_failed_paths.append({
+                    "source": src_display, "target": dst_display, "decision": "✗ COMPROMISE NOT POSSIBLE",
+                    "reason": f"Resisted exploitation attempt (Probability: {int(prob*100)}%)"
+                })
+                timeline.append({
+                    "node": target, "from_node": current_node, "timestep": actual_timestep,
+                    "mitre_code": technique_code, "mitre_desc": technique_desc,
+                    "access_vector": path_str, "success": False, "vuln": vuln_score,
+                    "criticality": dst_data.get("criticality", 1), "ntype": dst_ntype, "priv_esc": False,
+                })
+
+            step_counter += 1
 
     timeline.sort(key=lambda x: x["timestep"])
+    uncompromised = set(G.nodes) - compromised
     real_nodes = [n for n in G.nodes if G.nodes[n].get("node_type") != "honeypot"]
     real_compromised = [n for n in compromised if G.nodes[n].get("node_type") != "honeypot"]
-    critical_reached = [n for n in real_compromised if G.nodes[n]["criticality"] >= 4]
+    critical_reached = [n for n in real_compromised if G.nodes[n].get("criticality", 1) >= 4]
     max_hops = max((len(p) - 1 for p in attack_paths), default=0)
 
     stats = {
-        "systems_controlled": len(real_compromised), "total_systems": len(real_nodes),
-        "max_lateral_hops": max_hops, "privilege_escalations": len(priv_escalated),
-        "attack_paths": attack_paths[:10], "reachable_from_entry": len(real_compromised),
+        "systems_controlled": len(real_compromised),
+        "total_systems": len(real_nodes),
+        "max_lateral_hops": max_hops,
+        "privilege_escalations": len(priv_escalated),
+        "attack_paths": attack_paths[:10],
+        "reachable_from_entry": len(real_compromised),
         "critical_assets_reached": len(critical_reached),
+        "decision_log": decision_log,
+        "successful_paths": successful_paths,
+        "blocked_failed_paths": blocked_failed_paths,
+        "uncompromised": uncompromised,
+        "live_validation_used": bool(live_validation),
     }
+
+    return timeline, decision_log, compromised, uncompromised, successful_paths, blocked_failed_paths, stats
+
+
+def simulate_attack(G, entry_node, seed=42, ids_deployed=False, segmentation_applied=False, applied_rules=None, live_validation=None):
+    """
+    Standard simulation interface delegating directly to the decision-based propagation engine.
+    """
+    timeline, decision_log, compromised, uncompromised, successful_paths, blocked_failed_paths, stats = simulate_decision_based_propagation(
+        G, entry_node, seed=seed, ids_deployed=ids_deployed, segmentation_applied=segmentation_applied,
+        applied_rules=applied_rules, live_validation=live_validation
+    )
+    honeypot_triggered = any(
+        entry.get("ntype") == "honeypot" and entry.get("success") for entry in timeline
+    )
     return timeline, compromised, honeypot_triggered, stats
 
 
@@ -2973,8 +3539,26 @@ def render_before_after_verification():
         st.markdown(
             '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a;margin-top:6px">'
             'Apply defenses in the ACDS DEFENSE OPTIMIZATION panel above, then this page re-runs the MITRE '
-            'simulation automatically and fills in the AFTER column.</div>', unsafe_allow_html=True)
+            'simulation automatically against the validated network posture and fills in the AFTER column.</div>', unsafe_allow_html=True)
     else:
+        # Verified Real-Time Defense Card
+        val_changes = st.session_state.get("validation_changes", [])
+        verified_changes = [c for c in val_changes if "REMOVED" in c.get("change_type", "") or "VERIFIED" in c.get("change_type", "")]
+
+        if verified_changes:
+            v_items = "".join(f"<li><b>{c.get('change_type')}:</b> {c.get('description')}</li>" for c in verified_changes[:4])
+            st.markdown(f"""
+            <div style='background:rgba(0,255,136,0.06);border:1px solid #00ff88;border-left:4px solid #00ff88;padding:12px 16px;border-radius:4px;margin:14px 0'>
+                <div style='color:#00ff88;font-family:Orbitron,monospace;font-size:0.8rem;font-weight:bold'>
+                    ✓ REAL-TIME DEFENSE RE-VALIDATION CONFIRMED
+                </div>
+                <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#e0f4ff;margin-top:4px'>
+                    Real-time network validation confirms that targeted attack surface ports are CLOSED and verified non-responsive:
+                    <ul style='margin:4px 0 0 16px;color:#7ab8d4'>{v_items}</ul>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
         st.markdown('<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin:14px 0 6px 0">'
                      'MITRE ATT&CK COVERAGE — BEFORE vs AFTER (re-simulated)</div>', unsafe_allow_html=True)
         before_mitre = st.session_state.mitre_before_defense or {}
@@ -3045,7 +3629,21 @@ def render_node_panel(active_node=None, selected_node=None, G=None):
 
         ip = data.get('ip', '')
         hostname = data.get('hostname', '')
-        mac_addr = data.get('mac_address', '')
+        mac_addr = data.get('mac') or data.get('mac_address') or ''
+        asset_id = data.get('asset_id') or generate_asset_id(mac_addr, ip, hostname, data.get('mac_vendor'), data.get('os'))
+        prev_ips = data.get('previous_ips') or []
+        if isinstance(prev_ips, str):
+            try:
+                prev_ips = json.loads(prev_ips)
+            except Exception:
+                prev_ips = [prev_ips] if prev_ips else []
+        lifecycle_status = data.get('lifecycle_status')
+        if not lifecycle_status and prev_ips:
+            lifecycle_status = "IP_CHANGED"
+
+        asset_id_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Asset ID:</span><span style='color:#00ff88;font-family:Share Tech Mono,monospace;font-weight:bold'>{asset_id}</span></div>" if asset_id else ""
+        lifecycle_badge = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#ffaa33;width:105px'>State:</span><span style='background:rgba(255,170,51,0.12);border:1px solid #ffaa33;color:#ffaa33;padding:2px 6px;border-radius:3px;font-size:0.65rem;font-weight:bold'>🔄 SAME DEVICE — IP CHANGED</span></div>" if (lifecycle_status == "IP_CHANGED" or prev_ips) else ""
+        prev_ips_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Previous IP(s):</span><span style='color:#7ab8d4;font-family:Share Tech Mono,monospace'>{', '.join(prev_ips)}</span></div>" if prev_ips else ""
         mac_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>MAC Address:</span><span style='color:#e0f4ff;font-family:Share Tech Mono,monospace'>{mac_addr}</span></div>" if mac_addr else ""
         hostname_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Hostname:</span><span style='color:#e0f4ff'>{hostname}</span></div>" if hostname else ""
 
@@ -3152,7 +3750,7 @@ def render_node_panel(active_node=None, selected_node=None, G=None):
             f"<span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.82rem;font-weight:700'>{disp_title}</span>"
             f"<span style='font-size:0.62rem;opacity:0.9'>{status_icon}</span></div>"
             f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>IP:</span><span style='color:#e0f4ff'>{ip}</span></div>"
-            f"{mac_html}{hostname_html}{os_html}{device_html}{ports_html}{services_html}{risk_html}{sensitive_html}{cve_html}{recommendation_html}"
+            f"{asset_id_html}{lifecycle_badge}{mac_html}{prev_ips_html}{hostname_html}{os_html}{device_html}{ports_html}{services_html}{risk_html}{sensitive_html}{cve_html}{recommendation_html}"
             f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Role:</span><span style='color:#e0f4ff'>{data.get('role', 'Node')}</span></div>"
             f"<div style='margin:4px 0'><span style='color:#3d6a8a;width:105px;display:inline-block;'>Criticality:</span><span style='color:#ffd700'>{crit_label}{conf_str} ({crit_stars})</span>"
             + _evidence_block("", data.get('criticality_evidence') or [])
@@ -4122,10 +4720,37 @@ defaults = {
     "prev_asset_snapshot": {}, "prev_graph_edges": set(),
     "new_exposure_edges": set(), "removed_exposure_edges": set(),
     "risk_history_last_run": None,
+    # Dynamic Network Environment Context
+    "network_env": None,
+    # Level 2 — Real-Time Defensive Validation Engine State
+    "live_validation_results": {},
+    "last_validation_time": None,
+    "validation_changes": [],
+    "validation_target_selection": "All Discovered Authorized Assets",
+    "continuous_val_active": False,
+    "continuous_val_interval": "30s",
+    # ACDS Attack & Defense Storyline Demonstration Workflow
+    "demo_target_ip": "",
+    "demo_controller_ip": "",
+    "demo_router_ip": "",
+    "demo_stage": 1,
+    "demo_max_stage_reached": 1,
+    "demo_data": {},
+    "demo_stage_status": {i: "Not Started" for i in range(1, 13)},
+    "demo_running": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+if not st.session_state.get("network_env"):
+    st.session_state["network_env"] = detect_network_environment()
+
+_net_env = st.session_state["network_env"]
+if not st.session_state.get("demo_controller_ip"):
+    st.session_state["demo_controller_ip"] = _net_env.get("controller_ip") or "127.0.0.1"
+if not st.session_state.get("demo_router_ip"):
+    st.session_state["demo_router_ip"] = _net_env.get("gateway_ip") or "192.168.0.1"
 
 if "G" not in st.session_state:
     st.session_state.G = build_network() if st.session_state.network_mode == "Simulated Lab" else nx.DiGraph()
@@ -4470,37 +5095,48 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     if network_mode == "Real Network Scan":
-        lab_preset = st.selectbox(
-            "Lab network preset",
-            ["Custom / Auto", "VMware NAT (192.168.93.x)", "Home LAN (192.168.1.x)"],
-            help="VMware NAT is skipped by auto-detect — use this preset for VM lab targets",
+        net_env = st.session_state.get("network_env") or detect_network_environment()
+        st.session_state["network_env"] = net_env
+
+        st.markdown(f"""
+        <div style='background:rgba(0,212,255,0.06);border:1px solid #00d4ff;padding:8px 10px;border-radius:4px;margin:8px 0;font-family:Share Tech Mono;font-size:0.65rem;color:#e0f4ff;line-height:1.6'>
+            <div style='color:#00d4ff;font-weight:bold;margin-bottom:2px'>📡 ACTIVE INTERFACE</div>
+            <div><b>Adapter:</b> {net_env.get('adapter_name', 'Default')}</div>
+            <div><b>Local IP:</b> <code>{net_env.get('controller_ip')}</code></div>
+            <div><b>Subnet:</b> <code>{net_env.get('subnet_cidr')}</code></div>
+            <div><b>Gateway:</b> <code>{net_env.get('gateway_ip')}</code></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        discovery_mode = st.radio(
+            "Discovery Mode",
+            ["Automatic Subnet Discovery", "Controlled Target / Range"],
+            index=0,
+            help="Choose between scanning the detected subnet or targeting specific lab IPs/ranges."
         )
 
-        if lab_preset == "VMware NAT (192.168.93.x)":
-            base_ip = "192.168.93."
-            preset_limit = 200
-            st.info("VMware NAT lab: target VM usually at **192.168.93.128**.")
-        elif lab_preset == "Home LAN (192.168.1.x)":
-            base_ip = "192.168.1."
-            preset_limit = 254
-        else:
-            auto_detect = st.checkbox("🔍 Auto-detect Base IP", value=True)
-            preset_limit = 100
-            if auto_detect:
-                detected_ip = get_local_ip()
-                st.info(f"Detected Base IP: **{detected_ip}**")
-                base_ip = None
-            else:
-                base_ip = st.text_input("Base IP Prefix", value="192.168.1.")
+        target_spec_ips = None
+        base_ip = None
+        scan_limit = 254
 
-        scan_limit = st.slider("Scan Range (last octet up to...)", 10, 254, preset_limit, 10)
+        if discovery_mode == "Automatic Subnet Discovery":
+            base_ip = net_env.get('base_ip_prefix') or get_local_ip()
+            scan_limit = st.slider("Host Scan Range (1 to ...)", 10, 254, 100, 10,
+                                   help=f"Scans {base_ip}1 up to {base_ip}{scan_limit}")
+        else:
+            custom_target = st.text_input(
+                "Target IP / Range / CIDR",
+                value=net_env.get('subnet_cidr') or "192.168.1.0/24",
+                help="Enter single IP (e.g. 192.168.0.101), range (e.g. 1-30), CIDR (e.g. 192.168.0.0/24), or comma-separated IPs"
+            )
+            target_spec_ips = parse_target_ips(custom_target, net_env.get('base_ip_prefix'))
+            if target_spec_ips:
+                st.caption(f"✓ {len(target_spec_ips)} target IP(s) queued for scan")
+            else:
+                st.caption("Enter a valid IPv4 address, range, or CIDR")
 
         if st.button("📡  SCAN NETWORK", use_container_width=True, disabled=st.session_state.get("scan_in_progress", False)):
-            # Sprint 3 — Phase 7: scan scope validation + duplicate-scan guard.
-            # Auto-detected base_ip is trusted (computed by get_local_ip()
-            # itself, not user-typed) and skips the format check; a manually
-            # typed prefix is validated before any network operation starts.
-            valid, reason = (True, None) if base_ip is None else validate_scan_scope(base_ip, scan_limit)
+            valid, reason = (True, None) if target_spec_ips or base_ip is None else validate_scan_scope(base_ip, scan_limit)
             if not valid:
                 st.error(f"Scan not started — invalid scan scope: {reason}")
             elif st.session_state.get("scan_in_progress"):
@@ -4518,7 +5154,12 @@ with st.sidebar:
                     st.session_state.scan_error = None
                     try:
                         with st.spinner("Pinging subnet and discovering hosts..."):
-                            devices, scan_timeline = scan_network(base_ip=base_ip, limit=scan_limit, progress_cb=_progress)
+                            devices, scan_timeline = scan_network(
+                                base_ip=base_ip if not target_spec_ips else None,
+                                limit=scan_limit,
+                                target_ips=target_spec_ips,
+                                progress_cb=_progress
+                            )
                     except Exception as exc:
                         devices, scan_timeline = [], []
                         st.session_state.scan_error = f"Scan failed safely: {type(exc).__name__}: {exc}"
@@ -4561,7 +5202,6 @@ with st.sidebar:
                 finally:
                     st.session_state.scan_in_progress = False
                 st.rerun()
-
         # ─────────────────────────────────────────────────────
         # SPRINT 1 — PHASE 5: PERSISTENT / BACKGROUND MONITORING
         # ─────────────────────────────────────────────────────
@@ -4820,16 +5460,559 @@ def _render_alert_card(a):
     </div>
     """, unsafe_allow_html=True)
 
+
 # ─────────────────────────────────────────────────────────────────
-# 🧭 MODERN TAB-BASED DASHBOARD NAVIGATION
+# ⚔️ DYNAMIC DECISION-BASED PROPAGATION TAB RENDERER
 # ─────────────────────────────────────────────────────────────────
-tab_exec, tab_sim_map, tab_defense, tab_assets_vulns, tab_alerts = st.tabs([
-    "🏠 Executive Dashboard",
-    "⚔️ Attack Simulation & Live Map",
-    "🛡️ Defense & Remediation",
-    "🧬 Assets & Vulnerabilities",
+
+def render_decision_propagation_tab():
+    st.markdown('<div class="section-header">⚔️ ACDS LEVEL 2: REAL-TIME DEFENSIVE VALIDATION &amp; PROPAGATION SIMULATOR</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style='background:rgba(0,212,255,0.05);border:1px solid #00d4ff;padding:12px 18px;border-radius:4px;
+         font-family:Share Tech Mono;font-size:0.75rem;color:#7ab8d4;line-height:1.8;margin-bottom:16px'>
+        <b style='color:#00d4ff'>LEVEL 2 ARCHITECTURE: REAL OBSERVATION + REAL-TIME VALIDATION + SIMULATED PROPAGATION</b><br>
+        ACDS does not rely solely on previous scan history. It safely performs <b>non-destructive real-time validation</b>
+        (host reachability, TCP connect ping, expected banner consistency) on authorized targets and feeds those live observations
+        into the decision-based attack propagation engine.<br>
+        <span style='color:#00ff88'><b>REAL OBSERVATION:</b></span> Discovered during network inventory &nbsp;|&nbsp;
+        <span style='color:#00d4ff'><b>REAL-TIME VALIDATION:</b></span> Currently verified accepting/rejecting connections &nbsp;|&nbsp;
+        <span style='color:#ff3355'><b>SIMULATION:</b></span> Modeled propagation condition evaluated in-memory.
+        <br><span style='color:#ffd700'>🛡 100% NON-DESTRUCTIVE &amp; AUTHORIZED</span> — Zero exploits, zero brute force, zero payloads.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────────────────────
+    # LEVEL 2 LIVE VALIDATION CONTROL PANEL
+    # ─────────────────────────────────────────────────────────────
+    st.markdown("<b style='color:#00d4ff;font-family:Orbitron,monospace;font-size:0.82rem'>⚡ REAL-TIME DEFENSIVE VALIDATION (LIVE NETWORK)</b>", unsafe_allow_html=True)
+    
+    val_c1, val_c2, val_c3 = st.columns([2.2, 1.2, 1.0])
+    all_nodes_list = list(st.session_state.G.nodes)
+    real_nodes_list = [n for n in all_nodes_list if st.session_state.G.nodes[n].get("node_type") != "honeypot"]
+    val_target_options = ["All Discovered Authorized Assets"] + real_nodes_list
+
+    with val_c1:
+        selected_val_target = st.selectbox(
+            "Authorized Validation Scope",
+            val_target_options,
+            index=0,
+            disabled=not real_nodes_list,
+            key="live_val_target_scope",
+            help="Select specific authorized asset or all discovered assets for safe, non-destructive real-time validation"
+        )
+    with val_c2:
+        st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+        run_live_val_btn = st.button("⚡  VALIDATE LIVE STATE", use_container_width=True, disabled=not real_nodes_list)
+    with val_c3:
+        st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+        clear_val_btn = st.button("✕  CLEAR VALIDATION", use_container_width=True)
+
+    if clear_val_btn:
+        st.session_state.live_validation_results = {}
+        st.session_state.last_validation_time = None
+        st.session_state.validation_changes = []
+        st.toast("Real-time validation cache cleared", icon="🧹")
+        st.rerun()
+
+    if run_live_val_btn and real_nodes_list:
+        with st.spinner("Safely validating authorized target reachability and TCP ports..."):
+            target_nodes = real_nodes_list if selected_val_target == "All Discovered Authorized Assets" else [selected_val_target]
+            asset_targets_to_val = []
+            for n in target_nodes:
+                ndata = st.session_state.G.nodes.get(n, {})
+                nip = ndata.get("ip")
+                if not nip:
+                    continue
+                n_aid = ndata.get("asset_id") or generate_asset_id(ndata.get("mac", ""), nip, ndata.get("hostname", ""))
+                n_ports = ndata.get("open_ports", [])
+                asset_targets_to_val.append({
+                    "asset_id": n_aid,
+                    "ip": nip,
+                    "expected_ports": n_ports,
+                    "hostname": ndata.get("hostname"),
+                    "services": ndata.get("services", [])
+                })
+
+            if asset_targets_to_val:
+                val_snapshot = validate_multiple_assets(asset_targets_to_val, max_workers=4)
+                
+                # Diff against discovered baseline in graph
+                discovered_baseline = {}
+                for a in asset_targets_to_val:
+                    discovered_baseline[a["asset_id"]] = {
+                        "asset_id": a["asset_id"],
+                        "ip": a["ip"],
+                        "open_ports": a["expected_ports"],
+                        "services": a.get("services", [])
+                    }
+                
+                changes = diff_validation_against_discovery(discovered_baseline, val_snapshot)
+                
+                # Persist to database
+                monitor_db.record_validation_snapshot(val_snapshot, changes)
+                
+                # Update session state
+                st.session_state.live_validation_results.update(val_snapshot)
+                st.session_state.last_validation_time = datetime.now(timezone.utc)
+                st.session_state.validation_changes = changes
+
+                # Alert if defense verified or exposure removed
+                closed_count = sum(1 for c in changes if c.get("change_type") in ("SERVICE_EXPOSURE_REMOVED", "DEFENSE_VERIFIED"))
+                if closed_count > 0:
+                    st.toast(f"🛡 Defense Verified: {closed_count} attack surface port(s) confirmed CLOSED in real-time!", icon="🛡")
+                else:
+                    st.toast(f"⚡ Live validation complete — {len(val_snapshot)} asset(s) verified", icon="⚡")
+                st.rerun()
+
+    # ─────────────────────────────────────────────────────────────
+    # REAL-TIME LIVE NETWORK STATE VISUALIZATION
+    # ─────────────────────────────────────────────────────────────
+    live_vals = st.session_state.get("live_validation_results", {})
+    last_val_ts = st.session_state.get("last_validation_time")
+    last_val_str = last_val_ts.strftime("%Y-%m-%d %H:%M:%S UTC") if last_val_ts else "Not yet performed (using discovery baseline)"
+
+    if live_vals:
+        st.markdown(f"""
+        <div style='display:flex;justify-content:space-between;align-items:center;background:#06111a;border:1px solid #1a3a5c;padding:8px 14px;border-radius:4px;margin-bottom:12px;font-family:Share Tech Mono;font-size:0.68rem'>
+            <span style='color:#00ff88'>● <b>REAL-TIME LIVE VALIDATION ACTIVE</b> ({len(live_vals)} targets evaluated)</span>
+            <span style='color:#7ab8d4'>Last Validated: <b>{last_val_str}</b></span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        for n in real_nodes_list:
+            ndata = st.session_state.G.nodes.get(n, {})
+            n_aid = ndata.get("asset_id") or n
+            nip = ndata.get("ip") or ""
+            disp_name = ndata.get("display_name") or n
+
+            val_res = live_vals.get(n_aid) or live_vals.get(nip)
+            if not val_res:
+                continue
+
+            is_reach = val_res.get("reachable", False)
+            reach_badge = "<span style='color:#00ff88;font-weight:bold'>✓ ONLINE</span>" if is_reach else "<span style='color:#ff3355;font-weight:bold'>✗ OFFLINE</span>"
+            lat_txt = f"({val_res.get('latency_ms', 0):.1f} ms latency)" if val_res.get("latency_ms") is not None else ""
+            method_txt = val_res.get("method", "tcp_syn_ping")
+            ports_val = val_res.get("ports_validated") or val_res.get("ports", {})
+
+            # Service validation rows
+            port_rows_html = []
+            disc_ports = ndata.get("open_ports", [])
+            all_ports_to_show = sorted(list(set(disc_ports + [int(p) for p in ports_val])))
+            
+            for p in all_ports_to_show:
+                p_int = int(p)
+                svc_name = PORT_SERVICE_MAP.get(p_int, "TCP Service")
+                was_disc = p_int in disc_ports
+                pval_data = ports_val.get(p_int) or ports_val.get(str(p_int))
+                
+                if pval_data:
+                    curr_state = (pval_data.get("status") or pval_data.get("state") or ("OPEN" if pval_data.get("open") else "CLOSED")).upper()
+                    if curr_state == "OPEN":
+                        status_badge = "<span style='color:#ff8c00;font-weight:bold'>● OPEN</span>"
+                        val_badge = "<span style='background:rgba(255,140,0,0.15);color:#ff8c00;padding:2px 6px;border-radius:2px'>✓ STILL EXPOSED</span>"
+                        sim_badge = "<span style='color:#00ff88'>✓ PROPAGATION CONDITION SATISFIED</span>"
+                    elif curr_state == "HOST_UNREACHABLE" or not is_reach:
+                        status_badge = "<span style='color:#ff3355;font-weight:bold'>✗ UNREACHABLE</span>"
+                        val_badge = "<span style='background:rgba(255,51,85,0.15);color:#ff3355;padding:2px 6px;border-radius:2px'>✗ HOST OFFLINE</span>"
+                        sim_badge = "<span style='color:#ff3355'>✗ ATTACK PATH INACTIVE (HOST OFFLINE)</span>"
+                    else:
+                        status_badge = "<span style='color:#00ff88;font-weight:bold'>○ CLOSED</span>"
+                        val_badge = "<span style='background:rgba(0,255,136,0.15);color:#00ff88;padding:2px 6px;border-radius:2px'>✓ EXPOSURE REMOVED</span>"
+                        sim_badge = "<span style='color:#ff3355'>✗ ATTACK SURFACE REMOVED</span>"
+                else:
+                    if not is_reach:
+                        status_badge = "<span style='color:#ff3355;font-weight:bold'>✗ UNREACHABLE</span>"
+                        val_badge = "<span style='background:rgba(255,51,85,0.15);color:#ff3355;padding:2px 6px;border-radius:2px'>✗ HOST OFFLINE</span>"
+                        sim_badge = "<span style='color:#ff3355'>✗ ATTACK PATH INACTIVE (HOST OFFLINE)</span>"
+                    else:
+                        status_badge = "<span style='color:#7ab8d4'>UNVALIDATED</span>"
+                        val_badge = "<span style='color:#7ab8d4'>Discovery Snapshot</span>"
+                        sim_badge = "<span style='color:#7ab8d4'>Modeled</span>"
+
+                disc_txt = f"TCP/{p_int} ({svc_name})" + (" [Discovered in scan]" if was_disc else "")
+                port_rows_html.append(
+                    f"<tr style='border-bottom:1px solid #142a3a'>"
+                    f"<td style='padding:6px 8px;color:#e0f4ff'>{disc_txt}</td>"
+                    f"<td style='padding:6px 8px'>{status_badge}</td>"
+                    f"<td style='padding:6px 8px'>{val_badge}</td>"
+                    f"<td style='padding:6px 8px'>{sim_badge}</td>"
+                    f"</tr>"
+                )
+
+            rows_joined = "".join(port_rows_html) if port_rows_html else "<tr><td colspan='4' style='padding:6px;color:#3d6a8a'>No listening ports discovered or evaluated on this asset</td></tr>"
+            ports_table = (
+                f"<table style='width:100%;border-collapse:collapse;font-family:Share Tech Mono;font-size:0.68rem;margin-top:6px'>"
+                f"<thead><tr style='color:#00d4ff;border-bottom:1px solid #00d4ff;text-align:left'>"
+                f"<th style='padding:4px 8px'>REAL OBSERVATION (SCAN)</th>"
+                f"<th style='padding:4px 8px'>PORT STATUS</th>"
+                f"<th style='padding:4px 8px'>REAL-TIME VALIDATION</th>"
+                f"<th style='padding:4px 8px'>SIMULATION IMPACT</th>"
+                f"</tr></thead>"
+                f"<tbody>{rows_joined}</tbody>"
+                f"</table>"
+            )
+
+            card_html = (
+                f"<div style='background:#091520;border:1px solid #1a3a5c;border-left:4px solid #00d4ff;padding:12px 16px;border-radius:4px;margin-bottom:10px'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                f"<span style='color:#e0f4ff;font-family:Orbitron,monospace;font-size:0.8rem;font-weight:bold'>🛰 LIVE STATE — {disp_name}</span>"
+                f"<span style='font-family:Share Tech Mono;font-size:0.68rem'>Reachability: {reach_badge} {lat_txt}</span>"
+                f"</div>"
+                f"<div style='font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin-top:4px'>"
+                f"• <b>Asset ID:</b> <code>{n_aid}</code> &nbsp;|&nbsp; <b>Dynamic IP:</b> <code>{nip}</code> &nbsp;|&nbsp; <b>Method:</b> {method_txt}"
+                f"</div>"
+                f"{ports_table}"
+                f"</div>"
+            )
+            st.markdown(card_html, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style='background:#07121c;border:1px dashed #1a3a5c;padding:12px 16px;border-radius:4px;margin-bottom:12px;font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4'>
+            ℹ <i>Live validation not yet executed this session. Click <b>⚡ VALIDATE LIVE STATE</b> above to test authorized targets in real time. (Simulation will fall back to discovery snapshot with clear labeling if live validation is omitted).</i>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Validation Changes Timeline if any
+    val_changes = st.session_state.get("validation_changes", [])
+    if val_changes:
+        st.markdown("<b style='color:#00d4ff;font-family:Orbitron,monospace;font-size:0.75rem'>🔁 REAL-TIME CHANGE DETECTION &amp; DEFENSE VERIFICATION LOG</b>", unsafe_allow_html=True)
+        for ch in val_changes[:5]:
+            ch_type = ch.get("change_type", "CHANGE")
+            ch_color = "#00ff88" if "REMOVED" in ch_type or "VERIFIED" in ch_type else "#ff3355"
+            st.markdown(f"""
+            <div style='background:#0a1926;border-left:3px solid {ch_color};padding:6px 10px;margin-bottom:6px;font-family:Share Tech Mono;font-size:0.68rem;color:#e0f4ff'>
+                <span style='color:{ch_color};font-weight:bold'>[{ch_type}]</span> {ch.get('description', '')}
+                <span style='color:#3d6a8a;float:right'>{ch.get('timestamp', '')[:19]}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────────────────────
+    # CONTROLS BAR: Foothold Selection & Run Simulation
+    # ─────────────────────────────────────────────────────────────
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([2.5, 1.2, 1.0])
+    all_sim_nodes = list(st.session_state.G.nodes)
+    if st.session_state.network_mode == "Simulated Lab":
+        all_sim_nodes = [n for n in all_sim_nodes if st.session_state.G.nodes[n].get("node_type") != "honeypot"]
+
+    with ctrl_col1:
+        entry_node_prop = st.selectbox(
+            "Attacker Foothold / Entry Point Asset",
+            all_sim_nodes,
+            index=min(1, len(all_sim_nodes) - 1) if all_sim_nodes else 0,
+            disabled=not all_sim_nodes,
+            key="prop_sim_entry_select",
+            help="Select the initial compromised asset where the threat actor established a foothold"
+        )
+    with ctrl_col2:
+        st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+        run_prop_btn = st.button("▶  RUN PROPAGATION SIM", use_container_width=True, disabled=not all_sim_nodes, key="btn_run_prop_sim")
+    with ctrl_col3:
+        st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+        reset_prop_btn = st.button("↺  RESET SIMULATION", use_container_width=True, key="btn_reset_prop_sim")
+
+    if reset_prop_btn:
+        for node in st.session_state.G.nodes:
+            st.session_state.G.nodes[node]["compromised"] = False
+        st.session_state.simulation_done = False
+        st.session_state.timeline = []
+        st.session_state.decision_log = []
+        st.session_state.compromised = set()
+        st.session_state.risk_score = 0.0
+        st.session_state.blast_details = {}
+        st.session_state.honeypot_triggered = False
+        st.session_state.defense_actions = []
+        st.session_state.selected_defenses = []
+        st.session_state.attack_log = []
+        st.session_state.current_anim_node = None
+        st.session_state.overall_acds_risk = None
+        st.rerun()
+
+    if run_prop_btn and entry_node_prop:
+        st.session_state.last_entry_node = entry_node_prop
+        for node in st.session_state.G.nodes:
+            st.session_state.G.nodes[node]["compromised"] = False
+
+        # Feed real-time live validation snapshot into the propagation decision engine
+        live_val_snapshot = st.session_state.get("live_validation_results") or None
+
+        timeline, decision_log, compromised, uncompromised, successful_paths, blocked_failed_paths, stats = simulate_decision_based_propagation(
+            st.session_state.G, entry_node_prop, seed=random.randint(1, 9999),
+            ids_deployed=st.session_state.ids_deployed,
+            segmentation_applied=st.session_state.segmentation_applied,
+            live_validation=live_val_snapshot,
+        )
+
+        honeypot_triggered = any(
+            entry.get("ntype") == "honeypot" and entry.get("success") for entry in timeline
+        )
+
+        st.session_state.timeline = timeline
+        st.session_state.decision_log = decision_log
+        st.session_state.compromised = compromised
+        st.session_state.honeypot_triggered = honeypot_triggered
+        st.session_state.simulation_done = True
+        st.session_state.current_anim_node = None
+
+        risk_score, blast_details = calculate_risk(st.session_state.G, compromised, timeline, honeypot_triggered, stats)
+        st.session_state.risk_score = risk_score
+        st.session_state.blast_details = blast_details
+        st.session_state.attack_stats = stats
+
+        if honeypot_triggered:
+            honeypot_engine.record_trigger(
+                source_node=entry_node_prop, decoy_node="Honeypot (decoy)",
+                event_type="simulated_probe",
+                details="Simulated attacker reached the decoy node during attack propagation simulation.",
+                risk_before=risk_score - 15 if risk_score is not None else None,
+                risk_after=risk_score,
+            )
+        st.session_state.adaptive_feedback = honeypot_engine.apply_adaptive_feedback(risk_score)
+        st.session_state.overall_acds_risk = calculate_overall_acds_risk(st.session_state.G, risk_score)
+
+        if st.session_state.risk_before_defense is None:
+            st.session_state.risk_before_defense = risk_score
+            st.session_state.blast_before_defense = blast_details
+            st.session_state.overall_acds_risk_before = st.session_state.overall_acds_risk
+            st.session_state.mitre_before_defense = {
+                e["mitre_code"]: e["mitre_desc"] for e in timeline if e["success"]
+            }
+
+        st.session_state.defense_actions = get_defense_actions(st.session_state.G, compromised, risk_score)
+        selected, total_reduction, remaining = greedy_defense_selection(st.session_state.defense_actions, st.session_state.budget)
+        st.session_state.selected_defenses = selected
+        st.session_state.attack_log = generate_attack_log(timeline, honeypot_triggered)
+        st.session_state.blast_radius_last_computed = datetime.now(timezone.utc)
+        record_scan_history(st.session_state.G, "Post-simulation")
+        persist_dynamic_risk_pipeline("SIMULATION")
+        st.rerun()
+
+    # ─────────────────────────────────────────────────────────────
+    # SIMULATION OUTPUT & DECISION VISUALIZATION
+    # ─────────────────────────────────────────────────────────────
+    if not st.session_state.get("simulation_done") or not st.session_state.get("decision_log"):
+        st.markdown("""
+        <div style='background:#0a1520;border:1px solid #1a3a5c;border-left:3px solid #00d4ff;
+             padding:24px;font-family:Share Tech Mono;font-size:0.78rem;line-height:2;
+             text-align:center;margin-top:16px'>
+            <div style='color:#00d4ff;font-size:0.95rem;font-family:Orbitron,monospace;letter-spacing:3px;margin-bottom:12px'>
+                READY TO SIMULATE ATTACK PROPAGATION
+            </div>
+            <div style='color:#7ab8d4'>
+                1. Click <b>⚡ VALIDATE LIVE STATE</b> to safely test authorized target reachability &amp; open ports in real time.<br>
+                2. Select an <b>Attacker Foothold / Entry Point Asset</b> in the controls above.<br>
+                3. Click <b>▶ RUN PROPAGATION SIM</b> to evaluate candidate attack paths against live-validated conditions.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    dlog = st.session_state.get("decision_log", [])
+    entry_item = dlog[0] if dlog else {}
+    eval_items = dlog[1:] if len(dlog) > 1 else []
+    stats = st.session_state.get("attack_stats", {})
+
+    # Top Metrics Row
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1:
+        st.metric("INITIAL FOOTHOLD", entry_item.get("target", "Asset")[:18])
+    with m2:
+        st.metric("CANDIDATES EVALUATED", len(eval_items))
+    with m3:
+        st.metric("COMPROMISED ASSETS", len(st.session_state.get("compromised", [])))
+    with m4:
+        blocked_count = sum(1 for d in eval_items if "BLOCKED" in d.get("decision", ""))
+        st.metric("BLOCKED BY DEFENSE", blocked_count)
+    with m5:
+        st.metric("MAX LATERAL HOPS", stats.get("max_lateral_hops", 0))
+
+    st.markdown('<hr style="border-color:#1a3a5c;margin:14px 0">', unsafe_allow_html=True)
+
+    # 1. INITIAL COMPROMISE CARD
+    st.markdown("<b style='color:#00d4ff;font-family:Orbitron,monospace;font-size:0.82rem'>🎯 INITIAL ACCESS FOOTHOLD (STEP 1)</b>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style='background:#0d1f2d;border:1px solid #00ff88;border-left:4px solid #00ff88;padding:12px 16px;border-radius:4px;margin-bottom:16px'>
+        <div style='display:flex;justify-content:space-between;align-items:center'>
+            <span style='color:#00ff88;font-family:Orbitron,monospace;font-size:0.85rem;font-weight:bold'>
+                ✓ COMPROMISE INITIALIZED — {entry_item.get("target")}
+            </span>
+            <span style='background:rgba(0,255,136,0.15);color:#00ff88;padding:2px 8px;border-radius:3px;font-family:Share Tech Mono;font-size:0.68rem'>
+                PROBABILITY: 100%
+            </span>
+        </div>
+        <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#e0f4ff;margin-top:6px;line-height:1.7'>
+            • <b>Asset ID:</b> <code>{entry_item.get("target_id", "-")}</code> &nbsp;|&nbsp; <b>IP:</b> <code>{entry_item.get("target_ip", "-")}</code><br>
+            • <b>Initial Access Vector:</b> {entry_item.get("technique")}<br>
+            • <b>Vulnerability / Foothold:</b> {entry_item.get("vulnerability")}<br>
+            • <b>Explanation:</b> {entry_item.get("reason")}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 2. CANDIDATE PROPAGATION EVALUATION (STEP 2+)
+    st.markdown("<b style='color:#00d4ff;font-family:Orbitron,monospace;font-size:0.82rem'>🔗 CANDIDATE PROPAGATION EVALUATION &amp; DECISIONS</b>", unsafe_allow_html=True)
+
+    if not eval_items:
+        st.markdown("""
+        <div style='background:#0a1926;border:1px solid #ffaa33;border-left:4px solid #ffaa33;padding:16px 20px;border-radius:4px;margin-bottom:16px'>
+            <div style='color:#ffaa33;font-family:Orbitron,monospace;font-size:0.85rem;font-weight:bold'>
+                ⚠️ NO VALID SIMULATED PROPAGATION PATH IDENTIFIED FROM CURRENT FOOTHOLD
+            </div>
+            <div style='font-family:Share Tech Mono;font-size:0.75rem;color:#e0f4ff;margin-top:6px;line-height:1.8'>
+                The initial compromised asset has no exploitable listening services or accessible lateral paths to other discovered endpoints on the network.
+                <br>• <b>Exploitation Status:</b> Contained at entry foothold.
+                <br>• <b>Empirical Evidence:</b> Neighboring assets have no open ports matching known lateral movement vectors (e.g., SMB/445, RDP/3389, SSH/22, DB ports) or are protected by host isolation.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        for item in eval_items:
+            dec = item.get("decision", "")
+            is_comp = "COMPROMISE POSSIBLE" in dec
+            is_blocked = "BLOCKED" in dec
+            is_no_path = "NO VALID PATH" in dec
+            is_live_val = item.get("live_validated", False)
+            live_pt_state = item.get("live_port_state", "")
+
+            if is_comp:
+                border_color = "#ff3355"
+                badge_bg = "rgba(255,51,85,0.15)"
+                badge_color = "#ff3355"
+                status_icon = "💥"
+            elif is_blocked:
+                border_color = "#9b5de5"
+                badge_bg = "rgba(155,93,229,0.15)"
+                badge_color = "#c77dff"
+                status_icon = "🛡"
+            elif is_no_path:
+                border_color = "#3d6a8a"
+                badge_bg = "rgba(61,106,138,0.15)"
+                badge_color = "#7ab8d4"
+                status_icon = "⊘"
+            else:
+                border_color = "#ff8c00"
+                badge_bg = "rgba(255,140,0,0.15)"
+                badge_color = "#ffaa33"
+                status_icon = "✗"
+
+            val_badge_html = (
+                f"<span style='background:rgba(0,255,136,0.15);color:#00ff88;padding:2px 6px;border-radius:2px;font-size:0.62rem;margin-left:8px'>⚡ LIVE VALIDATED: {live_pt_state}</span>"
+                if is_live_val
+                else "<span style='background:rgba(61,106,138,0.15);color:#7ab8d4;padding:2px 6px;border-radius:2px;font-size:0.62rem;margin-left:8px'>[DISCOVERY SNAPSHOT]</span>"
+            )
+
+            st.markdown(f"""
+            <div style='background:#091520;border:1px solid {border_color};border-left:4px solid {border_color};padding:12px 16px;border-radius:4px;margin-bottom:10px'>
+                <div style='display:flex;justify-content:space-between;align-items:center'>
+                    <div>
+                        <span style='color:#e0f4ff;font-family:Orbitron,monospace;font-size:0.8rem;font-weight:bold'>
+                            STEP {item.get("step")} &nbsp;·&nbsp; {item.get("source")} ➔ {item.get("target")}
+                        </span>
+                        {val_badge_html}
+                    </div>
+                    <span style='background:{badge_bg};color:{badge_color};padding:2px 8px;border-radius:3px;font-family:Share Tech Mono;font-size:0.68rem;font-weight:bold'>
+                        {status_icon} {dec} ({item.get("probability", "0%")})
+                    </span>
+                </div>
+                <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4;margin-top:6px;line-height:1.7'>
+                    • <b>Path:</b> <code>{item.get("path")}</code><br>
+                    • <b>Evaluated Service:</b> <span style='color:#00d4ff'>{item.get("service")}</span> &nbsp;|&nbsp; <b>Vulnerability / Condition:</b> <span style='color:#ffd700'>{item.get("vulnerability")}</span><br>
+                    • <b>MITRE ATT&CK:</b> {item.get("technique")}<br>
+                    • <b>Decision Rationale:</b> <span style='color:#e0f4ff'>{item.get("reason")}</span>
+                </div>
+                {f"<div style='background:rgba(255,51,85,0.1);padding:4px 8px;border-radius:2px;font-family:Share Tech Mono;font-size:0.65rem;color:#ff3355;margin-top:6px'>🔗 Target asset compromised — chained as new attack source for subsequent lateral propagation evaluations</div>" if is_comp else ""}
+            </div>
+            """, unsafe_allow_html=True)
+
+    # 3. STRUCTURED DECISION LOG TABLE
+    st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+    st.markdown("<b style='color:#00d4ff;font-family:Orbitron,monospace;font-size:0.82rem'>📋 STRUCTURED ATTACK PROPAGATION DECISION LOG</b>", unsafe_allow_html=True)
+    table_rows = []
+    for d in dlog:
+        table_rows.append({
+            "STEP": d.get("step"),
+            "SOURCE ASSET": d.get("source"),
+            "TARGET ASSET": d.get("target"),
+            "EVALUATED SERVICE / PORT": d.get("service"),
+            "VULNERABILITY / CONDITION": d.get("vulnerability"),
+            "DECISION OUTCOME": d.get("decision"),
+            "PROBABILITY": d.get("probability"),
+            "LIVE VALIDATED": "YES" if d.get("live_validated") else "NO (Snapshot)",
+            "RESULT STATUS": d.get("result_status"),
+            "RATIONALE": d.get("reason")[:75] + "..." if len(d.get("reason", "")) > 75 else d.get("reason")
+        })
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+    # 4. SIMULATION-DRIVEN RISK PRIORITIZATION
+    st.markdown('<hr style="border-color:#1a3a5c;margin:16px 0">', unsafe_allow_html=True)
+    st.markdown("<b style='color:#00d4ff;font-family:Orbitron,monospace;font-size:0.82rem'>🎯 SIMULATION-DRIVEN RISK PRIORITIZATION</b>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#7ab8d4;margin-bottom:12px'>
+        ACDS prioritizes risk based on <b>actual simulated attack leverage</b> rather than CVSS in isolation.
+    </div>
+    """, unsafe_allow_html=True)
+
+    comp_nodes = list(st.session_state.get("compromised", []))
+    if not comp_nodes:
+        st.info("No compromised nodes in current simulation.")
+    else:
+        p_idx = 1
+        for cn in comp_nodes:
+            cdata = st.session_state.G.nodes.get(cn, {})
+            cdisplay = cdata.get("display_name", cn)
+            cscore = cdata.get("risk_score", 50.0)
+            csev = cdata.get("risk_severity", "MEDIUM")
+            cports = cdata.get("open_ports", [])
+            ccves = cdata.get("cve_findings", [])
+            csev_color = "#ff3355" if csev == "CRITICAL" else "#ff8c00" if csev == "HIGH" else "#ffd700" if csev == "MEDIUM" else "#00ff88"
+
+            why_txt = (
+                f"Asset was compromised during simulation via {cdata.get('services', ['service exposure'])[0]} "
+                f"and provides lateral propagation access to {len(cdata.get('open_ports', []))} reachable listening ports."
+            )
+            action_txt = (
+                f"Apply host firewall rules to restrict sensitive ports ({', '.join(str(p) for p in cports[:3])}) "
+                f"and patch identified CVEs ({ccves[0]['cve_id'] if ccves else 'harden service configuration'})."
+            )
+
+            st.markdown(f"""
+            <div style='background:#091520;border-left:4px solid {csev_color};border:1px solid #1a3a5c;padding:12px 16px;border-radius:4px;margin-bottom:10px'>
+                <div style='display:flex;justify-content:space-between;align-items:center'>
+                    <div style='color:{csev_color};font-family:Orbitron,monospace;font-size:0.82rem;font-weight:bold'>
+                        #{p_idx} — HIGH RISK VECTOR ON {cdisplay}
+                    </div>
+                    <div style='background:rgba(255,255,255,0.05);padding:2px 8px;border-radius:3px;font-family:Share Tech Mono;font-size:0.68rem;color:{csev_color}'>
+                        RISK: {cscore}/100 ({csev})
+                    </div>
+                </div>
+                <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#e0f4ff;margin-top:6px;line-height:1.7'>
+                    • <b>Simulation Leverage:</b> {why_txt}<br>
+                    • <b>Recommended Hardening:</b> <span style='color:#00ff88'>{action_txt}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            p_idx += 1
+
+
+# ─────────────────────────────────────────────────────────────────
+# 🧭 MODERN TAB-BASED CYBER-DEFENSE LIFECYCLE NAVIGATION
+# ─────────────────────────────────────────────────────────────────
+tab_exec, tab_assets_vulns, tab_prop_sim, tab_sim_map, tab_defense, tab_alerts = st.tabs([
+    "🏠 Executive Overview",
+    "🧬 Discover & Assess",
+    "⚔️ Attack Propagation Simulator",
+    "🗺️ Attack Graph & Blast Radius",
+    "🛡️ Defense Optimization & Verification",
     "🚨 Alerts & Reports",
 ])
+
+# ═════════════════════════════════════════════════════════════════
+# TAB 2: ⚔️ DYNAMIC DECISION-BASED ATTACK PROPAGATION SIMULATOR
+# ═════════════════════════════════════════════════════════════════
+with tab_prop_sim:
+    render_decision_propagation_tab()
 
 # ═════════════════════════════════════════════════════════════════
 # TAB 1: 🏠 EXECUTIVE DASHBOARD
@@ -4994,9 +6177,9 @@ with tab_sim_map:
             help="The system where the attacker first gained simulated access",
         )
     with sim_ctrl2:
-        run_sim_btn = st.button("▶  RUN SIMULATION", use_container_width=True, disabled=not all_sim_nodes)
+        run_sim_btn = st.button("▶  RUN SIMULATION", use_container_width=True, disabled=not all_sim_nodes, key="btn_run_sim_map")
     with sim_ctrl3:
-        reset_sim_btn = st.button("↺  RESET SIMULATION", use_container_width=True)
+        reset_sim_btn = st.button("↺  RESET SIMULATION", use_container_width=True, key="btn_reset_sim_map")
 
     if reset_sim_btn:
         for node in st.session_state.G.nodes:
@@ -5334,9 +6517,11 @@ with tab_defense:
             st.session_state.segmentation_applied = st.session_state.segmentation_applied or seg_applied
 
             current_entry = st.session_state.get("last_entry_node") or (entry_node if 'entry_node' in locals() else None)
+            live_val_snapshot = st.session_state.get("live_validation_results") or None
             new_timeline, new_compromised, new_honeypot, new_stats = simulate_attack(
                 st.session_state.G, current_entry, seed=random.randint(1, 9999),
                 ids_deployed=st.session_state.ids_deployed, segmentation_applied=st.session_state.segmentation_applied,
+                live_validation=live_val_snapshot,
             )
             new_risk, new_bd = calculate_risk(st.session_state.G, new_compromised, new_timeline, new_honeypot, new_stats)
             st.session_state.timeline = new_timeline

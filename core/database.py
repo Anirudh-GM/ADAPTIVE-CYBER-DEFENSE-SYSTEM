@@ -27,8 +27,10 @@ reuse from a background scheduler fragment.
 """
 
 import os
+import re
 import json
 import sqlite3
+import hashlib
 from datetime import datetime, timezone
 
 from core import change_detector
@@ -42,7 +44,9 @@ DEFAULT_DB_PATH = os.path.join(DB_DIR, "acds.db")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id           TEXT UNIQUE,
     ip_address         TEXT,
+    previous_ips       TEXT,                             -- JSON array of historical IP addresses
     mac_address        TEXT,
     hostname           TEXT,
     vendor             TEXT,
@@ -51,12 +55,14 @@ CREATE TABLE IF NOT EXISTS assets (
     first_seen         TEXT NOT NULL,
     last_seen          TEXT NOT NULL,
     status             TEXT NOT NULL DEFAULT 'ONLINE',   -- ONLINE / OFFLINE
+    lifecycle_status   TEXT NOT NULL DEFAULT 'NEW',      -- NEW / ACTIVE / IP_CHANGED / UPDATED / OFFLINE / RETURNED
     current_risk       REAL,
     criticality        TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_assets_ip  ON assets(ip_address);
-CREATE INDEX IF NOT EXISTS idx_assets_mac ON assets(mac_address);
+CREATE INDEX IF NOT EXISTS idx_assets_asset_id ON assets(asset_id);
+CREATE INDEX IF NOT EXISTS idx_assets_ip       ON assets(ip_address);
+CREATE INDEX IF NOT EXISTS idx_assets_mac      ON assets(mac_address);
 
 CREATE TABLE IF NOT EXISTS services (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -213,6 +219,26 @@ CREATE TABLE IF NOT EXISTS cve_history (
 
 CREATE INDEX IF NOT EXISTS idx_cve_history_time  ON cve_history(timestamp);
 CREATE INDEX IF NOT EXISTS idx_cve_history_asset ON cve_history(asset_ip);
+
+-- ─────────────────────────────────────────────────────────────────
+-- ACDS LEVEL 2: REAL-TIME DEFENSIVE VALIDATION HISTORY
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS validation_history (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp          TEXT NOT NULL,
+    asset_id           TEXT NOT NULL,
+    ip_address         TEXT,
+    port               INTEGER,
+    service            TEXT,
+    previous_state     TEXT,
+    current_state      TEXT,
+    validation_result  TEXT,
+    latency_ms         REAL,
+    change_type        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_validation_asset ON validation_history(asset_id);
+CREATE INDEX IF NOT EXISTS idx_validation_time  ON validation_history(timestamp);
 """
 
 
@@ -242,56 +268,83 @@ def init_db(db_path=DEFAULT_DB_PATH):
 
 
 def _migrate_schema(conn):
-    """Sprint 3 — Phase 6: databases created before this sprint have an
-    `alerts` table without the acknowledgement columns. CREATE TABLE IF
-    NOT EXISTS never alters an existing table, so add them here with a
-    guarded ALTER TABLE — safe to run on every startup, and a no-op on a
-    brand-new database (the table doesn't exist yet, SCHEMA creates it
-    with these columns already included)."""
+    """Ensure all required columns exist in older databases without dropping data."""
     tables = {row["name"] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if "alerts" not in tables:
-        return
-    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()}
-    if "acknowledged" not in existing_cols:
-        conn.execute("ALTER TABLE alerts ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0")
-    if "acknowledged_at" not in existing_cols:
-        conn.execute("ALTER TABLE alerts ADD COLUMN acknowledged_at TEXT")
+    if "alerts" in tables:
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+        if "acknowledged" not in existing_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0")
+        if "acknowledged_at" not in existing_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN acknowledged_at TEXT")
+
+    if "assets" in tables:
+        asset_cols = {row["name"] for row in conn.execute("PRAGMA table_info(assets)").fetchall()}
+        if "asset_id" not in asset_cols:
+            conn.execute("ALTER TABLE assets ADD COLUMN asset_id TEXT")
+        if "previous_ips" not in asset_cols:
+            conn.execute("ALTER TABLE assets ADD COLUMN previous_ips TEXT")
+        if "lifecycle_status" not in asset_cols:
+            conn.execute("ALTER TABLE assets ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'NEW'")
 
 
-def _find_asset(conn, mac, ip):
-    """Match key priority: MAC address first (stable across DHCP lease
-    changes), falling back to IP address for devices with no readable
-    MAC (e.g. scanning machine itself, or ARP not available)."""
+def generate_asset_id(mac, ip=None, hostname=None, vendor=None, os_type=None):
+    """
+    Generate a stable, permanent asset_id.
+    - If MAC exists: ASSET-<MAC_HEX> (e.g. ASSET-701AB87DC72E)
+    - If no MAC: deterministic hash from hostname/vendor/os
+    """
+    if mac and mac.strip() and mac.strip().upper() not in ("UNKNOWN", "LOCAL", "NONE", "—", "-"):
+        clean_mac = re.sub(r'[^A-Fa-f0-9]', '', mac).upper()
+        if clean_mac:
+            return f"ASSET-{clean_mac}"
+    
+    # Deterministic fingerprint hash for devices without MAC
+    import hashlib
+    fp = f"{hostname or ''}|{vendor or ''}|{os_type or ''}|{ip or ''}".strip()
+    h = hashlib.sha256(fp.encode('utf-8', errors='ignore')).hexdigest()[:10].upper()
+    return f"ASSET-{h}"
+
+
+def _find_asset(conn, mac, ip, hostname=None, asset_id=None):
+    """Match key priority:
+    1. asset_id (direct stable key)
+    2. Normalized MAC address (hardware identity, invariant across DHCP changes)
+    3. Hostname + vendor (when MAC is absent)
+    4. IP address fallback
+    """
     row = None
-    if mac:
-        row = conn.execute("SELECT * FROM assets WHERE mac_address = ?", (mac,)).fetchone()
-    if row is None and ip:
+    if asset_id:
+        row = conn.execute("SELECT * FROM assets WHERE asset_id = ?", (asset_id,)).fetchone()
+        if row:
+            return row
+
+    if mac and mac.strip() and mac.strip().upper() not in ("UNKNOWN", "LOCAL", "NONE", "—", "-"):
+        clean_mac = mac.strip().replace('-', ':').upper()
+        row = conn.execute("SELECT * FROM assets WHERE UPPER(REPLACE(mac_address, '-', ':')) = ?", (clean_mac,)).fetchone()
+        if row:
+            return row
+
+    if hostname and hostname.strip() and hostname.lower() not in ('unknown', 'none', (ip or '').lower()):
         row = conn.execute(
-            "SELECT * FROM assets WHERE ip_address = ? AND mac_address IS ?", (ip, mac)
+            "SELECT * FROM assets WHERE LOWER(hostname) = ? AND (mac_address IS NULL OR mac_address = '')",
+            (hostname.strip().lower(),)
         ).fetchone()
+        if row:
+            return row
+
+    if ip:
+        row = conn.execute(
+            "SELECT * FROM assets WHERE ip_address = ? AND (mac_address IS NULL OR mac_address = '')", (ip,)
+        ).fetchone()
+        if not row:
+            row = conn.execute("SELECT * FROM assets WHERE ip_address = ?", (ip,)).fetchone()
+
     return row
 
 
 def record_monitoring_scan(devices, subnet, duration, db_path=DEFAULT_DB_PATH):
-    """Persist one completed monitoring pass (Phases 2/3/4).
-
-    devices: list of dicts, each shaped like:
-        {
-          'ip': str, 'mac': str|None, 'hostname': str|None,
-          'vendor': str|None, 'os': str|None, 'device_type': str|None,
-          'criticality': str|None, 'current_risk': float|None,
-          'ports': [ {'port': int, 'protocol': 'tcp', 'service': str,
-                       'version': str|None, 'banner': str|None}, ... ],
-        }
-
-    Returns (changes, snapshot_id):
-        changes      - list of structured change dicts from
-                        core.change_detector.detect_asset_service_changes
-                        (NEW_ASSET / REMOVED_ASSET / NEW_PORT /
-                        CLOSED_PORT / SERVICE_CHANGED / VERSION_CHANGED)
-        snapshot_id  - the new scan_snapshots row id
-    """
+    """Persist one completed monitoring pass with stable asset tracking and lifecycle status."""
     conn = get_connection(db_path)
     try:
         now = datetime.now(timezone.utc).isoformat()
@@ -302,7 +355,7 @@ def record_monitoring_scan(devices, subnet, duration, db_path=DEFAULT_DB_PATH):
         )
         snapshot_id = cur.lastrowid
 
-        # ---- Capture state BEFORE this scan (for the change detector) ----
+        # Capture state BEFORE this scan (for the change detector)
         previous_assets = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM assets").fetchall()}
         previous_services = {}
         for row in conn.execute("SELECT * FROM services").fetchall():
@@ -310,8 +363,9 @@ def record_monitoring_scan(devices, subnet, duration, db_path=DEFAULT_DB_PATH):
 
         before_state = {
             "assets": {
-                aid: {"ip": a["ip_address"], "mac": a["mac_address"],
-                      "hostname": a["hostname"], "status": a["status"]}
+                aid: {"asset_id": a.get("asset_id"), "ip": a["ip_address"], "previous_ips": a.get("previous_ips"),
+                      "mac": a["mac_address"], "hostname": a["hostname"], "status": a["status"],
+                      "lifecycle_status": a.get("lifecycle_status", "ACTIVE")}
                 for aid, a in previous_assets.items()
             },
             "services": {
@@ -320,7 +374,7 @@ def record_monitoring_scan(devices, subnet, duration, db_path=DEFAULT_DB_PATH):
             },
         }
 
-        # ---- Insert / update assets + services seen in THIS scan ----
+        # Insert / update assets + services seen in THIS scan
         seen_ids = set()
         after_assets = {}
         after_services = {}
@@ -328,30 +382,59 @@ def record_monitoring_scan(devices, subnet, duration, db_path=DEFAULT_DB_PATH):
         for dev in devices:
             ip = dev.get("ip")
             mac = dev.get("mac") or None
-            row = _find_asset(conn, mac, ip)
+            hostname = dev.get("hostname")
+            vendor = dev.get("vendor")
+            os_type = dev.get("os")
+            dev_type = dev.get("device_type")
+            dev_asset_id = dev.get("asset_id") or generate_asset_id(mac, ip, hostname, vendor, os_type)
+
+            row = _find_asset(conn, mac, ip, hostname, dev_asset_id)
 
             if row is None:
                 cur = conn.execute(
-                    "INSERT INTO assets (ip_address, mac_address, hostname, vendor, operating_system, "
-                    "device_type, first_seen, last_seen, status, current_risk, criticality) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (ip, mac, dev.get("hostname"), dev.get("vendor"), dev.get("os"),
-                     dev.get("device_type"), now, now, "ONLINE",
+                    "INSERT INTO assets (asset_id, ip_address, previous_ips, mac_address, hostname, vendor, operating_system, "
+                    "device_type, first_seen, last_seen, status, lifecycle_status, current_risk, criticality) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (dev_asset_id, ip, json.dumps([]), mac, hostname, vendor, os_type,
+                     dev_type, now, now, "ONLINE", "NEW",
                      dev.get("current_risk"), dev.get("criticality")),
                 )
                 asset_id = cur.lastrowid
+                lifecycle_status = "NEW"
             else:
                 asset_id = row["id"]
+                current_prev_ips = []
+                if row["previous_ips"]:
+                    try:
+                        current_prev_ips = json.loads(row["previous_ips"])
+                    except Exception:
+                        current_prev_ips = []
+
+                old_ip = row["ip_address"]
+                lifecycle_status = "ACTIVE"
+                if old_ip and old_ip != ip:
+                    if old_ip not in current_prev_ips:
+                        current_prev_ips.append(old_ip)
+                    lifecycle_status = "IP_CHANGED"
+
+                if row["status"] == "OFFLINE":
+                    lifecycle_status = "RETURNED" if lifecycle_status != "IP_CHANGED" else "RETURNED / IP_CHANGED"
+
+                stable_id = row["asset_id"] or dev_asset_id
+
                 conn.execute(
-                    "UPDATE assets SET ip_address=?, mac_address=COALESCE(?, mac_address), "
+                    "UPDATE assets SET asset_id=?, ip_address=?, previous_ips=?, mac_address=COALESCE(?, mac_address), "
                     "hostname=?, vendor=?, operating_system=?, device_type=?, last_seen=?, "
-                    "status='ONLINE', current_risk=?, criticality=? WHERE id=?",
-                    (ip, mac, dev.get("hostname"), dev.get("vendor"), dev.get("os"),
-                     dev.get("device_type"), now, dev.get("current_risk"), dev.get("criticality"),
+                    "status='ONLINE', lifecycle_status=?, current_risk=?, criticality=? WHERE id=?",
+                    (stable_id, ip, json.dumps(current_prev_ips), mac, hostname, vendor, os_type,
+                     dev_type, now, lifecycle_status, dev.get("current_risk"), dev.get("criticality"),
                      asset_id),
                 )
             seen_ids.add(asset_id)
-            after_assets[asset_id] = {"ip": ip, "mac": mac, "hostname": dev.get("hostname"), "status": "ONLINE"}
+            after_assets[asset_id] = {
+                "asset_id": dev_asset_id, "ip": ip, "mac": mac,
+                "hostname": hostname, "status": "ONLINE", "lifecycle_status": lifecycle_status
+            }
 
             port_map = {}
             for svc in dev.get("ports", []):
@@ -401,7 +484,11 @@ def record_monitoring_scan(devices, subnet, duration, db_path=DEFAULT_DB_PATH):
             if aid in seen_ids:
                 continue
             if a["status"] != "OFFLINE":
-                conn.execute("UPDATE assets SET status='OFFLINE' WHERE id=?", (aid,))
+                conn.execute("UPDATE assets SET status='OFFLINE', lifecycle_status='OFFLINE' WHERE id=?", (aid,))
+            after_assets[aid] = {
+                "asset_id": a.get("asset_id"), "ip": a["ip_address"], "mac": a["mac_address"],
+                "hostname": a["hostname"], "status": "OFFLINE", "lifecycle_status": "OFFLINE"
+            }
             conn.execute(
                 "INSERT INTO asset_history (asset_id, snapshot_id, ip, mac, hostname, os, device_type, "
                 "status) VALUES (?,?,?,?,?,?,?,?)",
@@ -928,3 +1015,102 @@ def get_cve_timeline(limit=50, db_path=DEFAULT_DB_PATH):
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────
+# ACDS LEVEL 2: LIVE VALIDATION HISTORY PERSISTENCE
+# ─────────────────────────────────────────────────────────────────
+
+def record_validation_event(asset_id, ip_address, port=None, service=None,
+                            previous_state=None, current_state=None,
+                            validation_result="VALIDATED", latency_ms=0.0,
+                            change_type=None, timestamp=None, db_path=DEFAULT_DB_PATH):
+    """
+    Records a live defensive validation event to the validation_history table.
+    """
+    ts = timestamp or datetime.now(timezone.utc).isoformat()
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO validation_history (timestamp, asset_id, ip_address, port, service, "
+            "previous_state, current_state, validation_result, latency_ms, change_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, str(asset_id), str(ip_address), port, service, previous_state,
+             current_state, validation_result, float(latency_ms or 0.0), change_type)
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        log.error("record_validation_event failed: %s", exc)
+    finally:
+        conn.close()
+
+
+def record_validation_snapshot(snapshot, db_path=DEFAULT_DB_PATH):
+    """
+    Records all port validation outcomes from a live validation snapshot.
+    """
+    if not snapshot:
+        return
+    aid = snapshot.get("asset_id", "UNKNOWN")
+    ip = snapshot.get("ip", "")
+    ts = snapshot.get("timestamp", datetime.now(timezone.utc).isoformat())
+    lat = snapshot.get("latency_ms", 0.0)
+    ports_val = snapshot.get("ports_validated", {})
+
+    for port, p_info in ports_val.items():
+        record_validation_event(
+            asset_id=aid,
+            ip_address=ip,
+            port=port,
+            service=p_info.get("service"),
+            previous_state=None,
+            current_state=p_info.get("status", "OPEN" if p_info.get("open") else "CLOSED"),
+            validation_result=p_info.get("validation_status", "VALIDATED"),
+            latency_ms=p_info.get("latency_ms", lat),
+            change_type=None,
+            timestamp=ts,
+            db_path=db_path
+        )
+
+
+def get_validation_history(asset_id=None, limit=50, db_path=DEFAULT_DB_PATH):
+    """
+    Retrieves the most recent validation records from the validation_history table.
+    """
+    conn = get_connection(db_path)
+    try:
+        if asset_id:
+            rows = conn.execute(
+                "SELECT * FROM validation_history WHERE asset_id = ? OR ip_address = ? "
+                "ORDER BY id DESC LIMIT ?", (str(asset_id), str(asset_id), limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM validation_history ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.Error as exc:
+        log.error("get_validation_history failed: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+def get_latest_validations_per_asset(db_path=DEFAULT_DB_PATH):
+    """
+    Returns latest validation snapshot per asset_id.
+    """
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM validation_history WHERE id IN ("
+            "    SELECT MAX(id) FROM validation_history GROUP BY asset_id, port"
+            ") ORDER BY timestamp DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.Error as exc:
+        log.error("get_latest_validations_per_asset failed: %s", exc)
+        return []
+    finally:
+        conn.close()
+

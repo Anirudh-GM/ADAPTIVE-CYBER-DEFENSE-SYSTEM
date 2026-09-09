@@ -18,6 +18,7 @@ core/database.create_alerts() and the "🚨 REAL-TIME ALERTS" panel.
 ALERT_TYPES = {
     "NEW_CVE", "RISK_INCREASE", "CRITICAL_ASSET_EXPOSED",
     "NEW_EXPOSURE_PATH", "HONEYPOT_PATH", "RISK_DECREASE",
+    "IP_CHANGED", "DEVICE_RETURNED", "NEW_ASSET", "REMOVED_ASSET",
 }
 
 SEVERITIES = ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL")
@@ -79,6 +80,22 @@ def generate_change_alerts(before_assets, after_assets, before_edges, after_edge
     after_assets = after_assets or {}
     before_edges = before_edges or set()
     after_edges = after_edges or set()
+
+    # ---- IP_CHANGED ---------------------------------------------------
+    from core.change_detector import diff_scans
+    diff = diff_scans(before_assets, after_assets)
+    for change in diff.get("ip_changed_assets", []):
+        old_ip = change.get("old_ip")
+        new_ip = change.get("new_ip")
+        after_obj = after_assets.get(new_ip, {})
+        label = _asset_label(after_obj, None, new_ip)
+        alerts.append({
+            "timestamp": now_iso, "severity": "INFO",
+            "alert_type": "IP_CHANGED", "asset": label,
+            "title": "Device IP changed (DHCP reassignment)",
+            "description": f"Stable asset {label} migrated from IP {old_ip} to {new_ip}. Historical risk and CVE profile preserved.",
+            "old_value": old_ip, "new_value": new_ip,
+        })
 
     # ---- RISK_INCREASE / RISK_DECREASE -------------------------------
     for ip, after in after_assets.items():
