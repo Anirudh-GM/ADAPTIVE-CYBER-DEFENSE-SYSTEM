@@ -3591,11 +3591,11 @@ def render_before_after_verification():
 # MODULE 5: ASSET INTELLIGENCE & GRAPH VISUALIZATION ENGINE
 # ─────────────────────────────────────────────────────────────────
 
-def _evidence_block(title, evidence_list, color="#3d6a8a"):
+def _evidence_block(title, evidence_list, color="#7ab8d4"):
     if not evidence_list:
         return ""
-    items = "".join(f"<div>✓ {html_lib.escape(str(e))}</div>" for e in evidence_list[:4])
-    return f"<div style='margin:2px 0 6px 70px;font-size:0.62rem;color:{color};line-height:1.6'>{items}</div>"
+    chips = "".join(f"<span style='display:inline-block;background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.18);color:{color};padding:1px 5px;border-radius:2px;margin:1px 2px;font-size:0.62rem;white-space:nowrap;'>✓ {html_lib.escape(str(e))}</span>" for e in evidence_list[:4])
+    return f"<div style='margin:1px 0 3px 0;display:flex;flex-wrap:wrap;gap:2px;'>{chips}</div>"
 
 def render_node_panel(active_node=None, selected_node=None, G=None):
     if G is None:
@@ -3614,8 +3614,8 @@ def render_node_panel(active_node=None, selected_node=None, G=None):
         if is_active:
             card_class = "compromised"
 
-        status_icon = ("🔴 COMPROMISED (simulated)" if is_comp else
-                        "🟢 ISOLATED (defense applied)" if is_isolated else
+        status_icon = ("🔴 COMPROMISED" if is_comp else
+                        "🟢 ISOLATED" if is_isolated else
                         "⚠ ALERT" if (is_honey and st.session_state.get("honeypot_triggered", False)) else
                         "🟡 DECOY" if is_honey else "🔵 OBSERVED SECURE")
         if is_active:
@@ -3625,7 +3625,7 @@ def render_node_panel(active_node=None, selected_node=None, G=None):
         crit_val = data.get("criticality", 1)
         crit_stars = "★" * crit_val + "☆" * (5 - crit_val)
         crit_conf = data.get('criticality_confidence')
-        conf_str = f" ({int(crit_conf*100)}% confidence)" if isinstance(crit_conf, (int, float)) else ""
+        conf_str = f" ({int(crit_conf*100)}%)" if isinstance(crit_conf, (int, float)) else ""
 
         ip = data.get('ip', '')
         hostname = data.get('hostname', '')
@@ -3641,29 +3641,17 @@ def render_node_panel(active_node=None, selected_node=None, G=None):
         if not lifecycle_status and prev_ips:
             lifecycle_status = "IP_CHANGED"
 
-        asset_id_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Asset ID:</span><span style='color:#00ff88;font-family:Share Tech Mono,monospace;font-weight:bold'>{asset_id}</span></div>" if asset_id else ""
-        lifecycle_badge = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#ffaa33;width:105px'>State:</span><span style='background:rgba(255,170,51,0.12);border:1px solid #ffaa33;color:#ffaa33;padding:2px 6px;border-radius:3px;font-size:0.65rem;font-weight:bold'>🔄 SAME DEVICE — IP CHANGED</span></div>" if (lifecycle_status == "IP_CHANGED" or prev_ips) else ""
-        prev_ips_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Previous IP(s):</span><span style='color:#7ab8d4;font-family:Share Tech Mono,monospace'>{', '.join(prev_ips)}</span></div>" if prev_ips else ""
-        mac_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>MAC Address:</span><span style='color:#e0f4ff;font-family:Share Tech Mono,monospace'>{mac_addr}</span></div>" if mac_addr else ""
-        hostname_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Hostname:</span><span style='color:#e0f4ff'>{hostname}</span></div>" if hostname else ""
-
         os_type = data.get('os', 'unknown')
         os_confidence = data.get('os_confidence')
         os_evidence = data.get('os_evidence') or []
         os_icon = {'windows': '🪟', 'linux': '🐧', 'macos': '🍎', 'ios': '📱', 'android': '🤖', 'unknown': '❓'}.get(os_type.lower(), '❓')
-        conf_suffix = f" · {int(round(os_confidence * 100))}% confidence" if isinstance(os_confidence, (int, float)) else ""
+        conf_suffix = f" · {int(round(os_confidence * 100))}%" if isinstance(os_confidence, (int, float)) else ""
         os_label = {'windows': 'Windows', 'linux': 'Linux', 'macos': 'macOS', 'ios': 'iOS', 'android': 'Android'}.get(os_type.lower(), os_type.upper() if os_type else 'Unknown')
-        os_html = (
-            f"<div style='display:flex;align-items:center;margin:4px 0'>"
-            f"<span style='color:#3d6a8a;width:105px'>Inferred OS:</span>"
-            f"<span style='color:#e0f4ff'>{os_icon} {os_label}{conf_suffix}</span></div>"
-            + _evidence_block("", os_evidence)
-        )
 
         device_type = data.get('device_type', '')
         device_evidence = data.get('device_evidence') or []
         device_conf = data.get('device_confidence')
-        dconf_str = f" · {int(device_conf*100)}% confidence" if isinstance(device_conf, (int, float)) else ""
+        dconf_str = f" · {int(device_conf*100)}%" if isinstance(device_conf, (int, float)) else ""
         vendor = data.get('mac_vendor')
         device_icon = {
             'Mobile Device': '📱', 'Tablet': '📱', 'Network Device': '🌐',
@@ -3672,12 +3660,6 @@ def render_node_panel(active_node=None, selected_node=None, G=None):
             'Mac Computer': '🍎', 'Decoy System': '🍯',
         }.get(device_type, '💻' if os_type == 'windows' else '🖥️' if os_type == 'linux' else '📦')
         vendor_suffix = f" ({vendor})" if vendor else ""
-        device_html = (
-            f"<div style='display:flex;align-items:center;margin:4px 0'>"
-            f"<span style='color:#3d6a8a;width:105px'>Inferred Device:</span>"
-            f"<span style='color:#e0f4ff'>{device_icon} {device_type or 'Network Host'}{vendor_suffix}{dconf_str}</span>"
-            f"</div>" + _evidence_block("", device_evidence)
-        )
 
         version_map = data.get('version_map', {})
         services = data.get('services', [])
@@ -3685,9 +3667,7 @@ def render_node_panel(active_node=None, selected_node=None, G=None):
             svc_strs = [f"{s} ({version_map[s]})" if version_map.get(s) else s for s in services[:4]]
         else:
             svc_strs = services[:4]
-        services_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Services:</span><span style='color:#e0f4ff'>{', '.join(svc_strs)}{'...' if len(services) > 4 else ''}</span></div>" if services else ""
         open_ports = data.get('open_ports', [])
-        ports_html = f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Ports:</span><span style='color:#e0f4ff'>{', '.join(str(p) for p in open_ports) or 'None detected'}</span></div>"
 
         risk_score = data.get('risk_score', int(data.get('vulnerability', 0) * 100))
         risk_severity = data.get('risk_severity', 'LOW')
@@ -3696,65 +3676,104 @@ def render_node_panel(active_node=None, selected_node=None, G=None):
         def comp_row(key, label, cap):
             c = comps.get(key, {})
             contrib = c.get('contribution', 0)
-            return f"<div style='display:flex;justify-content:space-between;color:#7ab8d4;margin:2px 0;'><span>{label}</span><span style='color:#e0f4ff'>{contrib:.1f} / {cap}</span></div>"
+            return f"<div style='display:flex;justify-content:space-between;color:#7ab8d4;margin:1px 0;'><span>{label}</span><span style='color:#e0f4ff'>{contrib:.1f}/{cap}</span></div>"
 
         risk_breakdown_html = ""
+        risk_color = "#ff3355" if risk_score > 70 else "#ff8c00" if risk_score > 40 else "#00ff88"
         if comps:
             risk_breakdown_html = (
-                "<div style='margin:6px 0;padding:8px 10px;background:rgba(0,212,255,0.04);border:1px solid #1a3a5c;border-radius:4px;font-size:0.65rem'>"
-                "<div style='color:#00d4ff;font-weight:bold;margin-bottom:6px;letter-spacing:1px'>RISK CALCULATION BREAKDOWN</div>"
+                "<div style='margin:4px 0;padding:5px 8px;background:rgba(0,212,255,0.03);border:1px solid #1a3a5c;border-radius:4px;font-size:0.64rem'>"
+                "<div style='color:#00d4ff;font-weight:bold;margin-bottom:3px;letter-spacing:0.8px;font-size:0.64rem'>RISK CALCULATION BREAKDOWN</div>"
+                "<div style='display:grid;grid-template-columns:1fr 1fr;gap:2px 14px;'>"
                 + comp_row('vulnerability', 'Vulnerability / CVSS', 40)
-                + comp_row('service_exposure', 'Service Exposure', 20)
-                + comp_row('sensitive_services', 'Sensitive Services', 15)
                 + comp_row('criticality', 'Asset Criticality', 15)
+                + comp_row('service_exposure', 'Service Exposure', 20)
                 + comp_row('network_exposure', 'Network Exposure', 10)
-                + f"<div style='border-top:1px solid #1a3a5c;margin-top:6px;padding-top:4px;display:flex;justify-content:space-between;color:#00d4ff;font-weight:bold'><span>TOTAL SCORE</span><span style='color:#00ff88'>{risk_score} / 100</span></div>"
-                "</div>"
+                + comp_row('sensitive_services', 'Sensitive Services', 15)
+                + f"<div style='display:flex;justify-content:space-between;color:#00d4ff;font-weight:bold;border-top:1px solid #1a3a5c;padding-top:2px'><span>TOTAL</span><span style='color:{risk_color}'>{risk_score}/100</span></div>"
+                + "</div></div>"
             )
-        risk_color = "#ff3355" if risk_score > 70 else "#ff8c00" if risk_score > 40 else "#00ff88"
+
         risk_html = (
-            f"<div style='margin:6px 0;padding:6px 10px;background:rgba(0,212,255,0.05);border-left:3px solid {risk_color};border-radius:2px'>"
-            f"<div style='color:{risk_color};font-size:0.72rem;font-weight:bold;'>ASSET RISK: {risk_score}/100 — {risk_severity}</div></div>"
+            f"<div style='margin:4px 0;padding:4px 8px;background:rgba(0,212,255,0.05);border-left:3px solid {risk_color};border-radius:2px;display:flex;justify-content:space-between;align-items:center'>"
+            f"<span style='color:{risk_color};font-size:0.72rem;font-weight:bold;'>ASSET RISK: {risk_score}/100 — {risk_severity}</span>"
+            f"<span style='color:#7ab8d4;font-size:0.64rem;'>Score: {risk_score}</span>"
+            f"</div>"
             + risk_breakdown_html
         )
 
         sensitive_detected = (data.get('asset_risk') or {}).get('sensitive_detected', [])
-        sensitive_html = ""
-        if sensitive_detected:
-            sens_strs = [f"{s[0]} ({s[1]})" if isinstance(s, (list, tuple)) and len(s) >= 2 else str(s) for s in sensitive_detected]
-            sensitive_html = (
-                f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Sensitive:</span>"
-                f"<span style='color:#ff3355'>{', '.join(sens_strs)}</span></div>"
-            )
+        sens_strs = [f"{s[0]} ({s[1]})" if isinstance(s, (list, tuple)) and len(s) >= 2 else str(s) for s in sensitive_detected] if sensitive_detected else []
 
         cve_findings = data.get('cve_findings', [])
         cve_html = ""
         if cve_findings:
             cve_badges = "".join(
                 f"<span class='cve-tag' title='{c.get('summary','')[:80]}'>{c['cve_id']} (CVSS {c['cvss']})</span>"
-                for c in cve_findings[:4]
+                for c in cve_findings[:3]
             )
-            cve_html = f"<div style='margin:4px 0'><div style='color:#3d6a8a;font-size:0.65rem;margin-bottom:2px'>MATCHED CVEs:</div>{cve_badges}</div>"
+            cve_html = f"<div style='margin:3px 0;display:flex;align-items:center;gap:6px;'><span style='color:#3d6a8a;font-size:0.64rem'>CVEs:</span><div style='display:flex;flex-wrap:wrap;gap:2px'>{cve_badges}</div></div>"
 
         fixes = data.get('fixes', [])
         recommendation_html = ""
         if fixes:
-            recommendation_html = "".join(f"<div style='color:#00ff88;font-size:0.65rem;margin:2px 0;'>• {fix}</div>" for fix in fixes[:3])
-            recommendation_html = f"<div style='margin:6px 0;padding:8px 10px;background:rgba(0,255,136,0.04);border:1px solid #1a3a5c;border-left:3px solid #00ff88;border-radius:4px'><div style='color:#00ff88;font-size:0.65rem;font-weight:bold;margin-bottom:4px'>RECOMMENDED ACTIONS</div>{recommendation_html}</div>"
+            recs = "".join(f"<div style='color:#00ff88;font-size:0.63rem;margin:1px 0;'>• {fix}</div>" for fix in fixes[:2])
+            recommendation_html = f"<div style='margin:4px 0;padding:5px 8px;background:rgba(0,255,136,0.04);border:1px solid #1a3a5c;border-left:3px solid #00ff88;border-radius:4px'><div style='color:#00ff88;font-size:0.64rem;font-weight:bold;margin-bottom:2px'>RECOMMENDED ACTIONS</div>{recs}</div>"
 
         node_color = "#ff3355" if is_comp else "#00ff88" if is_isolated else "#ffd700" if is_honey else "#00d4ff"
         disp_title = data.get('display_name', node)
+
+        # 2-column info grid
+        left_fields = []
+        left_fields.append(f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>IP:</span><b style='color:#e0f4ff'>{ip}</b></div>")
+        if asset_id:
+            left_fields.append(f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>Asset ID:</span><span style='color:#00ff88;font-family:Share Tech Mono,monospace;font-weight:bold'>{asset_id}</span></div>")
+        if mac_addr:
+            left_fields.append(f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>MAC:</span><span style='color:#7ab8d4;font-family:Share Tech Mono,monospace'>{mac_addr}</span></div>")
+        if hostname:
+            left_fields.append(f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>Hostname:</span><span style='color:#e0f4ff'>{hostname}</span></div>")
+        left_fields.append(f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>Role:</span><span style='color:#e0f4ff'>{data.get('role', 'Node')}</span></div>")
+
+        right_fields = []
+        right_fields.append(f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>OS:</span><span style='color:#e0f4ff'>{os_icon} {os_label}{conf_suffix}</span></div>")
+        right_fields.append(f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>Device:</span><span style='color:#e0f4ff'>{device_icon} {device_type or 'Host'}{vendor_suffix}{dconf_str}</span></div>")
+        right_fields.append(f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>Criticality:</span><span style='color:#ffd700;'>{crit_label}{conf_str} ({crit_stars})</span></div>")
+        if lifecycle_status == "IP_CHANGED" or prev_ips:
+            right_fields.append(f"<div><span style='color:#ffaa33;display:inline-block;width:72px'>Prev IP(s):</span><span style='color:#ffaa33;font-size:0.65rem'>{', '.join(prev_ips)}</span></div>")
+
+        os_ev_block = _evidence_block("OS Evidence", os_evidence)
+        dev_ev_block = _evidence_block("Device Evidence", device_evidence)
+        crit_ev_block = _evidence_block("Criticality Evidence", data.get('criticality_evidence') or [])
+
+        all_evidence = ""
+        if os_ev_block or dev_ev_block or crit_ev_block:
+            all_evidence = f"<div style='margin:3px 0;'>{os_ev_block}{dev_ev_block}{crit_ev_block}</div>"
+
+        ports_str = ', '.join(str(p) for p in open_ports) or 'None'
+        services_str = ', '.join(svc_strs) or 'None'
+        network_fields = (
+            "<div style='margin:3px 0;font-size:0.71rem;display:flex;flex-direction:column;gap:2px;background:rgba(255,255,255,0.02);padding:4px 6px;border-radius:3px'>"
+            f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>Ports:</span><span style='color:#e0f4ff'>{ports_str}</span></div>"
+            f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>Services:</span><span style='color:#e0f4ff'>{services_str}{'...' if len(services) > 4 else ''}</span></div>"
+            + (f"<div><span style='color:#3d6a8a;display:inline-block;width:72px'>Sensitive:</span><span style='color:#ff3355'>{', '.join(sens_strs)}</span></div>" if sens_strs else "")
+            + "</div>"
+        )
+
         html += (
-            f"<div class='node-card {card_class}'>"
+            f"<div class='node-card {card_class}' style='padding:8px 10px;margin:2px 0;font-size:0.72rem;line-height:1.45;'>"
             f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;border-bottom:1px solid #1a3a5c;padding-bottom:4px'>"
             f"<span style='color:{node_color};font-family:Orbitron,monospace;font-size:0.82rem;font-weight:700'>{disp_title}</span>"
-            f"<span style='font-size:0.62rem;opacity:0.9'>{status_icon}</span></div>"
-            f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>IP:</span><span style='color:#e0f4ff'>{ip}</span></div>"
-            f"{asset_id_html}{lifecycle_badge}{mac_html}{prev_ips_html}{hostname_html}{os_html}{device_html}{ports_html}{services_html}{risk_html}{sensitive_html}{cve_html}{recommendation_html}"
-            f"<div style='display:flex;align-items:center;margin:4px 0'><span style='color:#3d6a8a;width:105px'>Role:</span><span style='color:#e0f4ff'>{data.get('role', 'Node')}</span></div>"
-            f"<div style='margin:4px 0'><span style='color:#3d6a8a;width:105px;display:inline-block;'>Criticality:</span><span style='color:#ffd700'>{crit_label}{conf_str} ({crit_stars})</span>"
-            + _evidence_block("", data.get('criticality_evidence') or [])
-            + "</div></div>"
+            f"<span style='font-size:0.64rem;font-weight:bold'>{status_icon}</span></div>"
+            f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:2px 10px;margin-bottom:3px;'>"
+            f"<div>{''.join(left_fields)}</div>"
+            f"<div>{''.join(right_fields)}</div>"
+            f"</div>"
+            f"{all_evidence}"
+            f"{network_fields}"
+            f"{risk_html}"
+            f"{cve_html}"
+            f"{recommendation_html}"
+            f"</div>"
         )
     return html
 
@@ -3766,7 +3785,7 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True,
     new_exposure_edges = new_exposure_edges or set()
     num_nodes = len(G.nodes)
 
-    net = Network(height="570px", width="100%", bgcolor="#050a0f", font_color="#7ab8d4", directed=True)
+    net = Network(height="670px", width="100%", bgcolor="#050a0f", font_color="#7ab8d4", directed=True)
 
     if layout_mode == "Hierarchical (Tiered)":
         layout_json = """
@@ -4039,19 +4058,19 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True,
     # Replace the pyvis card container with side-by-side flex layout (Map on Left, Inspector on Right)
     old_card_pattern = r'<div class="card" style="width: 100%">\s*<div id="mynetwork" class="card-body"></div>\s*</div>'
     side_by_side_html = """
-    <div class="hud-side-by-side-container" style="display: flex; flex-direction: row; gap: 14px; width: 100%; height: 570px; box-sizing: border-box; align-items: stretch; margin: 0; padding: 0;">
-        <div class="hud-map-panel" style="flex: 1.22; min-width: 0; height: 100%; position: relative; background: #050a0f; border: 1px solid #1a3a5c; border-radius: 6px; overflow: hidden; display: flex; flex-direction: column;">
+    <div class="hud-side-by-side-container" style="display: flex; flex-direction: row; gap: 14px; width: 100%; height: 670px; box-sizing: border-box; align-items: stretch; margin: 0; padding: 0;">
+        <div class="hud-map-panel" style="flex: 1.15; min-width: 0; height: 100%; position: relative; background: #050a0f; border: 1px solid #1a3a5c; border-radius: 6px; overflow: hidden; display: flex; flex-direction: column;">
             <div id="mynetwork" style="width: 100% !important; height: 100% !important; flex: 1; background-color: #050a0f !important; border: none !important;"></div>
         </div>
-        <div id="inspector-wrapper" style="flex: 0.98; min-width: 0; height: 100%; overflow-y: auto; background: #071019; border: 1px solid #1a3a5c; border-radius: 6px; padding: 12px 14px; box-sizing: border-box; display: flex; flex-direction: column;">
-            <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1a3a5c; padding-bottom: 8px; margin-bottom: 10px; flex-shrink: 0;">
+        <div id="inspector-wrapper" style="flex: 1.05; min-width: 0; height: 100%; overflow-y: auto; background: #071019; border: 1px solid #1a3a5c; border-radius: 6px; padding: 10px 12px; box-sizing: border-box; display: flex; flex-direction: column;">
+            <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1a3a5c; padding-bottom: 6px; margin-bottom: 8px; flex-shrink: 0;">
                 <span style="color: #00d4ff; font-weight: bold; font-size: 0.8rem; letter-spacing: 1px; display: flex; align-items: center; gap: 8px;">
                     <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#00d4ff;box-shadow:0 0 8px #00d4ff;"></span>
                     🔍 ASSET INTELLIGENCE INSPECTOR
                 </span>
                 <span id="inspector-badge" style="font-size: 0.68rem; color: #00ff88; background: rgba(0,255,136,0.08); padding: 3px 8px; border-radius: 3px; border: 1px solid rgba(0,255,136,0.25);">Click any node in map</span>
             </div>
-            <div id="inspector-body" style="font-size: 0.78rem; overflow-y: auto; flex: 1; padding-right: 4px;"></div>
+            <div id="inspector-body" style="font-size: 0.74rem; overflow-y: auto; flex: 1; padding-right: 2px;"></div>
         </div>
     </div>
     """
@@ -4073,7 +4092,7 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True,
         float: none !important;
     }}
     #inspector-wrapper::-webkit-scrollbar, #inspector-body::-webkit-scrollbar {{
-        width: 6px;
+        width: 5px;
     }}
     #inspector-wrapper::-webkit-scrollbar-track, #inspector-body::-webkit-scrollbar-track {{
         background: #050a0f;
@@ -4089,11 +4108,11 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True,
         background: #09141f;
         border: 1px solid #1a3a5c;
         border-left: 3px solid #00d4ff;
-        padding: 12px 14px;
-        margin: 6px 0;
+        padding: 8px 10px;
+        margin: 4px 0;
         font-family: 'Share Tech Mono', Segoe UI, monospace;
-        font-size: 0.76rem;
-        line-height: 1.7;
+        font-size: 0.74rem;
+        line-height: 1.5;
         border-radius: 4px;
     }}
     .node-card.safe {{ border-left-color: #00ff88; }}
@@ -4109,10 +4128,10 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True,
         border: 1px solid #ff3355;
         color: #ff3355;
         font-family: 'Share Tech Mono', monospace;
-        font-size: 0.65rem;
-        padding: 2px 6px;
-        margin: 2px;
-        border-radius: 3px;
+        font-size: 0.63rem;
+        padding: 1px 5px;
+        margin: 1px;
+        border-radius: 2px;
     }}
     .mitre-tag {{
         display: inline-block;
@@ -4120,18 +4139,18 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True,
         border: 1px solid #ff8c00;
         color: #ff8c00;
         font-family: 'Share Tech Mono', monospace;
-        font-size: 0.65rem;
-        padding: 2px 6px;
-        margin: 2px;
-        border-radius: 3px;
+        font-size: 0.63rem;
+        padding: 1px 5px;
+        margin: 1px;
+        border-radius: 2px;
     }}
     .risk-bar-container {{
         background: rgba(255,255,255,0.05);
         border: 1px solid #1a3a5c;
-        height: 10px;
+        height: 8px;
         border-radius: 2px;
         overflow: hidden;
-        margin: 4px 0;
+        margin: 3px 0;
     }}
     .risk-bar {{ height: 100%; transition: width 0.4s ease; border-radius: 2px; }}
     </style>
@@ -6281,7 +6300,7 @@ with tab_sim_map:
                                new_exposure_edges=st.session_state.get("new_exposure_edges"),
                                edge_filter=topo_edge_filter, layout_mode=topo_layout)
     with graph_placeholder:
-        st.components.v1.html(html_graph, height=590, scrolling=False)
+        st.components.v1.html(html_graph, height=690, scrolling=False)
 
     st.markdown("""
     <div style='display:flex;gap:12px;font-family:Share Tech Mono,monospace;font-size:0.62rem;margin-top:8px;margin-bottom:16px;flex-wrap:wrap;background:#050a0f;padding:8px 10px;border:1px solid #1a3a5c;border-radius:4px;'>
