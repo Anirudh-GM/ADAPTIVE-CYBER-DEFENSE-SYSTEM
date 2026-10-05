@@ -239,6 +239,24 @@ CREATE TABLE IF NOT EXISTS validation_history (
 
 CREATE INDEX IF NOT EXISTS idx_validation_asset ON validation_history(asset_id);
 CREATE INDEX IF NOT EXISTS idx_validation_time  ON validation_history(timestamp);
+
+-- ─────────────────────────────────────────────────────────────────
+-- ACDS v4.0 — PHASE 3: ADAPTIVE SIMULATION TOPOLOGY HISTORY
+-- Records graph topology snapshots for the historical timeline.
+-- One row per significant topology-changing event (new scan, monitoring
+-- pass, simulation run, or defense application).
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS topology_snapshots (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp      TEXT NOT NULL,
+    node_count     INTEGER NOT NULL DEFAULT 0,
+    edge_count     INTEGER NOT NULL DEFAULT 0,
+    critical_assets INTEGER NOT NULL DEFAULT 0,
+    avg_risk       REAL,
+    trigger        TEXT   -- MANUAL_SCAN / MONITORING / SIMULATION / DEFENSE_APPLIED
+);
+
+CREATE INDEX IF NOT EXISTS idx_topo_time ON topology_snapshots(timestamp);
 """
 
 
@@ -1114,3 +1132,75 @@ def get_latest_validations_per_asset(db_path=DEFAULT_DB_PATH):
     finally:
         conn.close()
 
+
+# ─────────────────────────────────────────────────────────────────
+# ACDS v4.0 — PHASE 9: HISTORICAL INTELLIGENCE HELPERS
+# ─────────────────────────────────────────────────────────────────
+
+def get_risk_history_summary(limit=30, db_path=DEFAULT_DB_PATH):
+    """Return overall risk trend rows (is_summary=1) newest-last for charting."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT timestamp, overall_risk, blast_radius, trigger "
+            "FROM risk_history WHERE is_summary = 1 "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return list(reversed([dict(r) for r in rows]))
+    except Exception as exc:
+        log.warning("get_risk_history_summary failed: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+def get_asset_count_trend(limit=30, db_path=DEFAULT_DB_PATH):
+    """Return asset count over time from scan_snapshots, newest-last."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT scan_time as timestamp, total_assets FROM scan_snapshots "
+            "ORDER BY snapshot_id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return list(reversed([dict(r) for r in rows]))
+    except Exception as exc:
+        log.warning("get_asset_count_trend failed: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+def record_topology_snapshot(node_count, edge_count, critical_assets, avg_risk, trigger,
+                              db_path=DEFAULT_DB_PATH):
+    """Phase 3: persist a topology snapshot for the historical timeline."""
+    conn = get_connection(db_path)
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO topology_snapshots "
+            "(timestamp, node_count, edge_count, critical_assets, avg_risk, trigger) "
+            "VALUES (?,?,?,?,?,?)",
+            (now, node_count, edge_count, critical_assets, round(avg_risk or 0, 2), trigger)
+        )
+        conn.commit()
+    except Exception as exc:
+        log.warning("record_topology_snapshot failed: %s", exc)
+    finally:
+        conn.close()
+
+
+def get_topology_history(limit=30, db_path=DEFAULT_DB_PATH):
+    """Return topology history rows for trend display."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM topology_snapshots ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return list(reversed([dict(r) for r in rows]))
+    except Exception as exc:
+        log.warning("get_topology_history failed: %s", exc)
+        return []
+    finally:
+        conn.close()
