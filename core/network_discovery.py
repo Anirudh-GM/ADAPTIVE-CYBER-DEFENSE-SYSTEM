@@ -106,10 +106,38 @@ def detect_network_environment():
                     ctx['gateway_ip'] = ad_data['gateway']
                 if ad_data.get('mask'):
                     ctx['netmask'] = ad_data['mask']
+
+            # Populate all active adapters
+            all_ads = []
+            for ad_name, ad_data in adapters.items():
+                ip_val = ad_data.get('ip')
+                if not ip_val or ip_val.startswith('127.'):
+                    continue
+                mask_val = ad_data.get('mask') or '255.255.255.0'
+                try:
+                    iface = ipaddress.IPv4Interface(f"{ip_val}/{mask_val}")
+                    sub_cidr = str(iface.network)
+                except Exception:
+                    octs = ip_val.split('.')
+                    sub_cidr = f"{octs[0]}.{octs[1]}.{octs[2]}.0/24"
+                octs = ip_val.split('.')
+                prefix = f"{octs[0]}.{octs[1]}.{octs[2]}." if len(octs) == 4 else None
+                all_ads.append({
+                    'name': ad_name,
+                    'ip': ip_val,
+                    'netmask': mask_val,
+                    'subnet_cidr': sub_cidr,
+                    'base_ip_prefix': prefix,
+                    'gateway': ad_data.get('gateway'),
+                    'is_default': (ip_val == ctx['controller_ip']),
+                })
+            ctx['all_adapters'] = all_ads
         except Exception as exc:
             log.debug("ipconfig parsing failed: %s", exc)
+            ctx['all_adapters'] = []
     else:
         # Linux / macOS
+        unix_adapters = []
         try:
             cmd = ["ifconfig"] if system == "Darwin" else ["ip", "-4", "addr", "show"]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
@@ -127,12 +155,28 @@ def detect_network_environment():
                                     ctx['controller_ip'] = ip_p
                                 try:
                                     iface = ipaddress.IPv4Interface(val)
-                                    ctx['subnet_cidr'] = str(iface.network)
-                                    ctx['netmask'] = str(iface.netmask)
+                                    sub_cidr = str(iface.network)
+                                    netmask_str = str(iface.netmask)
+                                    if not ctx['subnet_cidr']:
+                                        ctx['subnet_cidr'] = sub_cidr
+                                        ctx['netmask'] = netmask_str
+                                    octs = ip_p.split('.')
+                                    prefix = f"{octs[0]}.{octs[1]}.{octs[2]}." if len(octs) == 4 else None
+                                    unix_adapters.append({
+                                        'name': 'Unix Interface',
+                                        'ip': ip_p,
+                                        'netmask': netmask_str,
+                                        'subnet_cidr': sub_cidr,
+                                        'base_ip_prefix': prefix,
+                                        'gateway': None,
+                                        'is_default': (ip_p == ctx['controller_ip']),
+                                    })
                                 except Exception:
                                     pass
+            ctx['all_adapters'] = unix_adapters
         except Exception as exc:
             log.debug("unix ifconfig/ip parsing failed: %s", exc)
+            ctx['all_adapters'] = []
 
         # Gateway on Unix
         try:
@@ -174,6 +218,9 @@ def detect_network_environment():
         ctx['subnet_cidr'] = f"{ctx['base_ip_prefix']}0/24"
     if not ctx['controller_ip']:
         ctx['controller_ip'] = f"{ctx['base_ip_prefix']}100"
+
+    if 'all_adapters' not in ctx:
+        ctx['all_adapters'] = []
 
     return ctx
 

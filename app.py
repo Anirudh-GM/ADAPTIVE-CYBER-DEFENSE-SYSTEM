@@ -143,6 +143,19 @@ from core import device_fingerprinting
 # ACDS v4.0 — NEW MODULE IMPORTS (Phases 1-13, backward-compatible)
 # ─────────────────────────────────────────────────────────────────
 try:
+    from core import (
+        attack_graph_intelligence,
+        graph_risk_prioritizer,
+        adaptive_simulation,
+        defense_optimizer_v4,
+        adaptive_cycle,
+        alert_correlator,
+        historical_intelligence,
+        threat_intelligence,
+        vuln_dedup,
+        sme_lab,
+        report_generator_v4,
+    )
     from core.attack_graph_intelligence import (
         resolve_mitre_technique, build_explainable_edge,
         enrich_graph_edges, render_edge_explanation_html,
@@ -171,7 +184,10 @@ try:
     )
     from core.threat_intelligence import (
         enrich_cve_with_threat_intel, calculate_ti_adjusted_priority,
-        render_threat_intel_badge, CISA_KEV_OFFLINE,
+        render_threat_intel_badge, is_in_cisa_kev, CISA_KEV_OFFLINE,
+    )
+    from core.vuln_dedup import (
+        deduplicate_findings, get_vulnerability_statistics,
     )
     from core.sme_lab import (
         SME_LAB_NODES, build_lab_graph_nodes,
@@ -855,24 +871,44 @@ def is_apple_vendor(mac):
 # MODULE 0B: BANNER GRABBING (passive service fingerprinting)
 # ─────────────────────────────────────────────────────────────────
 
-def grab_banner(ip, port, timeout=1.2):
+def grab_banner(ip, port, timeout=1.5):
     """
     Connect to an open port and read whatever banner/header the service
     offers. This is passive — we never send exploit payloads, only the
     minimal protocol-correct request needed to elicit a version string
-    (e.g. an HTTP GET, a TLS ClientHello). Returns (raw_banner, version_str).
+    (e.g. an HTTP HEAD/GET, a TLS ClientHello). Returns (raw_banner, version_str).
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             sock.connect((ip, port))
 
-            if port in (80, 8080):
-                sock.sendall(b"HEAD / HTTP/1.0\r\nHost: %s\r\n\r\n" % ip.encode())
+            # HTTP / HTTP-Alt
+            if port in (80, 8080, 8000, 8888, 5000):
+                http_req = (
+                    f"HEAD / HTTP/1.1\r\nHost: {ip}\r\n"
+                    f"User-Agent: Mozilla/5.0 (compatible; ACDS-Scanner/2.0)\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode()
+                sock.sendall(http_req)
                 data = sock.recv(2048).decode(errors='ignore')
-                m = re.search(r'Server:\s*(.+)', data, re.IGNORECASE)
-                return data[:300], (m.group(1).strip() if m else None)
+                m = re.search(r'Server:\s*([^\r\n]+)', data, re.IGNORECASE)
+                if not m and ("40" in data[:30] or not data):
+                    # If HEAD returned no Server header, try a quick lightweight GET
+                    try:
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as gsock:
+                            gsock.settimeout(timeout)
+                            gsock.connect((ip, port))
+                            gsock.sendall(f"GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: ACDS/2.0\r\n\r\n".encode())
+                            gdata = gsock.recv(2048).decode(errors='ignore')
+                            gm = re.search(r'Server:\s*([^\r\n]+)', gdata, re.IGNORECASE)
+                            if gm:
+                                return gdata[:300], gm.group(1).strip()
+                    except Exception:
+                        pass
+                return data[:300], (m.group(1).strip() if m else (data.splitlines()[0] if data else None))
 
+            # HTTPS / HTTPS-Alt
             if port in (443, 8443):
                 try:
                     ctx = ssl.create_default_context()
@@ -880,19 +916,36 @@ def grab_banner(ip, port, timeout=1.2):
                     ctx.verify_mode = ssl.CERT_NONE
                     with ctx.wrap_socket(sock, server_hostname=ip) as tls:
                         tls.settimeout(timeout)
-                        tls.sendall(b"HEAD / HTTP/1.0\r\nHost: %s\r\n\r\n" % ip.encode())
+                        tls.sendall(
+                            f"HEAD / HTTP/1.1\r\nHost: {ip}\r\n"
+                            f"User-Agent: Mozilla/5.0 (compatible; ACDS-Scanner/2.0)\r\n"
+                            f"Connection: close\r\n\r\n".encode()
+                        )
                         data = tls.recv(2048).decode(errors='ignore')
-                        m = re.search(r'Server:\s*(.+)', data, re.IGNORECASE)
+                        m = re.search(r'Server:\s*([^\r\n]+)', data, re.IGNORECASE)
                         return data[:300], (m.group(1).strip() if m else None)
                 except (ssl.SSLError, OSError):
                     return None, None
 
-            # Banner-on-connect protocols: SSH, FTP, SMTP, POP3, IMAP, Telnet
+            # MySQL (Port 3306)
+            if port == 3306:
+                data = sock.recv(1024)
+                if len(data) > 5:
+                    try:
+                        null_idx = data.find(b'\x00', 5)
+                        if null_idx != -1:
+                            ver_str = data[5:null_idx].decode(errors='ignore')
+                            return f"MySQL Handshake {ver_str}", ver_str
+                    except Exception:
+                        pass
+                return (data[:300].decode(errors='ignore') if data else None), None
+
+            # Banner-on-connect protocols: SSH (22), FTP (21), SMTP (25, 587), POP3 (110), IMAP (143), Telnet (23)
             data = sock.recv(1024).decode(errors='ignore').strip()
             if not data:
                 return None, None
-            version = data.splitlines()[0] if data else None
-            return data[:300], version
+            first_line = data.splitlines()[0] if data else None
+            return data[:300], first_line
     except (socket.timeout, OSError, ConnectionRefusedError):
         return None, None
 
@@ -914,12 +967,22 @@ def parse_version_from_banner(service, banner):
         r'(MySQL\s+[\d.]+)',
         r'(\d+\.\d+\.\d+-MariaDB)',
         r'(OpenSSH[_\-][\d.]+\w*)',
+        r'(lighttpd/[\d.]+)',
+        r'(Postfix)',
+        r'(Exim\s+[\d.]+)',
+        r'(redis_version:[\d.]+)',
     ]
     for pat in patterns:
         m = re.search(pat, banner, re.IGNORECASE)
         if m:
-            return m.group(1).replace('_', ' ').replace('-', ' ', 1).strip()
-    # Fallback: return first ~60 chars of banner as the "version" label
+            ver = m.group(1).replace('_', ' ').replace('-', ' ', 1).strip()
+            ver = re.sub(r'/(\d)', r' \1', ver)
+            return ver
+    
+    # Generic product + numeric version extraction
+    m = re.search(r'(Apache|nginx|OpenSSH|vsftpd|ProFTPD|MySQL|MariaDB|lighttpd|IIS)[ /_-]*([0-9]+(?:\.[0-9A-Za-z]+)+)', banner, re.I)
+    if m:
+        return f"{m.group(1)} {m.group(2)}"
     return banner[:60]
 
 
@@ -1173,11 +1236,28 @@ def get_local_system_context():
 def _clean_hostname(name, ip):
     if not name:
         return None
-    name = name.strip().rstrip('.')
+    name = str(name).strip().rstrip('.')
     name = re.sub(r'\.local$', '', name, flags=re.IGNORECASE)
     if not name or name == ip or name.replace('.', '') == ip.replace('.', ''):
         return None
     return name
+
+
+def resolve_hostname_local(ip):
+    """Check if the scanned IP is localhost or matches the local host adapter."""
+    try:
+        if ip in ("127.0.0.1", "localhost", "::1"):
+            return socket.gethostname()
+        local_ips = set()
+        try:
+            local_ips.add(socket.gethostbyname(socket.gethostname()))
+        except Exception:
+            pass
+        if ip in local_ips:
+            return socket.gethostname()
+    except Exception:
+        pass
+    return None
 
 
 def resolve_hostname_ping(ip, system):
@@ -1248,16 +1328,46 @@ def resolve_hostname_dns(ip):
     return None
 
 
-def resolve_hostname(ip):
+def resolve_hostname_http(ip, timeout=0.8):
+    """Attempt non-destructive HTTP probe to extract server HTML title / hostname header."""
+    for port, scheme in [(80, "http"), (8080, "http"), (443, "https")]:
+        try:
+            import urllib.request
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            url = f"{scheme}://{ip}:{port}/"
+            req = urllib.request.Request(url, headers={"User-Agent": "ACDS-Scanner/2.0"})
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                data = resp.read(2048).decode("utf-8", errors="ignore")
+                match = re.search(r'<title>(.+?)</title>', data, re.IGNORECASE)
+                if match:
+                    title = match.group(1).strip()
+                    if title and not any(x in title.lower() for x in ["404", "403", "500", "error", "not found"]):
+                        clean = _clean_hostname(title.split("-")[0].split(":")[0].strip(), ip)
+                        if clean and len(clean) < 32:
+                            return clean
+        except Exception:
+            pass
+    return None
+
+
+def resolve_hostname(ip, open_ports=None, services=None, banner_map=None):
     system = platform.system()
     for resolver in (
+        lambda: resolve_hostname_local(ip),
         lambda: resolve_hostname_ping(ip, system),
         lambda: resolve_hostname_netbios(ip) if system == "Windows" else None,
         lambda: resolve_hostname_dns(ip),
+        lambda: resolve_hostname_http(ip) if (not open_ports or any(p in (open_ports or []) for p in (80, 443, 8080))) else None,
     ):
-        name = resolver()
-        if name:
-            return name
+        try:
+            name = resolver()
+            if name:
+                return name
+        except Exception:
+            continue
     return None
 
 
@@ -2353,6 +2463,20 @@ def profile_single_target(target_ip):
 def _parse_device_record(device):
     if isinstance(device, dict):
         rec = dict(device)
+        h = rec.get('hostname')
+        d_name = rec.get('display_name', '')
+        if not h or str(h).strip().lower() in ('unknown', 'none', '', '—'):
+            if d_name and ' (' in d_name:
+                h = d_name.split(' (')[0].strip()
+            elif d_name and '@' in d_name:
+                h = d_name.split(' @')[0].strip()
+            elif d_name and d_name != rec.get('ip'):
+                h = d_name.strip()
+            else:
+                dev_t = (rec.get('device_type') or 'Host').lower().replace(' ', '-')
+                ip_tail = str(rec.get('ip', '0')).split('.')[-1]
+                h = f"{dev_t}-{ip_tail}"
+            rec['hostname'] = h
         if not rec.get('asset_id'):
             rec['asset_id'] = generate_asset_id(rec.get('mac'), rec.get('ip'), rec.get('hostname'), rec.get('mac_vendor'), rec.get('os'))
         if not rec.get('display_name'):
@@ -2368,6 +2492,18 @@ def _parse_device_record(device):
          open_ports, services, version_map, banner_map, device_type, display_name,
          device_confidence, device_evidence) = device[:16]
         asset_id = generate_asset_id(mac, ip, hostname, mac_vendor_, os_type)
+
+    if not hostname or str(hostname).strip().lower() in ('unknown', 'none', '', '—'):
+        if display_name and ' (' in display_name:
+            hostname = display_name.split(' (')[0].strip()
+        elif display_name and '@' in display_name:
+            hostname = display_name.split(' @')[0].strip()
+        elif display_name and display_name != ip:
+            hostname = display_name.strip()
+        else:
+            dev_t = (device_type or 'Host').lower().replace(' ', '-')
+            ip_tail = str(ip).split('.')[-1]
+            hostname = f"{dev_t}-{ip_tail}"
 
     if not display_name:
         display_name = format_device_display_name(hostname, device_type, ip)
@@ -2458,6 +2594,181 @@ def build_dynamic_graph(devices):
     # while building nodes above, then reflow that into Asset Risk (Priority 18).
     network_exposure.apply_network_exposure_scores(G, SENSITIVE_PORTS, recompute_node_risk)
     return G
+
+
+def sync_live_validation_to_graph(G, target_ip_or_id, val_res):
+    """
+    Propagates live validation findings back into the active topology graph (G),
+    session cache, SQLite persistence, and recomputes all risk metrics:
+      1. Updates open ports & active services on the target node.
+      2. Updates banner_map and version_map from live findings.
+      3. Correlates CVE findings for detected software versions.
+      4. Recomputes Asset Risk (vuln, ports, sensitive, crit, network exposure).
+      5. Updates lateral exposure edges (removes closed port edges, adds new open port edges).
+      6. Re-applies network centrality and exposure scores across G.
+      7. Syncs st.session_state.last_scan_devices cache.
+      8. Persists updated asset snapshot to SQLite database (monitor_db).
+    """
+    if not G or G.number_of_nodes() == 0 or not val_res:
+        return {}
+
+    target_ip = val_res.get("ip") or val_res.get("target_ip") or str(target_ip_or_id)
+    target_node = None
+
+    for node, data in G.nodes(data=True):
+        if (node == target_ip_or_id or 
+            data.get("ip") == target_ip or 
+            data.get("asset_id") == target_ip_or_id or
+            data.get("display_name") == target_ip_or_id):
+            target_node = node
+            break
+
+    if not target_node:
+        return {}
+
+    data = G.nodes[target_node]
+    old_ports = list(data.get("open_ports", []))
+    old_risk = float(data.get("risk_score", 0.0))
+
+    new_open_ports = sorted(list(val_res.get("open_ports", [])))
+    new_services = sorted(list({PORT_SERVICE_MAP.get(p, f"Port {p}") for p in new_open_ports}))
+    new_version_map = dict(data.get("version_map", {}))
+    new_banner_map = dict(data.get("banner_map", {}))
+
+    # Update banners and versions from live validation
+    ports_val = val_res.get("ports_validated") or val_res.get("ports") or {}
+    if not isinstance(ports_val, dict):
+        ports_val = {}
+
+    for p in new_open_ports:
+        p_info = ports_val.get(p, {}) if isinstance(ports_val, dict) else {}
+        s_name = p_info.get("service") or PORT_SERVICE_MAP.get(p, f"Port {p}")
+        b_text = p_info.get("banner") or (val_res.get("banner_map") or {}).get(s_name) or (val_res.get("banner_map") or {}).get(p)
+        if b_text:
+            new_banner_map[s_name] = b_text
+            new_banner_map[p] = b_text
+            new_banner_map[str(p)] = b_text
+            v_str = parse_version_from_banner(s_name, b_text)
+            if v_str:
+                new_version_map[s_name] = v_str
+                new_version_map[p] = v_str
+                new_version_map[str(p)] = v_str
+
+    # Remove closed ports from maps
+    closed_detected = val_res.get("closed_ports_detected", [])
+    for p in closed_detected:
+        s_name = PORT_SERVICE_MAP.get(p, f"Port {p}")
+        new_banner_map.pop(s_name, None)
+        new_banner_map.pop(p, None)
+        new_banner_map.pop(str(p), None)
+        new_version_map.pop(s_name, None)
+        new_version_map.pop(p, None)
+        new_version_map.pop(str(p), None)
+
+    # Re-classify and assess security
+    role = assign_role_from_services(new_services, data.get("os", "unknown"), data.get("device_type", "Computer"))
+    security = assess_device_security(
+        new_services, data.get("os", "unknown"), data.get("device_type", "Computer"),
+        new_open_ports, role, version_map=new_version_map, ip=data.get("ip", target_ip)
+    )
+    criticality = calculate_criticality(
+        data.get("device_type", "Computer"), new_services, new_open_ports, data.get("os", "unknown")
+    )
+    other_assets = max(0, len(G.nodes) - 1)
+    network_comp = calculate_network_exposure_score(len(new_open_ports), other_assets)
+    asset_risk = calculate_asset_risk(
+        security["vulnerability_component"], security["service_component"],
+        security["sensitive_component"], calculate_criticality_score(criticality["level"]),
+        network_comp
+    )
+
+    # Apply updates to G node
+    data["open_ports"] = new_open_ports
+    data["services"] = new_services
+    data["version_map"] = new_version_map
+    data["banner_map"] = new_banner_map
+    data["role"] = role
+    data["criticality"] = criticality["level"]
+    data["criticality_label"] = criticality["label"]
+    data["criticality_confidence"] = criticality["confidence"]
+    data["criticality_evidence"] = criticality["evidence"]
+    data["vulnerability"] = round(asset_risk["score"] / 100, 3)
+    data["exposure_level"] = security["exposure_level"]
+    data["risk_score"] = asset_risk["score"]
+    data["risk_severity"] = asset_risk["severity"]
+    data["risk_components"] = asset_risk["components"]
+    data["asset_risk"] = asset_risk
+    data["fixes"] = security["fixes"]
+    data["weaknesses"] = security["weaknesses"]
+    data["access_vectors"] = security["access_vectors"]
+    data["cve_findings"] = security["cve_findings"]
+    data["exposure_findings"] = security["exposure_findings"]
+    data["cve_source"] = security["cve_source"]
+    data["last_seen"] = "Live Validated"
+
+    # Rebuild incoming lateral edges for target_node
+    in_edges_to_remove = [(u, v) for u, v in G.in_edges(target_node)]
+    G.remove_edges_from(in_edges_to_remove)
+
+    for src_node in G.nodes:
+        if src_node == target_node:
+            continue
+        for edge_info in get_lateral_edges_for_target(new_open_ports):
+            G.add_edge(
+                src_node, target_node,
+                connection=edge_info['connection'],
+                access_vector=edge_info['vector'],
+                access_port=edge_info['port'],
+                mitre_code=edge_info['mitre_code'],
+                mitre_desc=edge_info['mitre_desc'],
+                success_prob=edge_info['success_prob'],
+                reachability='POTENTIAL REACHABILITY'
+            )
+
+    # Re-apply graph-wide network exposure scores
+    network_exposure.apply_network_exposure_scores(G, SENSITIVE_PORTS, recompute_node_risk)
+
+    # Sync raw device session cache
+    raw_devices = st.session_state.get("last_scan_devices", []) or []
+    for d in raw_devices:
+        d_ip = d.get("ip") if isinstance(d, dict) else (d[0] if len(d) > 0 else None)
+        if d_ip == target_ip:
+            if isinstance(d, dict):
+                d["open_ports"] = new_open_ports
+                d["services"] = new_services
+                d["version_map"] = new_version_map
+                d["banner_map"] = new_banner_map
+                d["risk_score"] = asset_risk["score"]
+                d["cve_findings"] = security["cve_findings"]
+
+    # Persist updated asset to SQLite
+    try:
+        monitor_db.upsert_asset({
+            "ip_address": target_ip,
+            "mac_address": data.get("mac"),
+            "hostname": data.get("hostname"),
+            "vendor": data.get("mac_vendor"),
+            "device_type": data.get("device_type"),
+            "operating_system": data.get("os"),
+            "criticality": criticality["level"],
+            "current_risk": asset_risk["score"],
+            "status": "ONLINE" if val_res.get("reachable") else "OFFLINE",
+            "open_ports": ",".join(str(p) for p in new_open_ports),
+            "services": ",".join(new_services),
+            "last_seen": datetime.now(timezone.utc).isoformat()
+        })
+    except Exception:
+        pass
+
+    return {
+        "target_node": target_node,
+        "old_ports": old_ports,
+        "new_ports": new_open_ports,
+        "new_opened": val_res.get("new_ports_detected", []),
+        "new_closed": val_res.get("closed_ports_detected", []),
+        "old_risk": old_risk,
+        "new_risk": asset_risk["score"],
+    }
 
 
 def build_network():
@@ -3163,8 +3474,8 @@ def calculate_risk(G, compromised_nodes, timeline, honeypot_triggered, attack_st
     real_compromised = [n for n in compromised_nodes if G.nodes[n].get("node_type") != "honeypot"]
 
     spread = min(1.0, len(real_compromised) / max(len(real_nodes), 1))
-    all_criticality = sum(G.nodes[n]["criticality"] for n in real_nodes)
-    compromised_criticality = sum(G.nodes[n]["criticality"] for n in real_compromised)
+    all_criticality = sum(G.nodes[n].get("criticality", G.nodes[n].get("business_criticality", 2)) for n in real_nodes)
+    compromised_criticality = sum(G.nodes[n].get("criticality", G.nodes[n].get("business_criticality", 2)) for n in real_compromised)
     critical_impact = min(1.0, compromised_criticality / max(all_criticality, 1))
 
     max_timestep = max((t["timestep"] for t in timeline), default=1)
@@ -3462,85 +3773,196 @@ def greedy_defense_selection(actions, budget):
 
 
 def apply_defense_actions(G, selected_actions):
-    """Priority 18/19: actually mutate the in-memory asset/network model
-    so a re-simulation produces a genuinely different result. This is the
-    ONLY function that may set an action's state to APPLIED TO SIMULATION
-    MODEL. Returns (applied_actions, ids_deployed, segmentation_applied).
     """
-    applied = []
-    ids_deployed = False
-    segmentation_applied = False
+    Mutates the in-memory asset/network model so a re-simulation produces a genuinely
+    different, technically defensible result. Tracks applied patches/fixes and saves the
+    pre-defense baseline snapshot for before/after comparison.
+    Returns (applied_actions, ids_deployed, segmentation_applied).
+    """
+    # 1. Establish Before baseline if not already captured
+    if st.session_state.get("risk_before_defense") is None and st.session_state.get("risk_score") is not None:
+        st.session_state.risk_before_defense = float(st.session_state.get("risk_score", 0.0))
+    if not st.session_state.get("blast_before_defense") and st.session_state.get("blast_details"):
+        st.session_state.blast_before_defense = dict(st.session_state.get("blast_details") or {})
+    if not st.session_state.get("overall_acds_risk_before") and st.session_state.get("overall_acds_risk"):
+        st.session_state.overall_acds_risk_before = dict(st.session_state.get("overall_acds_risk") or {})
+    if not st.session_state.get("compromised_before_defense") and st.session_state.get("compromised"):
+        st.session_state.compromised_before_defense = set(st.session_state.get("compromised") or set())
+    if not st.session_state.get("timeline_before_defense") and st.session_state.get("timeline"):
+        st.session_state.timeline_before_defense = list(st.session_state.get("timeline") or [])
+    if not st.session_state.get("mitre_before_defense") and st.session_state.get("timeline"):
+        st.session_state.mitre_before_defense = {
+            t['mitre_code']: t.get('mitre_desc', 'Remote Service')
+            for t in st.session_state.get('timeline', []) if t.get('mitre_code')
+        }
+
+    newly_applied = []
+    applied_patches_ledger = list(st.session_state.get("applied_patches", []) or [])
+    prev_applied = list(st.session_state.get("applied_defenses", []) or [])
+    ids_deployed = st.session_state.get("ids_deployed", False)
+    segmentation_applied = st.session_state.get("segmentation_applied", False)
 
     for action in selected_actions:
         node = action.get("node")
-        atype = action.get("type")
+        atype = str(action.get("type", "")).lower()
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         if atype == "ids" and node == "ALL":
             ids_deployed = True
         elif atype in ("isolate", "firewall_rule") and node == "ALL":
-            # Both VLAN segmentation and perimeter firewall rules reduce the
-            # same modeled quantity — lateral-movement reachability — so
-            # both feed the existing segmentation_applied flag consumed by
-            # simulate_attack(); this is a deliberate simplification, not a
-            # rewrite of the attack-simulation engine.
             segmentation_applied = True
         elif node in G.nodes:
             nd = G.nodes[node]
             comps = nd.get("risk_components")
-            if atype == "patch" and comps:
-                # A patch removes the matched confirmed CVE finding and
-                # collapses the vulnerability component to "no confirmed
-                # CVE" (0), which is only fair since the fix was applied.
+            if atype in ("patch", "update_software"):
+                # Clear confirmed CVEs and zero out the vulnerability component
                 nd["cve_findings"] = []
-                comps['vulnerability']['normalized_score'] = 0.0
+                if comps and 'vulnerability' in comps:
+                    comps['vulnerability']['normalized_score'] = 0.0
                 recompute_node_risk(nd)
-            elif atype == "isolate" and comps:
+            elif atype == "isolate":
+                # Isolate the node: zero exposure & sever lateral network edges
                 nd["isolated"] = True
-                comps['network_exposure']['normalized_score'] = 0.0
+                if comps and 'network_exposure' in comps:
+                    comps['network_exposure']['normalized_score'] = 0.0
                 recompute_node_risk(nd)
-            elif atype == "privilege" and comps:
-                # Least-privilege/MFA reduces how dangerous compromising
-                # this node is to the rest of the network (its effective
-                # criticality contribution to blast radius), modeled here
-                # as a 40% reduction of the criticality component.
-                comps['criticality']['normalized_score'] = round(comps['criticality']['normalized_score'] * 0.6, 1)
+                in_edges = list(G.in_edges(node))
+                out_edges = list(G.out_edges(node))
+                G.remove_edges_from(in_edges + out_edges)
+            elif atype == "privilege":
+                if comps and 'criticality' in comps:
+                    comps['criticality']['normalized_score'] = round(comps['criticality']['normalized_score'] * 0.6, 1)
                 recompute_node_risk(nd)
-            elif atype in ("disable_smb", "restrict_rdp", "close_port"):
-                # Remove the specific hardened port from this node's exposed
-                # surface so the exposure graph / lateral-edge model and the
-                # network_exposure component genuinely reflect the change.
+            elif atype in ("disable_smb", "restrict_rdp", "close_port", "restrict"):
                 port_map = {"disable_smb": 445, "restrict_rdp": 3389}
                 port_to_close = port_map.get(atype)
                 if port_to_close is None:
-                    m = re.search(r"port (\d+)", action.get("action", ""))
+                    m = re.search(r"port (\d+)", str(action.get("action", "")) + " " + str(action.get("description", "")))
                     port_to_close = int(m.group(1)) if m else None
                 if port_to_close and port_to_close in (nd.get("open_ports") or []):
                     nd["open_ports"] = [p for p in nd["open_ports"] if p != port_to_close]
-                if comps:
+                    # Remove incoming lateral edges targeting this port
+                    edges_to_remove = [
+                        (u, v) for u, v, d in G.in_edges(node, data=True)
+                        if d.get('port') == port_to_close or d.get('access_port') == port_to_close
+                    ]
+                    G.remove_edges_from(edges_to_remove)
+                if comps and 'network_exposure' in comps:
                     comps['network_exposure']['normalized_score'] = round(
                         comps['network_exposure']['normalized_score'] * 0.5, 1)
                     recompute_node_risk(nd)
-            elif atype == "honeypot_placement" and comps:
-                # A nearby decoy shortens detection time rather than closing
-                # an exposure, modeled as a modest deterrent discount on the
-                # vulnerability component (attacker more likely caught early).
-                comps['vulnerability']['normalized_score'] = round(
-                    comps['vulnerability']['normalized_score'] * 0.8, 1)
+            elif atype == "honeypot_placement":
+                if comps and 'vulnerability' in comps:
+                    comps['vulnerability']['normalized_score'] = round(
+                        comps['vulnerability']['normalized_score'] * 0.8, 1)
                 recompute_node_risk(nd)
 
-        applied.append({**action, "state": DEFENSE_STATE_APPLIED})
+        applied_entry = {
+            **action,
+            "state": DEFENSE_STATE_APPLIED,
+            "applied_at": now_ts
+        }
+        newly_applied.append(applied_entry)
+        applied_patches_ledger.append({
+            "Timestamp": now_ts,
+            "Target Host": node,
+            "Target IP": G.nodes[node].get("ip", node) if node in G.nodes else "Network-wide",
+            "Fix Category": atype.upper(),
+            "Control Applied": action.get("description", action.get("action")),
+            "Cost": action.get("cost", 10),
+            "Expected Reduction": f"-{action.get('risk_reduction', 0):.1f} pts",
+            "Status": "✓ Applied to Model",
+        })
 
-    return applied, ids_deployed, segmentation_applied
+    st.session_state.applied_defenses = prev_applied + newly_applied
+    st.session_state.applied_patches = applied_patches_ledger
+    st.session_state.ids_deployed = ids_deployed
+    st.session_state.segmentation_applied = segmentation_applied
+    st.session_state.pending_re_simulation = True
+
+    return newly_applied, ids_deployed, segmentation_applied
+
+
+def run_post_defense_re_simulation(G, entry_node=None):
+    """
+    Re-runs the decision-based attack propagation simulator against the hardened graph model
+    with all applied patches, isolated nodes, and firewall rules in effect.
+    Computes AFTER metrics and updates session state for comparative evaluation.
+    """
+    if not G or G.number_of_nodes() == 0:
+        return None
+
+    all_nodes = [n for n in G.nodes if G.nodes[n].get("node_type") != "honeypot"]
+    if not all_nodes:
+        return None
+
+    if not entry_node or entry_node not in G.nodes:
+        entry_node = st.session_state.get("last_entry_node") or all_nodes[0]
+
+    sim_ids = st.session_state.get("ids_deployed", False)
+    sim_seg = st.session_state.get("segmentation_applied", False)
+
+    timeline, decision_log, comp_after, uncomp_after, succ_paths, blocked_paths, attack_stats = simulate_decision_based_propagation(
+        G, entry_node, seed=42, ids_deployed=sim_ids, segmentation_applied=sim_seg
+    )
+    honeypot_trig = any(
+        entry.get("ntype") == "honeypot" and entry.get("success") for entry in timeline
+    )
+    risk_sc_after, blast_details_after = calculate_risk(G, comp_after, timeline, honeypot_trig, attack_stats)
+    overall_acds_risk_after = calculate_overall_acds_risk(G, risk_sc_after)
+
+    # Record post-defense outcomes
+    st.session_state.post_defense_stats = blast_details_after
+    st.session_state.risk_score_after = risk_sc_after
+    st.session_state.overall_acds_risk_after = overall_acds_risk_after
+    st.session_state.compromised_after = comp_after
+    st.session_state.timeline_after = timeline
+    st.session_state.decision_log_after = decision_log
+    st.session_state.mitre_after_defense = {
+        t['mitre_code']: t.get('mitre_desc', 'Remote Service')
+        for t in timeline if t.get('mitre_code')
+    }
+    st.session_state.post_defense_sim_done = True
+    st.session_state.pending_re_simulation = False
+
+    return {
+        "risk_score_after": risk_sc_after,
+        "blast_details_after": blast_details_after,
+        "overall_acds_risk_after": overall_acds_risk_after,
+        "compromised_after": comp_after,
+        "timeline_after": timeline,
+    }
+
+
+def reset_model_defenses_to_baseline(G):
+    """Resets in-memory model modifications back to the original baseline scan state."""
+    st.session_state.applied_defenses = []
+    st.session_state.applied_patches = []
+    st.session_state.ids_deployed = False
+    st.session_state.segmentation_applied = False
+    st.session_state.pending_re_simulation = False
+    st.session_state.post_defense_sim_done = False
+    st.session_state.post_defense_stats = None
+    st.session_state.risk_score_after = None
+    st.session_state.overall_acds_risk_after = None
+    st.session_state.compromised_after = None
+    st.session_state.timeline_after = None
+    st.session_state.decision_log_after = None
+    st.session_state.mitre_after_defense = None
+
+    # Re-build graph from original scan if available
+    raw_devices = st.session_state.get("last_scan_devices")
+    if raw_devices:
+        st.session_state.G = build_dynamic_graph(raw_devices)
+    else:
+        for node, d in G.nodes(data=True):
+            d["isolated"] = False
+            recompute_node_risk(d)
 
 
 # ─────────────────────────────────────────────────────────────────
 # SPRINT 3 — PHASE 2: DEDICATED BEFORE vs AFTER VERIFICATION PAGE
 # ─────────────────────────────────────────────────────────────────
-# Renders a standalone comparison section (Overall Risk, Blast Radius,
-# Critical Assets Reachable, Attack Depth, Reachable Nodes) using ONLY
-# numbers already produced by the existing Sprint 2 risk pipeline
-# (calculate_risk / calculate_overall_acds_risk / simulate_attack) —
-# no separate/duplicate risk math is introduced here.
 
 def _verification_metric_row(rows):
     """rows: list of (label, before_val, after_val_or_None, lower_is_better)."""
@@ -3548,58 +3970,91 @@ def _verification_metric_row(rows):
     for label, before_val, after_val, lower_is_better in rows:
         if after_val is None:
             cards.append(f"""
-            <div style='flex:1;min-width:150px;background:#0d1f2d;border:1px solid #1a3a5c;padding:14px;text-align:center'>
+            <div style='flex:1;min-width:140px;background:#0d1f2d;border:1px solid #1a3a5c;padding:12px;text-align:center;border-radius:6px'>
                 <div style='color:#3d6a8a;font-family:Share Tech Mono;font-size:0.62rem;letter-spacing:1px'>{label}</div>
-                <div style='color:#ffd700;font-family:Orbitron,monospace;font-size:1.3rem;margin-top:4px'>{before_val}</div>
-                <div style='color:#3d6a8a;font-family:Share Tech Mono;font-size:0.6rem;margin-top:2px'>defenses not yet applied</div>
+                <div style='color:#ffd700;font-family:Orbitron,monospace;font-size:1.25rem;margin-top:4px'>{before_val}</div>
+                <div style='color:#64748B;font-family:Share Tech Mono;font-size:0.6rem;margin-top:2px'>pending re-simulation</div>
             </div>""")
             continue
         delta = round(after_val - before_val, 1)
         improved = (delta <= 0) if lower_is_better else (delta >= 0)
-        arrow_color = "#00ff88" if improved else "#ff3355"
+        arrow_color = "#00ff88" if improved else ("#ffd700" if delta == 0 else "#ff3355")
         delta_str = f"{'+' if delta > 0 else ''}{delta}"
         cards.append(f"""
-        <div style='flex:1;min-width:150px;background:#0d1f2d;border:1px solid {arrow_color};padding:14px;text-align:center'>
+        <div style='flex:1;min-width:140px;background:#0d1f2d;border:1px solid {arrow_color};padding:12px;text-align:center;border-radius:6px'>
             <div style='color:#3d6a8a;font-family:Share Tech Mono;font-size:0.62rem;letter-spacing:1px'>{label}</div>
-            <div style='font-family:Orbitron,monospace;font-size:1.25rem;margin-top:4px'>
+            <div style='font-family:Orbitron,monospace;font-size:1.15rem;margin-top:4px'>
                 <span style='color:#ff3355'>{before_val}</span>
-                <span style='color:#3d6a8a;font-size:0.9rem'> → </span>
+                <span style='color:#3d6a8a;font-size:0.85rem'> → </span>
                 <span style='color:#00ff88'>{after_val}</span>
             </div>
-            <div style='color:{arrow_color};font-family:Share Tech Mono;font-size:0.72rem;margin-top:4px'>{delta_str} points</div>
+            <div style='color:{arrow_color};font-family:Share Tech Mono;font-size:0.72rem;margin-top:4px'>{delta_str} {'pts' if 'RISK' in label or 'BLAST' in label else ''}</div>
         </div>""")
     return "<div style='display:flex;gap:10px;flex-wrap:wrap;margin:10px 0'>" + "".join(cards) + "</div>"
 
 
 def render_before_after_verification():
-    before_overall = st.session_state.get("overall_acds_risk_before")
-    before_bd = st.session_state.get("blast_before_defense") or {}
-    before_risk = st.session_state.get("risk_before_defense")
+    G: nx.DiGraph = st.session_state.get("G", nx.DiGraph())
+    
+    before_overall = st.session_state.get("overall_acds_risk_before") or st.session_state.get("overall_acds_risk")
+    before_bd = st.session_state.get("blast_before_defense") or st.session_state.get("blast_details") or {}
+    before_risk = st.session_state.get("risk_before_defense") if st.session_state.get("risk_before_defense") is not None else st.session_state.get("risk_score")
 
-    has_after = bool(st.session_state.get("applied_defenses"))
-    after_overall_obj = st.session_state.get("overall_acds_risk") if has_after else None
-    after_bd = st.session_state.get("post_defense_stats") if has_after else None
-    after_risk = st.session_state.get("risk_score") if has_after else None
+    applied_defenses = st.session_state.get("applied_defenses", [])
+    applied_patches = st.session_state.get("applied_patches", [])
+    has_defenses = bool(applied_defenses or applied_patches)
 
-    st.markdown('<hr style="border-color:#1a3a5c;margin:20px 0">', unsafe_allow_html=True)
-    st.markdown('<div class="section-header">🎯 BEFORE vs AFTER VERIFICATION</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div style='background:rgba(255,51,85,0.06);border:1px solid #ff3355;padding:8px 14px;
-         font-family:Share Tech Mono;font-size:0.65rem;color:#ff3355;letter-spacing:1px;margin-bottom:10px'>
-    SIMULATED — NO REAL ATTACK TRAFFIC
-    </div>
-    """, unsafe_allow_html=True)
+    post_sim_done = bool(st.session_state.get("post_defense_sim_done"))
+    after_overall_obj = st.session_state.get("overall_acds_risk_after") or (st.session_state.get("overall_acds_risk") if post_sim_done else None)
+    after_bd = st.session_state.get("post_defense_stats") if post_sim_done else None
+    after_risk = st.session_state.get("risk_score_after") if post_sim_done else None
+
+    all_nodes = [n for n in G.nodes if G.nodes[n].get("node_type") != "honeypot"]
+    entry_node = st.session_state.get("last_entry_node") or (all_nodes[0] if all_nodes else None)
+
+    # 1. Action / Re-Simulation Toolbar
+    rc1, rc2, rc3 = st.columns([5, 4, 3])
+    with rc1:
+        st.markdown(f"**Hardened Model Status:** `{len(applied_defenses)} defense control(s) applied`")
+    with rc2:
+        if all_nodes:
+            sel_entry = st.selectbox("Re-Attack Entry Point", all_nodes, index=all_nodes.index(entry_node) if entry_node in all_nodes else 0, key="re_sim_entry_sel")
+        else:
+            sel_entry = None
+    with rc3:
+        run_re_sim = st.button("🔁 RUN RE-ATTACK SIMULATION", type="primary", use_container_width=True, disabled=not has_defenses)
+
+    if run_re_sim:
+        with st.spinner("Re-simulating attack propagation across hardened model..."):
+            run_post_defense_re_simulation(G, sel_entry)
+            st.toast("Post-defense attack simulation complete!", icon="🛡️")
+            st.rerun()
+
+    # Alert Banner if defenses changed but re-simulation pending
+    if has_defenses and (st.session_state.get("pending_re_simulation") or not post_sim_done):
+        st.markdown("""
+        <div style="background:rgba(255,215,0,0.08);border:1px solid #FFD700;border-radius:6px;padding:12px 16px;margin:10px 0 14px 0">
+            <div style="display:flex;align-items:center;gap:10px">
+                <span style="font-size:1.3rem">⚡</span>
+                <div>
+                    <b style="color:#FFD700;font-size:0.85rem">Defenses applied to in-memory model!</b>
+                    <div style="font-size:0.75rem;color:#CBD5E1">
+                        Click <b>🔁 RUN RE-ATTACK SIMULATION</b> above to test whether lateral attack paths were successfully severed and compare Before vs. After results.
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     if before_risk is None:
-        st.markdown(
-            '<div style="font-family:Share Tech Mono;font-size:0.72rem;color:#3d6a8a">'
-            'Run an attack simulation to establish a BEFORE snapshot for verification.</div>',
-            unsafe_allow_html=True)
+        st.info("Run an initial attack simulation from the ANALYSIS page to establish the BEFORE baseline.")
         return
 
     before_overall_score = before_overall.get("overall_score") if before_overall else None
     after_overall_score = after_overall_obj.get("overall_score") if after_overall_obj else None
 
+    # 2. Before vs After Scorecards Row
+    st.markdown("#### 📊 Before vs After Comparative Scorecards")
     rows = [
         ("OVERALL RISK", before_overall_score, after_overall_score, True),
         ("BLAST RADIUS", before_risk, after_risk, True),
@@ -3610,60 +4065,97 @@ def render_before_after_verification():
         ("REACHABLE NODES", before_bd.get("systems_controlled", before_bd.get("compromised_count", 0)),
          (after_bd.get("systems_controlled", after_bd.get("compromised_count", 0)) if after_bd else None), True),
     ]
-    # Drop rows where before_val itself is None (overall risk not yet complete)
     rows = [r for r in rows if r[1] is not None]
     st.markdown(_verification_metric_row(rows), unsafe_allow_html=True)
 
-    if not has_after:
-        st.markdown(
-            '<div style="font-family:Share Tech Mono;font-size:0.7rem;color:#3d6a8a;margin-top:6px">'
-            'Apply defenses in the ACDS DEFENSE OPTIMIZATION panel above, then this page re-runs the MITRE '
-            'simulation automatically against the validated network posture and fills in the AFTER column.</div>', unsafe_allow_html=True)
-    else:
-        # Verified Real-Time Defense Card
-        val_changes = st.session_state.get("validation_changes", [])
-        verified_changes = [c for c in val_changes if "REMOVED" in c.get("change_type", "") or "VERIFIED" in c.get("change_type", "")]
+    # 3. In-Depth "What's Done Better vs. Worse" Evaluation
+    if post_sim_done and after_risk is not None:
+        st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+        st.markdown("#### 🔬 Detailed Comparative Evaluation: What's Done Better vs Residual Risk")
 
-        if verified_changes:
-            v_items = "".join(f"<li><b>{c.get('change_type')}:</b> {c.get('description')}</li>" for c in verified_changes[:4])
-            st.markdown(f"""
-            <div style='background:rgba(0,255,136,0.06);border:1px solid #00ff88;border-left:4px solid #00ff88;padding:12px 16px;border-radius:4px;margin:14px 0'>
-                <div style='color:#00ff88;font-family:Orbitron,monospace;font-size:0.8rem;font-weight:bold'>
-                    ✓ REAL-TIME DEFENSE RE-VALIDATION CONFIRMED
+        before_comp_nodes = set(st.session_state.get("compromised_before_defense") or st.session_state.get("compromised") or set())
+        after_comp_nodes = set(st.session_state.get("compromised_after") or set())
+
+        saved_nodes = before_comp_nodes - after_comp_nodes
+        newly_comp = after_comp_nodes - before_comp_nodes
+
+        before_mitre = st.session_state.get("mitre_before_defense") or {}
+        after_mitre = st.session_state.get("mitre_after_defense") or {}
+        neutralized_techniques = set(before_mitre.keys()) - set(after_mitre.keys())
+
+        col_better, col_residual = st.columns(2)
+
+        with col_better:
+            st.markdown("""
+            <div style="background:#0F291E;border:1px solid #059669;border-radius:8px;padding:16px;height:100%">
+                <div style="font-size:0.9rem;font-weight:700;color:#10B981;margin-bottom:8px">
+                    🟢 WHAT'S DONE BETTER (Defensive Improvements)
                 </div>
-                <div style='font-family:Share Tech Mono;font-size:0.72rem;color:#e0f4ff;margin-top:4px'>
-                    Real-time network validation confirms that targeted attack surface ports are CLOSED and verified non-responsive:
-                    <ul style='margin:4px 0 0 16px;color:#7ab8d4'>{v_items}</ul>
-                </div>
-            </div>
             """, unsafe_allow_html=True)
 
-        st.markdown('<div style="font-family:Share Tech Mono;font-size:0.65rem;color:#3d6a8a;margin:14px 0 6px 0">'
-                     'MITRE ATT&CK COVERAGE — BEFORE vs AFTER (re-simulated)</div>', unsafe_allow_html=True)
-        before_mitre = st.session_state.mitre_before_defense or {}
-        after_mitre = st.session_state.mitre_after_defense or {}
-        mcol1, mcol2 = st.columns(2)
-        with mcol1:
-            st.markdown("<div style='color:#ff3355;font-family:Share Tech Mono;font-size:0.68rem'>BEFORE</div>", unsafe_allow_html=True)
-            if before_mitre:
-                for code, desc in before_mitre.items():
-                    st.markdown(f'<span class="mitre-tag">{code}</span>', unsafe_allow_html=True)
+            risk_delta = round(after_risk - before_risk, 1)
+            st.markdown(f"- **Blast Radius Reduction:** Reduced by **{abs(risk_delta):.1f} points** ({before_risk:.1f} → {after_risk:.1f})")
+            
+            if saved_nodes:
+                saved_str = ", ".join(f"<code>{n}</code>" for n in saved_nodes)
+                st.markdown(f"- **Protected Endpoints:** {len(saved_nodes)} host(s) successfully shielded from compromise ({saved_str})", unsafe_allow_html=True)
             else:
-                st.markdown('<span style="color:#3d6a8a;font-size:0.68rem">none reached</span>', unsafe_allow_html=True)
-        with mcol2:
-            st.markdown("<div style='color:#00ff88;font-family:Share Tech Mono;font-size:0.68rem'>AFTER</div>", unsafe_allow_html=True)
-            if after_mitre:
-                for code, desc in after_mitre.items():
-                    st.markdown(f'<span class="mitre-tag" style="border-color:#00ff88;color:#00ff88">{code}</span>', unsafe_allow_html=True)
-            else:
-                st.markdown('<span style="color:#00ff88;font-size:0.68rem">none reached — all techniques blocked</span>', unsafe_allow_html=True)
+                st.markdown("- **Host Containment:** Scoped entry host isolated / contained.")
 
-        mitigated = set(before_mitre) - set(after_mitre)
-        if mitigated:
-            st.markdown(
-                f'<div style="font-family:Share Tech Mono;font-size:0.68rem;color:#7ab8d4;margin-top:8px">'
-                f'Techniques neutralized by applied defenses: {", ".join(sorted(mitigated))}</div>',
-                unsafe_allow_html=True)
+            hops_before = before_bd.get("max_lateral_hops", 0)
+            hops_after = after_bd.get("max_lateral_hops", 0)
+            if hops_after < hops_before:
+                st.markdown(f"- **Lateral Chain Severed:** Lateral propagation depth reduced from **{hops_before}** to **{hops_after} hop(s)**.")
+
+            if neutralized_techniques:
+                tech_str = ", ".join(f"<code>{t}</code>" for t in neutralized_techniques)
+                st.markdown(f"- **MITRE Techniques Neutralized:** {tech_str}", unsafe_allow_html=True)
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with col_residual:
+            st.markdown("""
+            <div style="background:#261815;border:1px solid #DC2626;border-radius:8px;padding:16px;height:100%">
+                <div style="font-size:0.9rem;font-weight:700;color:#EF4444;margin-bottom:8px">
+                    🔴 RESIDUAL RISKS & UNMITIGATED EXPOSURE
+                </div>
+            """, unsafe_allow_html=True)
+
+            if after_comp_nodes:
+                still_comp_str = ", ".join(f"<code>{n}</code>" for n in after_comp_nodes)
+                st.markdown(f"- **Reachable in Post-Defense Scope:** {len(after_comp_nodes)} asset(s) still accessible ({still_comp_str})", unsafe_allow_html=True)
+            else:
+                st.markdown("- **Reachable Endpoints:** 0 assets compromised.")
+
+            if after_mitre:
+                rem_tech = ", ".join(f"<code>{t} ({after_mitre[t]})</code>" for t in after_mitre)
+                st.markdown(f"- **Remaining Exploitation Techniques:** {rem_tech}", unsafe_allow_html=True)
+            else:
+                st.markdown("- **MITRE Techniques:** All modeled vectors successfully blocked.")
+
+            if newly_comp:
+                st.markdown(f"- ⚠️ **Shifted Exposure Warning:** {len(newly_comp)} node(s) reached via alternate routes.")
+            else:
+                st.markdown("- **No New Attack Vectors Opened:** Applied controls did not introduce unintended secondary paths.")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # 4. Applied Patches & Fixes Ledger (Audit Trail)
+    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+    st.markdown("#### 📋 Applied Patches & Fixes Ledger")
+    
+    if applied_patches:
+        st.dataframe(pd.DataFrame(applied_patches), use_container_width=True, hide_index=True)
+    else:
+        st.info("No patches or defense controls applied to the simulation model yet. Select controls from the 'Prioritized Action Plan' or 'Budget Defense Optimizer' tabs.")
+
+    # 5. Reset Posture Option
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    if has_defenses:
+        if st.button("↺ RESET ALL DEFENSES TO BASELINE SCAN STATE"):
+            reset_model_defenses_to_baseline(G)
+            st.toast("Model posture restored to baseline scan state.", icon="🔄")
+            st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -3968,6 +4460,7 @@ def render_graph(G, compromised_set=None, current_node=None, show_honeypot=True,
         tooltip = (
             f"<div style='font-family:Share Tech Mono,Segoe UI,monospace;font-size:11px;color:#e0f4ff;background:#09141f;padding:9px 12px;border:1px solid #00d4ff;border-radius:4px;box-shadow:0 4px 15px rgba(0,0,0,0.85);line-height:1.45'>"
             f"<b style='color:#00d4ff;font-size:12px'>{data.get('display_name', node)}</b><br>"
+            f"<b>Host Name:</b> {hostname or data.get('display_name', node)}<br>"
             f"<b>IP:</b> {ip}<br>"
             f"<b>Inferred OS:</b> {os_label}<br>"
             f"<b>Role:</b> {role} ({data.get('device_type') or 'Network Host'})<br>"
@@ -4370,9 +4863,10 @@ def export_asset_inventory_csv(G):
     if db_assets:
         for a in db_assets:
             crit_label = CRITICALITY_LABELS.get(_safe_int(a.get('criticality')), a.get('criticality') or 'Unknown')
+            h_name = a.get('hostname') or a.get('display_name') or 'Unknown'
             writer.writerow([
                 a.get('ip_address') or '', a.get('mac_address') or 'Unknown',
-                a.get('hostname') or 'Unknown', a.get('vendor') or 'Unknown',
+                h_name, a.get('vendor') or 'Unknown',
                 a.get('operating_system') or 'unknown', a.get('device_type') or 'Unknown',
                 a.get('current_risk') if a.get('current_risk') is not None else 'N/A',
                 crit_label, a.get('status') or 'Unknown',
@@ -4382,8 +4876,9 @@ def export_asset_inventory_csv(G):
         for node, d in G.nodes(data=True):
             if d.get('node_type') == 'honeypot':
                 continue
+            h_name = d.get('hostname') or d.get('display_name') or 'Unknown'
             writer.writerow([
-                d.get('ip', ''), d.get('mac') or 'Unknown', d.get('hostname') or 'Unknown',
+                d.get('ip', ''), d.get('mac') or 'Unknown', h_name,
                 d.get('mac_vendor') or 'Unknown', d.get('os', 'unknown'), d.get('device_type', 'Unknown'),
                 d.get('risk_score', 0), d.get('criticality_label', 'Unknown'), 'ONLINE (this session)',
                 '', '',
@@ -4420,39 +4915,68 @@ def export_vulnerability_report_csv(G):
 def build_executive_report_text(G, risk_score, blast_details, overall_risk, scan_history):
     metrics = get_asset_metrics(G)
     lines = []
-    lines.append("ACDS SECURITY ASSESSMENT")
-    lines.append("=" * 40)
-    lines.append("SIMULATION ONLY — NO REAL ATTACK TRAFFIC GENERATED")
-    lines.append("PASSIVE SCANNING ONLY — NO EXPLOITATION PERFORMED")
+    lines.append("ACDS SECURITY ASSESSMENT REPORT")
+    lines.append("=" * 45)
+    lines.append("ANALYTICAL MODELING ONLY — NO REAL ATTACK TRAFFIC")
+    lines.append("PASSIVE NETWORK AUDITING — ZERO EXPLOITATION PERFORMED")
+    lines.append("=" * 45)
     lines.append("")
-    lines.append("EXECUTIVE SUMMARY")
-    lines.append(f"Assets Discovered: {metrics['assets']}")
-    lines.append(f"Critical Findings (CVSS >= 9): {metrics['critical']}")
-    lines.append(f"High Findings (CVSS 7-8.9): {metrics['high']}")
-    lines.append(f"Average Asset Risk: {metrics['average_risk']}/100")
+    lines.append("1. EXECUTIVE SUMMARY")
+    lines.append(f"  • Assets Discovered: {metrics['assets']}")
+    lines.append(f"  • Critical Findings (CVSS >= 9): {metrics['critical']}")
+    lines.append(f"  • High Findings (CVSS 7-8.9): {metrics['high']}")
+    lines.append(f"  • Average Asset Risk: {metrics['average_risk']}/100")
     lines.append("")
-    lines.append("TOP RISKS")
+    lines.append("2. TOP RISK ASSETS")
     ranked = sorted(G.nodes(data=True), key=lambda x: x[1].get('risk_score', 0), reverse=True)[:5]
     for node, d in ranked:
-        lines.append(f"  - {d.get('display_name', node)} ({d.get('ip')}): {d.get('risk_score',0)}/100 [{d.get('risk_severity','?')}]")
+        lines.append(f"  • {d.get('display_name', node)} ({d.get('ip')}): {d.get('risk_score',0)}/100 [{d.get('risk_severity','?')}]")
     lines.append("")
-    lines.append("RECOMMENDED ACTIONS")
+    lines.append("3. ATTACK PROPAGATION & SIMULATION METRICS")
+    if blast_details:
+        hops = blast_details.get('max_lateral_hops', 0)
+        spread = blast_details.get('spread', 0.0)
+        crit_r = blast_details.get('critical_assets_reached', 0)
+        sys_c = blast_details.get('systems_controlled', 0)
+        lines.append(f"  • Simulation Status: Completed (Analytical Graph Traversal)")
+        lines.append(f"  • Initial Assumed Foothold: Included as starting node (non-exploitative baseline)")
+        lines.append(f"  • Network Blast Radius: {spread}% of scoped assets ({sys_c}/{metrics['assets']} hosts)")
+        lines.append(f"  • Critical Assets Reached: {crit_r}")
+        lines.append(f"  • Lateral Attack Depth: {hops} lateral hop(s)" + (" (Contained to initial foothold)" if hops == 0 else ""))
+        if risk_score is not None:
+            lines.append(f"  • Simulated Risk Score Before Defense: {risk_score:.1f}/100")
+    else:
+        lines.append("  • Simulation Status: Not run in this session")
+        lines.append("  • Attack Depth & Blast Radius: N/A (Execute simulation in Attack Propagation tab)")
+    lines.append("")
+    lines.append("4. OVERALL ACDS COMPOSITE RISK")
+    if overall_risk:
+        lines.append(f"  • Overall Composite Score: {overall_risk.get('overall_score')}/100 ({overall_risk.get('status')})")
+        lines.append(f"  • Asset Inherent Risk Component: {overall_risk.get('asset_risk_component', 'N/A')}")
+        lines.append(f"  • Simulated Blast Radius Component: {overall_risk.get('blast_radius_component', 'N/A')}")
+    else:
+        lines.append("  • Overall Composite Score: Pending calculation")
+    lines.append("")
+    lines.append("5. RECOMMENDED DEFENSIVE ACTIONS")
     seen = set()
+    action_count = 0
     for node, d in G.nodes(data=True):
-        for fix in d.get('fixes', [])[:2]:
+        for fix in d.get('fixes', []):
             if fix not in seen:
                 seen.add(fix)
-                lines.append(f"  - {fix}")
-    lines.append("")
-    lines.append(f"Risk Before Defense: {risk_score if risk_score else 'Simulation not run'}")
-    lines.append(f"Network Blast Radius: {blast_details.get('spread','N/A')}% spread, "
-                  f"{blast_details.get('critical_assets_reached','N/A')} critical asset(s) reached")
-    lines.append(f"Overall ACDS Risk: {overall_risk.get('overall_score')} ({overall_risk.get('status')})")
+                action_count += 1
+                lines.append(f"  [{action_count}] {fix}")
+                if action_count >= 8:
+                    break
+        if action_count >= 8:
+            break
+    if not seen:
+        lines.append("  • No high-priority remediation actions generated.")
     lines.append("")
     if scan_history:
-        lines.append("SCAN HISTORY")
-        for h in scan_history:
-            lines.append(f"  Scan #{h['scan_id']} — {h['asset_count']} assets, avg risk {h['average_risk']}, "
+        lines.append("6. SCAN AUDIT TRAIL")
+        for h in scan_history[-5:]:
+            lines.append(f"  • Scan #{h['scan_id']} — {h['asset_count']} assets, avg risk {h['average_risk']}, "
                           f"{h['critical_count']}C/{h['high_count']}H/{h['medium_count']}M/{h['low_count']}L")
     return "\n".join(lines)
 
@@ -5585,16 +6109,32 @@ def render_assets_page():
     G: nx.DiGraph = st.session_state.get("G", nx.DiGraph())
     raw_devices = st.session_state.get("last_scan_devices") or []
 
-    # Build structured asset records
+    # Build structured asset records with complete evidence provenance
     asset_list = []
     if G.number_of_nodes() > 0:
         for node, data in G.nodes(data=True):
             if data.get("node_type") == "honeypot":
                 continue
+            h_raw = data.get("hostname")
+            d_name = data.get("display_name", node)
+            if not h_raw or str(h_raw).strip().lower() in ("unknown", "none", "", "—"):
+                if d_name and " (" in d_name:
+                    h_val = d_name.split(" (")[0].strip()
+                elif d_name and "@" in d_name:
+                    h_val = d_name.split(" @")[0].strip()
+                elif d_name and d_name != data.get("ip"):
+                    h_val = d_name.strip()
+                else:
+                    dev_t = (data.get("device_type") or "Host").lower().replace(" ", "-")
+                    ip_tail = str(data.get("ip", "0")).split(".")[-1]
+                    h_val = f"{dev_t}-{ip_tail}"
+            else:
+                h_val = str(h_raw).strip()
+
             asset_list.append({
                 "node_id": node,
                 "ip": data.get("ip", ""),
-                "hostname": data.get("hostname", "Unknown"),
+                "hostname": h_val,
                 "display_name": data.get("display_name", node),
                 "device_type": data.get("device_type", "Computer"),
                 "os": data.get("os", "unknown"),
@@ -5603,11 +6143,20 @@ def render_assets_page():
                 "mac": data.get("mac", "—"),
                 "risk_score": data.get("risk_score", int(data.get("vulnerability", 0) * 100)),
                 "risk_severity": data.get("risk_severity", severity_from_score(data.get("risk_score", 0))),
+                "risk_components": data.get("risk_components", {}),
+                "asset_risk": data.get("asset_risk", {}),
                 "criticality": data.get("criticality", 1),
                 "criticality_label": data.get("criticality_label", CRITICALITY_LABELS.get(data.get("criticality", 1), "LOW")),
                 "open_ports": data.get("open_ports", []),
-                "services": data.get("services", {}),
+                "services": data.get("services", []),
+                "version_map": data.get("version_map", {}),
+                "banner_map": data.get("banner_map", {}),
                 "cve_findings": data.get("cve_findings", []),
+                "exposure_findings": data.get("exposure_findings", []),
+                "weaknesses": data.get("weaknesses", []),
+                "access_vectors": data.get("access_vectors", []),
+                "fixes": data.get("fixes", []),
+                "cve_source": data.get("cve_source", "none"),
                 "first_seen": data.get("first_seen", "Initial Scan"),
                 "last_seen": data.get("last_seen", "Current Assessment"),
                 "isolated": data.get("isolated", False),
@@ -5624,8 +6173,8 @@ def render_assets_page():
 
     # Top KPI Metrics Row
     total_count = len(asset_list)
-    server_count = sum(1 for a in asset_list if "Server" in a.get("device_type", "") or a.get("device_type") == "Database Server")
-    ws_count = sum(1 for a in asset_list if "Workstation" in a.get("device_type", "") or a.get("device_type") == "Computer")
+    server_count = sum(1 for a in asset_list if "Server" in str(a.get("device_type", "")) or a.get("device_type") == "Database Server")
+    ws_count = sum(1 for a in asset_list if "Workstation" in str(a.get("device_type", "")) or a.get("device_type") == "Computer")
     crit_count = sum(1 for a in asset_list if a.get("criticality", 1) >= 4)
     total_ports = sum(len(a.get("open_ports", [])) for a in asset_list)
 
@@ -5644,7 +6193,7 @@ def render_assets_page():
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
     # Search & Filter Toolbar
-    f_col1, f_col2, f_col3, f_col4 = st.columns([3, 2, 2, 2])
+    f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([3, 2, 2, 2, 2])
     with f_col1:
         search_q = st.text_input("🔍 Search Assets", placeholder="Search by IP, hostname, vendor, OS...", label_visibility="collapsed")
     with f_col2:
@@ -5653,6 +6202,20 @@ def render_assets_page():
         crit_filter = st.selectbox("Criticality Filter", ["All Criticalities", "Tier 5 (Critical)", "Tier 4 (High)", "Tier 3 (Medium)", "Tier 1-2 (Low)"], label_visibility="collapsed")
     with f_col4:
         type_filter = st.selectbox("Device Type", ["All Device Types"] + sorted(list({a.get("device_type") for a in asset_list if a.get("device_type")})), label_visibility="collapsed")
+    with f_col5:
+        if st.button("⚡ Validate All Live", use_container_width=True, help="Concurrently re-scan all network assets in real-time to detect new or closed ports"):
+            with st.spinner("Re-validating all assets in real-time (rechecking ports & exposure)..."):
+                for a in asset_list:
+                    v_res = validate_asset_state(
+                        asset_id=a.get("node_id") or a.get("ip"),
+                        ip=a.get("ip"),
+                        expected_ports=a.get("open_ports", [])
+                    )
+                    st.session_state.setdefault("live_validation_results", {})[a.get("node_id")] = v_res
+                    sync_live_validation_to_graph(G, a.get("node_id"), v_res)
+                st.session_state.overall_acds_risk = calculate_overall_acds_risk(G, st.session_state.get("risk_score", 0.0))
+                st.success(f"✓ Real-time validation completed for all {len(asset_list)} assets! Updated open ports, lateral paths, and risk scores.")
+                st.rerun()
 
     # Apply Filters
     filtered_assets = []
@@ -5693,9 +6256,9 @@ def render_assets_page():
         ports_str = ", ".join(str(p) for p in a.get("open_ports", [])) or "None"
         table_data.append({
             "IP Address": a.get("ip"),
-            "Hostname": a.get("hostname") or "—",
+            "Hostname": a.get("hostname") or a.get("display_name") or "—",
             "Device Type": a.get("device_type"),
-            "OS": f"{a.get('os').title()}" if a.get('os') else "Unknown",
+            "OS": f"{str(a.get('os')).title()}" if a.get('os') else "Unknown",
             "Vendor": a.get("vendor"),
             "Risk Score": f"{a.get('risk_score')}/100 ({a.get('risk_severity')})",
             "Criticality": f"{a.get('criticality_label')} (Tier {a.get('criticality')})",
@@ -5712,9 +6275,9 @@ def render_assets_page():
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
     st.markdown("### 🔎 Asset Deep-Dive Investigation")
 
-    asset_display_options = [f"{a.get('ip')} — {a.get('display_name')}" for a in filtered_assets]
+    asset_display_options = [f"{a.get('ip')} — {a.get('hostname') or a.get('display_name')} ({a.get('device_type')})" for a in filtered_assets]
     if not asset_display_options:
-        asset_display_options = [f"{a.get('ip')} — {a.get('display_name')}" for a in asset_list]
+        asset_display_options = [f"{a.get('ip')} — {a.get('hostname') or a.get('display_name')} ({a.get('device_type')})" for a in asset_list]
 
     sel_asset_str = st.selectbox("Select Asset to Investigate", asset_display_options, index=0)
     sel_ip = sel_asset_str.split(" ")[0]
@@ -5728,7 +6291,7 @@ def render_assets_page():
         <div style="background:#151E32;border:1px solid #23324D;border-radius:8px;padding:16px 20px;margin-bottom:12px">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
                 <div>
-                    <span style="font-size:1.15rem;font-weight:700;color:#F8FAFC">{selected_asset.get('display_name')}</span>
+                    <span style="font-size:1.15rem;font-weight:700;color:#F8FAFC">{selected_asset.get('hostname') or selected_asset.get('display_name')}</span>
                     <span style="font-size:0.85rem;color:#94A3B8;margin-left:8px"><code>{selected_asset.get('ip')}</code></span>
                 </div>
                 <div>
@@ -5736,12 +6299,15 @@ def render_assets_page():
                 </div>
             </div>
             <div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:10px;font-size:0.78rem">
+                <div><span style="color:#64748B">Host Name:</span> <b style="color:#F8FAFC">{selected_asset.get('hostname') or selected_asset.get('display_name')}</b></div>
+                <div><span style="color:#64748B">IP Address:</span> <code class="soc-code">{selected_asset.get('ip')}</code></div>
                 <div><span style="color:#64748B">MAC Address:</span> <code class="soc-code">{selected_asset.get('mac','—')}</code></div>
                 <div><span style="color:#64748B">Vendor:</span> <b style="color:#CBD5E1">{selected_asset.get('vendor','Unknown')}</b></div>
                 <div><span style="color:#64748B">Device Type:</span> <b style="color:#CBD5E1">{selected_asset.get('device_type','Unknown')}</b></div>
-                <div><span style="color:#64748B">Inferred OS:</span> <b style="color:#CBD5E1">{selected_asset.get('os','unknown').title()}</b> <span style="font-size:0.68rem;color:#64748B">({selected_asset.get('os_confidence')})</span></div>
+                <div><span style="color:#64748B">Inferred OS:</span> <b style="color:#CBD5E1">{str(selected_asset.get('os','unknown')).title()}</b> <span style="font-size:0.68rem;color:#64748B">({selected_asset.get('os_confidence')})</span></div>
                 <div><span style="color:#64748B">Criticality:</span> {_soc_criticality_stars(selected_asset.get('criticality',1))}</div>
                 <div><span style="color:#64748B">First Seen:</span> <span style="color:#94A3B8">{selected_asset.get('first_seen','Initial Scan')}</span></div>
+                <div><span style="color:#64748B">Last Seen:</span> <span style="color:#94A3B8">{selected_asset.get('last_seen','Current Assessment')}</span></div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -5750,20 +6316,26 @@ def render_assets_page():
         st.markdown(
             f'<div style="background:#0F172A;border:1px solid #23324D;border-radius:8px;padding:16px;margin-bottom:12px">'
             f'<div style="font-size:0.75rem;font-weight:700;color:#94A3B8;text-transform:uppercase;letter-spacing:0.5px">Real-Time Validation</div>'
-            f'<div style="font-size:0.78rem;color:#64748B;margin-top:4px;line-height:1.4">Actively test host reachability and TCP port status directly.</div>'
+            f'<div style="font-size:0.78rem;color:#64748B;margin-top:4px;line-height:1.4">Actively recheck open ports, discover new ports, and refresh topology.</div>'
             f'</div>',
             unsafe_allow_html=True
         )
         if st.button("⚡ Run Live Validation", use_container_width=True, key=f"val_{sel_ip}"):
-            with st.spinner(f"Validating {sel_ip} live..."):
+            with st.spinner(f"Validating {sel_ip} live (re-checking ports & services)..."):
                 val_res = validate_asset_state(
                     asset_id=selected_asset.get("node_id") or selected_asset.get("ip"),
                     ip=selected_asset.get("ip"),
                     expected_ports=selected_asset.get("open_ports", [])
                 )
                 st.session_state.setdefault("live_validation_results", {})[selected_asset.get("node_id")] = val_res
+
+                # Propagate findings into graph, lateral edges, risk scoring, session state, and SQLite DB
+                diff_summary = sync_live_validation_to_graph(G, selected_asset.get("node_id"), val_res)
+                st.session_state.overall_acds_risk = calculate_overall_acds_risk(G, st.session_state.get("risk_score", 0.0))
+
                 state_label = "ONLINE & REACHABLE" if val_res.get("reachable") else "UNREACHABLE / OFFLINE"
-                st.success(f"Validated: {state_label} ({val_res.get('latency_ms', 0):.1f}ms latency, {len(val_res.get('open_ports', []))} open ports)")
+                st.success(f"✓ Validated: {state_label} ({val_res.get('latency_ms', 0):.1f}ms latency | {len(val_res.get('open_ports', []))} active ports)")
+                st.rerun()
 
     # Detailed Sub-Tabs for Selected Asset
     a_tab_svcs, a_tab_cves, a_tab_risk, a_tab_exp, a_tab_actions = st.tabs([
@@ -5776,26 +6348,29 @@ def render_assets_page():
 
     with a_tab_svcs:
         open_ports = selected_asset.get("open_ports", [])
-        services_dict = selected_asset.get("services", {})
+        version_map = selected_asset.get("version_map", {})
+        banner_map = selected_asset.get("banner_map", {})
         if open_ports:
             svc_rows = []
             for p in open_ports:
-                s_info = services_dict.get(p, {}) if isinstance(services_dict, dict) else {}
-                if isinstance(s_info, str):
-                    s_name = s_info
-                    s_ver = ""
-                    s_banner = ""
+                s_name = PORT_SERVICE_MAP.get(p, f"Port {p}")
+                s_ver = version_map.get(s_name) or version_map.get(p) or version_map.get(str(p)) or ""
+                s_banner = banner_map.get(s_name) or banner_map.get(p) or banner_map.get(str(p)) or ""
+
+                if s_ver:
+                    det_status = "Version Detected"
+                elif s_banner:
+                    det_status = "Banner Obtained (Version Undisclosed)"
                 else:
-                    s_name = s_info.get("service") or PORT_SERVICE_MAP.get(p, "Unknown")
-                    s_ver = s_info.get("version") or ""
-                    s_banner = s_info.get("banner") or ""
+                    det_status = "Port Open (Banner Withheld)"
 
                 svc_rows.append({
                     "Port": p,
                     "Protocol": "TCP",
                     "Service": s_name,
-                    "Detected Version": s_ver or "—",
-                    "Service Banner": (s_banner[:60] + "…") if len(s_banner) > 60 else (s_banner or "—"),
+                    "Detected Version": s_ver or "Undisclosed / Unknown",
+                    "Detection Status": det_status,
+                    "Service Banner": (s_banner[:60] + "…") if len(s_banner) > 60 else (s_banner or "No banner response"),
                     "Exposure Baseline": f"{SERVICE_BASELINE_RISK.get(s_name, 0.4)*100:.0f}/100",
                 })
             st.dataframe(pd.DataFrame(svc_rows), use_container_width=True, hide_index=True)
@@ -5804,6 +6379,7 @@ def render_assets_page():
 
     with a_tab_cves:
         cves = selected_asset.get("cve_findings", [])
+        exp_findings = selected_asset.get("exposure_findings", [])
         if cves:
             cve_rows = []
             for c in cves:
@@ -5818,18 +6394,65 @@ def render_assets_page():
                 })
             st.dataframe(pd.DataFrame(cve_rows), use_container_width=True, hide_index=True)
         else:
-            st.info("No CVEs matched against detected service banners for this asset.")
+            st.markdown(
+                '<div style="background:#0F172A;border:1px solid #23324D;border-radius:6px;padding:12px 16px;margin-bottom:12px">'
+                '<div style="font-size:0.85rem;font-weight:600;color:#F8FAFC">ℹ️ Vulnerability Assessment Intelligence Status</div>'
+                '<div style="font-size:0.78rem;color:#94A3B8;margin-top:4px;line-height:1.5">'
+                'No version-specific CVEs were matched against NVD or offline intelligence for this asset. '
+                '<b>Note:</b> The absence of a matched CVE does not indicate zero risk; services with undisclosed version headers cannot be matched deterministically. '
+                'Review baseline exposure findings below.'
+                '</div></div>',
+                unsafe_allow_html=True
+            )
+            if exp_findings:
+                st.markdown("**Baseline Exposure & Service Risk Findings:**")
+                exp_rows = []
+                for ef in exp_findings:
+                    exp_rows.append({
+                        "Service": ef.get("service"),
+                        "Port": ef.get("port"),
+                        "Baseline Risk": f"{ef.get('baseline_risk', 0.4)*100:.0f}/100",
+                        "Risk Reason": ef.get("reason", "Open TCP Service"),
+                        "MITRE Tactic": ef.get("mitre_desc", "Exploit Public-Facing Application"),
+                    })
+                st.dataframe(pd.DataFrame(exp_rows), use_container_width=True, hide_index=True)
 
     with a_tab_risk:
         r_score = selected_asset.get("risk_score", 0)
         r_sev = selected_asset.get("risk_severity", "LOW")
+        r_comps = selected_asset.get("risk_components", {})
+        def _get_comp_score(comp_key):
+            val = r_comps.get(comp_key, 0.0)
+            if isinstance(val, dict):
+                return float(val.get("contribution", val.get("normalized_score", 0.0)) or 0.0)
+            try:
+                return float(val or 0.0)
+            except Exception:
+                return 0.0
+
+        v_comp = _get_comp_score("vulnerability")
+        s_comp = _get_comp_score("service_exposure")
+        sen_comp = _get_comp_score("sensitive_services")
+        c_comp = _get_comp_score("criticality")
+        n_comp = _get_comp_score("network_exposure")
+
         st.markdown(f"""
         <div style="background:#0F172A;border:1px solid #23324D;border-radius:6px;padding:14px 18px;margin-bottom:12px">
-            <div style="font-size:0.85rem;font-weight:700;color:#F8FAFC;margin-bottom:8px">
+            <div style="font-size:0.9rem;font-weight:700;color:#F8FAFC;margin-bottom:8px">
                 Asset Risk Formula Breakdown: <span style="color:#3B82F6">{r_score}/100</span> ({r_sev})
             </div>
             <div style="font-size:0.78rem;color:#94A3B8;line-height:1.6">
-                <code>Asset Risk = (0.40 × Vulnerability) + (0.20 × Port Exposure) + (0.15 × Sensitive Services) + (0.15 × Criticality) + (0.10 × Centrality)</code>
+                <code>Asset Risk = (40% × Vuln) + (20% × Exposure) + (15% × Sensitive Svc) + (15% × Criticality) + (10% × Centrality)</code>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(5, 1fr);gap:10px;margin-top:12px;font-size:0.75rem">
+                <div style="background:#151E32;padding:8px;border-radius:4px"><b>Vuln (40%):</b> {v_comp:.1f}</div>
+                <div style="background:#151E32;padding:8px;border-radius:4px"><b>Ports (20%):</b> {s_comp:.1f}</div>
+                <div style="background:#151E32;padding:8px;border-radius:4px"><b>Sensitive (15%):</b> {sen_comp:.1f}</div>
+                <div style="background:#151E32;padding:8px;border-radius:4px"><b>Crit (15%):</b> {c_comp:.1f}</div>
+                <div style="background:#151E32;padding:8px;border-radius:4px"><b>Network (10%):</b> {n_comp:.1f}</div>
+            </div>
+            <div style="font-size:0.75rem;color:#64748B;margin-top:10px">
+                <b>Note on Criticality vs Risk:</b> An asset may have HIGH criticality (e.g., Tier 4 Web/DB Server) but LOW risk score if its software is patched, hardened, and has minimal exposure. Criticality reflects business impact; Risk reflects active threat/vulnerability likelihood.
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -5845,14 +6468,14 @@ def render_assets_page():
                     for src, _, d in in_edges[:6]:
                         st.markdown(f"- From **{src}** via {d.get('service','TCP')} (Port {d.get('port','—')})")
                 else:
-                    st.caption("No inbound lateral paths.")
+                    st.caption("No inbound lateral paths (typical for single-host scans or isolated nodes).")
             with e_col2:
                 st.markdown(f"**Outbound Lateral Reach ({len(out_edges)}):**")
                 if out_edges:
                     for _, dst, d in out_edges[:6]:
                         st.markdown(f"- To **{dst}** via {d.get('service','TCP')} (Port {d.get('port','—')})")
                 else:
-                    st.caption("No outbound lateral paths.")
+                    st.caption("No outbound lateral paths (typical for single-host scans or endpoints).")
         else:
             st.info("Graph topology not populated for this node.")
 
@@ -5863,7 +6486,7 @@ def render_assets_page():
             fix_count += 1
             st.markdown(f"""
             <div class="soc-action-card critical">
-                <b>PATCH:</b> {c.get('cve_id')} on {c.get('service')} — {c.get('remediation', 'Upgrade service')}
+                <b>PATCH:</b> {c.get('cve_id')} on {c.get('service')} — {c.get('remediation', c.get('fix_version', 'Upgrade service'))}
             </div>
             """, unsafe_allow_html=True)
         for p in selected_asset.get("open_ports", []):
@@ -5872,7 +6495,7 @@ def render_assets_page():
                 svc = PORT_SERVICE_MAP.get(p, "Service")
                 st.markdown(f"""
                 <div class="soc-action-card high">
-                    <b>RESTRICT:</b> Close or firewall port {p} ({svc}) — {GENERIC_FIXES.get(svc)}
+                    <b>RESTRICT:</b> Close or firewall port {p} ({svc}) — {GENERIC_FIXES.get(svc, 'Restrict access')}
                 </div>
                 """, unsafe_allow_html=True)
         if fix_count == 0:
@@ -6234,18 +6857,41 @@ def render_analysis_page():
         if not all_nodes:
             st.info("No nodes in network graph. Run an assessment scan first.")
         else:
+            has_prev_sim = bool(st.session_state.get("simulation_done"))
+            btn_label = "🔁 RE-RUN ATTACK SIMULATION" if has_prev_sim else "▶ RUN ATTACK SIMULATION"
+
             sim_col1, sim_col2, sim_col3 = st.columns([4, 4, 3])
             with sim_col1:
-                entry_node = st.selectbox("Select Simulated Entry Point", all_nodes, index=min(1, len(all_nodes)-1))
+                default_idx = all_nodes.index(st.session_state.get("last_entry_node")) if st.session_state.get("last_entry_node") in all_nodes else min(1, len(all_nodes)-1)
+                entry_node = st.selectbox("Select Simulated Entry Point", all_nodes, index=default_idx)
             with sim_col2:
                 sim_ids = st.checkbox("Simulate with IDS Active", value=st.session_state.get("ids_deployed", False))
                 sim_seg = st.checkbox("Simulate with Network Segmentation", value=st.session_state.get("segmentation_applied", False))
             with sim_col3:
                 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-                run_sim = st.button("▶ RUN ATTACK SIMULATION", use_container_width=True, type="primary")
+                run_sim = st.button(btn_label, use_container_width=True, type="primary")
 
-            if run_sim or st.session_state.get("simulation_done"):
+            if run_sim or has_prev_sim:
                 if run_sim:
+                    # If this is a re-run, capture the previous state as BEFORE baseline if not already captured
+                    if has_prev_sim:
+                        if st.session_state.get("risk_before_defense") is None and st.session_state.get("risk_score") is not None:
+                            st.session_state.risk_before_defense = float(st.session_state.get("risk_score", 0.0))
+                        if not st.session_state.get("blast_before_defense") and st.session_state.get("blast_details"):
+                            st.session_state.blast_before_defense = dict(st.session_state.get("blast_details") or {})
+                        if not st.session_state.get("overall_acds_risk_before") and st.session_state.get("overall_acds_risk"):
+                            st.session_state.overall_acds_risk_before = dict(st.session_state.get("overall_acds_risk") or {})
+                        if not st.session_state.get("compromised_before_defense") and st.session_state.get("compromised"):
+                            st.session_state.compromised_before_defense = set(st.session_state.get("compromised") or set())
+                        if not st.session_state.get("timeline_before_defense") and st.session_state.get("timeline"):
+                            st.session_state.timeline_before_defense = list(st.session_state.get("timeline") or [])
+                        if not st.session_state.get("mitre_before_defense") and st.session_state.get("timeline"):
+                            st.session_state.mitre_before_defense = {
+                                t['mitre_code']: t.get('mitre_desc', 'Remote Service')
+                                for t in st.session_state.get('timeline', []) if t.get('mitre_code')
+                            }
+                        st.session_state.has_re_simulated = True
+
                     with st.spinner("Calculating analytical propagation path..."):
                         t_start = time.time()
                         timeline, decision_log, compromised, uncompromised, successful_paths, blocked_failed_paths, attack_stats = simulate_decision_based_propagation(
@@ -6256,8 +6902,12 @@ def render_analysis_page():
                         )
                         dur = round(time.time() - t_start, 4)
                         risk_sc, blast_details = calculate_risk(G, compromised, timeline, honeypot_trig, attack_stats)
+                        
                         st.session_state.compromised = compromised
                         st.session_state.timeline = timeline
+                        st.session_state.decision_log = decision_log
+                        st.session_state.successful_paths = successful_paths
+                        st.session_state.blocked_failed_paths = blocked_failed_paths
                         st.session_state.blast_details = blast_details
                         st.session_state.honeypot_triggered = honeypot_trig
                         st.session_state.attack_stats = attack_stats
@@ -6268,19 +6918,136 @@ def render_analysis_page():
                         st.session_state.overall_acds_risk = calculate_overall_acds_risk(G, risk_sc)
                         st.session_state.last_entry_node = entry_node
 
+                        # If re-simulated, store post-defense / re-sim outcomes
+                        if st.session_state.get("has_re_simulated"):
+                            st.session_state.post_defense_stats = blast_details
+                            st.session_state.risk_score_after = risk_sc
+                            st.session_state.overall_acds_risk_after = st.session_state.overall_acds_risk
+                            st.session_state.compromised_after = compromised
+                            st.session_state.timeline_after = timeline
+                            st.session_state.decision_log_after = decision_log
+                            st.session_state.mitre_after_defense = {
+                                t['mitre_code']: t.get('mitre_desc', 'Remote Service')
+                                for t in timeline if t.get('mitre_code')
+                            }
+                            st.session_state.post_defense_sim_done = True
+                            st.session_state.pending_re_simulation = False
+
                 # Simulation Outcome Cards
                 comp_nodes = st.session_state.get("compromised", set())
                 blast_det = st.session_state.get("blast_details", {})
+                max_hops = blast_det.get("max_lateral_hops", 0)
 
                 sr1, sr2, sr3, sr4 = st.columns(4)
                 with sr1:
-                    st.metric("COMPROMISED HOSTS", len(comp_nodes), f"of {len(all_nodes)} total")
+                    st.metric("COMPROMISED HOSTS", len(comp_nodes), f"of {len(all_nodes)} in scope")
                 with sr2:
                     st.metric("BLAST RADIUS SCORE", f"{st.session_state.get('risk_score', 0):.1f}/100")
                 with sr3:
-                    st.metric("ATTACK DEPTH", f"{blast_det.get('max_depth', 1)} Hops")
+                    st.metric("ATTACK DEPTH", f"{max_hops} Lateral Hop{'s' if max_hops != 1 else ''}")
                 with sr4:
                     st.metric("DECOY TRIGGERED", "YES" if st.session_state.get("honeypot_triggered") else "NO")
+
+                if len(all_nodes) == 1:
+                    st.markdown("""
+                    <div style="background:#0F172A;border:1px solid #1E293B;border-radius:6px;padding:8px 14px;margin-top:8px;font-size:0.75rem;color:#94A3B8">
+                        ℹ️ <b>Single-Host Scope Note:</b> Because only 1 asset was in scope and selected as the modeled entry point, 100% of scoped assets are within the blast radius with 0 lateral propagation hops.
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # ── BEFORE vs AFTER COMPARISON IN THE SAME SIMULATOR AREA ──
+                has_comparison = (
+                    st.session_state.get("has_re_simulated") or 
+                    st.session_state.get("post_defense_sim_done") or 
+                    st.session_state.get("risk_before_defense") is not None
+                )
+                if has_comparison and st.session_state.get("risk_before_defense") is not None:
+                    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+                    st.markdown("#### 🎯 Before vs After Re-Simulation Comparison")
+
+                    before_risk = st.session_state.get("risk_before_defense")
+                    after_risk = st.session_state.get("risk_score")
+                    before_bd = st.session_state.get("blast_before_defense") or {}
+                    after_bd = blast_det
+                    before_ov = st.session_state.get("overall_acds_risk_before") or {}
+                    after_ov = st.session_state.get("overall_acds_risk") or {}
+
+                    b_ov_sc = before_ov.get("overall_score")
+                    a_ov_sc = after_ov.get("overall_score")
+
+                    comp_rows = [
+                        ("OVERALL RISK", b_ov_sc, a_ov_sc, True),
+                        ("BLAST RADIUS", before_risk, after_risk, True),
+                        ("CRITICAL ASSETS REACHABLE", before_bd.get("critical_assets_reached", 0), after_bd.get("critical_assets_reached", 0), True),
+                        ("ATTACK DEPTH (hops)", before_bd.get("max_lateral_hops", 0), after_bd.get("max_lateral_hops", 0), True),
+                        ("REACHABLE NODES", before_bd.get("systems_controlled", before_bd.get("compromised_count", 0)), after_bd.get("systems_controlled", len(comp_nodes)), True),
+                    ]
+                    comp_rows = [r for r in comp_rows if r[1] is not None]
+                    st.markdown(_verification_metric_row(comp_rows), unsafe_allow_html=True)
+
+                    # Better vs Worse Comparative Analysis
+                    before_comp = set(st.session_state.get("compromised_before_defense") or set())
+                    after_comp = set(comp_nodes)
+                    saved_hosts = before_comp - after_comp
+                    newly_exposed = after_comp - before_comp
+
+                    before_m = st.session_state.get("mitre_before_defense") or {}
+                    current_m = {t['mitre_code']: t.get('mitre_desc', '') for t in (st.session_state.get("timeline") or []) if t.get('mitre_code')}
+                    neut_tech = set(before_m.keys()) - set(current_m.keys())
+
+                    cb1, cb2 = st.columns(2)
+                    with cb1:
+                        st.markdown("""
+                        <div style="background:#0F291E;border:1px solid #059669;border-radius:8px;padding:14px;height:100%">
+                            <div style="font-size:0.85rem;font-weight:700;color:#10B981;margin-bottom:6px">
+                                🟢 WHAT'S DONE BETTER (Defensive Improvements)
+                            </div>
+                        """, unsafe_allow_html=True)
+                        if after_risk is not None and before_risk is not None:
+                            r_delta = round(after_risk - before_risk, 1)
+                            if r_delta < 0:
+                                st.markdown(f"- **Blast Radius:** Decreased by **{abs(r_delta):.1f} pts** ({before_risk:.1f} → {after_risk:.1f})")
+                            elif r_delta == 0:
+                                st.markdown(f"- **Blast Radius:** Unchanged ({before_risk:.1f})")
+                        if saved_hosts:
+                            s_str = ", ".join(f"<code>{n}</code>" for n in saved_hosts)
+                            st.markdown(f"- **Shielded Endpoints:** {len(saved_hosts)} host(s) protected ({s_str})", unsafe_allow_html=True)
+                        if neut_tech:
+                            t_str = ", ".join(f"<code>{t}</code>" for t in neut_tech)
+                            st.markdown(f"- **MITRE Techniques Blocked:** {t_str}", unsafe_allow_html=True)
+                        if after_bd.get("max_lateral_hops", 0) < before_bd.get("max_lateral_hops", 0):
+                            st.markdown(f"- **Lateral Chain:** Reduced from {before_bd.get('max_lateral_hops', 0)} to {after_bd.get('max_lateral_hops', 0)} hop(s).")
+                        st.markdown("</div>", unsafe_allow_html=True)
+
+                    with cb2:
+                        st.markdown("""
+                        <div style="background:#261815;border:1px solid #DC2626;border-radius:8px;padding:14px;height:100%">
+                            <div style="font-size:0.85rem;font-weight:700;color:#EF4444;margin-bottom:6px">
+                                🔴 RESIDUAL RISKS & REMAINING EXPOSURE
+                            </div>
+                        """, unsafe_allow_html=True)
+                        if after_comp:
+                            st_str = ", ".join(f"<code>{n}</code>" for n in after_comp)
+                            st.markdown(f"- **Reachable Endpoints:** {len(after_comp)} asset(s) accessible ({st_str})", unsafe_allow_html=True)
+                        else:
+                            st.markdown("- **Reachable Endpoints:** 0 (Full containment achieved)")
+                        if current_m:
+                            m_str = ", ".join(f"<code>{t}</code>" for t in current_m)
+                            st.markdown(f"- **Active Vectors in Scope:** {m_str}", unsafe_allow_html=True)
+                        if newly_exposed:
+                            st.markdown(f"- ⚠️ **Secondary Exposure:** {len(newly_exposed)} asset(s) reached via alternate routes.")
+                        st.markdown("</div>", unsafe_allow_html=True)
+
+                    if st.button("↺ Reset Baseline Snapshot", key="reset_sim_baseline"):
+                        st.session_state.risk_before_defense = None
+                        st.session_state.blast_before_defense = None
+                        st.session_state.overall_acds_risk_before = None
+                        st.session_state.compromised_before_defense = None
+                        st.session_state.timeline_before_defense = None
+                        st.session_state.mitre_before_defense = None
+                        st.session_state.has_re_simulated = False
+                        st.toast("Baseline snapshot cleared. Next run will be the new baseline.", icon="🔄")
+                        st.rerun()
 
                 st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
@@ -6299,23 +7066,77 @@ def render_analysis_page():
                 # Propagation Step-by-Step Table
                 st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
                 st.markdown("#### Modeled Attack Propagation Sequence")
-                timeline = st.session_state.get("timeline", [])
-                if timeline:
-                    step_rows = []
-                    for t in timeline:
+
+                decision_log = st.session_state.get("decision_log") or []
+                timeline = st.session_state.get("timeline") or []
+
+                step_rows = []
+                if decision_log:
+                    for entry in decision_log:
+                        step_num = entry.get("step")
+                        src_name = entry.get("source") or "Not recorded"
+                        dst_name = entry.get("target") or "Not recorded"
+                        dst_ip = entry.get("target_ip")
+                        dst_display = f"{dst_name} ({dst_ip})" if (dst_ip and dst_ip not in dst_name) else dst_name
+                        svc_str = entry.get("service") or "Not recorded"
+                        tech_str = entry.get("technique") or "Not recorded"
+                        prob_str = entry.get("probability") or "Not recorded"
+                        decision_txt = str(entry.get("decision", ""))
+
+                        if entry.get("step") == 1 or src_name == "EXTERNAL ATTACKER":
+                            outcome_lbl = "🟢 ASSUMED ENTRY FOOTHOLD"
+                        elif "COMPROMISE POSSIBLE" in decision_txt:
+                            outcome_lbl = "🔴 COMPROMISE POSSIBLE (Simulated)"
+                        elif "BLOCKED" in decision_txt:
+                            outcome_lbl = "🛡️ BLOCKED BY DEFENSE"
+                        elif "COMPROMISE NOT POSSIBLE" in decision_txt:
+                            outcome_lbl = "⚪ ATTEMPT RESISTED / PORT CLOSED"
+                        elif "NO VALID PATH" in decision_txt:
+                            outcome_lbl = "⚪ NO VALID PATH (Offline/Closed)"
+                        else:
+                            outcome_lbl = entry.get("result_status", "EVALUATED")
+
                         step_rows.append({
-                            "Step": t.get("step"),
-                            "Attacker Source": t.get("attacker"),
-                            "Target Host": t.get("target"),
-                            "Vector": t.get("service", "TCP"),
-                            "Port": t.get("port", "—"),
-                            "Technique": t.get("mitre_id", "T1021"),
-                            "Probability": f"{t.get('p_exploit', 0.5)*100:.0f}%",
-                            "Simulated Result": "COMPROMISED" if t.get("status") == "compromised" else "CONTAINED",
+                            "Step": f"Step {step_num}" if step_num is not None else "—",
+                            "Attacker Source": src_name,
+                            "Target Host": dst_display,
+                            "Target Service / Vector": svc_str,
+                            "MITRE ATT&CK Technique": tech_str,
+                            "Modeled Probability": prob_str,
+                            "Analytical Outcome": outcome_lbl,
+                            "Decision Rationale": entry.get("reason", "Not recorded"),
                         })
+                elif timeline:
+                    for idx, t in enumerate(timeline, start=1):
+                        is_entry = (t.get("from_node") is None or idx == 1)
+                        src_str = "EXTERNAL / ASSUMED FOOTHOLD" if is_entry else str(t.get("from_node", "Unknown"))
+                        dst_str = str(t.get("node", "Target"))
+                        tech_str = f"{t.get('mitre_code', 'T1021')} — {t.get('mitre_desc', 'Remote Services')}" if t.get("mitre_code") else "Not recorded"
+                        vec_str = t.get("access_vector") or "Not recorded"
+                        if is_entry:
+                            outcome_str = "🟢 ASSUMED ENTRY FOOTHOLD"
+                        elif t.get("success"):
+                            outcome_str = "🔴 COMPROMISE POSSIBLE (Simulated)"
+                        else:
+                            outcome_str = "🛡️ BLOCKED / RESISTED"
+
+                        step_rows.append({
+                            "Step": f"Step {t.get('timestep', idx)}",
+                            "Attacker Source": src_str,
+                            "Target Host": dst_str,
+                            "Target Service / Vector": vec_str,
+                            "MITRE ATT&CK Technique": tech_str,
+                            "Modeled Probability": "100% (Assumed Entry)" if is_entry else f"{int(t.get('vuln', 0.5)*100)}%",
+                            "Analytical Outcome": outcome_str,
+                            "Decision Rationale": "Assumed entry point foothold" if is_entry else ("Modeled lateral compromise" if t.get("success") else "Blocked/contained by defensive controls or probability threshold"),
+                        })
+
+                if step_rows:
+                    if len(step_rows) == 1 and ("FOOTHOLD" in step_rows[0].get("Analytical Outcome", "")):
+                        st.info("ℹ️ **Simulation Contained at Initial Foothold:** Selected asset was modeled as the initial entry point. No lateral movement propagation occurred because no other reachable targets/edges exist in this scope.")
                     st.dataframe(pd.DataFrame(step_rows), use_container_width=True, hide_index=True)
                 else:
-                    st.info("Simulation contained at initial entry point with no further propagation.")
+                    st.info("Simulation not executed or no propagation events were recorded.")
 
     # 2. Graph Risk Prioritization Tab
     with tab_priorities:
@@ -6353,8 +7174,8 @@ def render_analysis_page():
         st.markdown("#### Historical Security & Exposure Posture Trends")
         if V4_MODULES_LOADED:
             try:
-                risk_rows = get_overall_risk_trend(database, limit=30)
-                asset_trend = get_asset_count_trend(database, limit=30)
+                risk_rows = get_overall_risk_trend(monitor_db, limit=30)
+                asset_trend = get_asset_count_trend(monitor_db, limit=30)
                 applied_defenses = st.session_state.get("applied_defenses", [])
                 defense_eff = calculate_defense_effectiveness(
                     st.session_state.get("blast_details"),
@@ -6379,10 +7200,31 @@ def render_response_page():
         st.info("No assets in graph. Run an assessment to generate defense recommendations.")
         return
 
+    # Re-Simulation Prompt Banner across Response page
+    applied_defenses = st.session_state.get("applied_defenses", [])
+    if applied_defenses and (st.session_state.get("pending_re_simulation") or not st.session_state.get("post_defense_sim_done")):
+        bp1, bp2 = st.columns([8, 4])
+        with bp1:
+            st.markdown(f"""
+            <div style="background:rgba(245,158,11,0.1);border:1px solid #F59E0B;border-radius:6px;padding:12px 16px;margin-bottom:12px">
+                <b style="color:#F59E0B;font-size:0.88rem">⚡ {len(applied_defenses)} Patch / Defense Control(s) Applied to In-Memory Model</b>
+                <div style="font-size:0.75rem;color:#CBD5E1;margin-top:2px">
+                    Re-run the attack simulation to evaluate whether lateral attack paths were halted and view the Before vs. After comparison.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        with bp2:
+            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+            if st.button("🔁 RUN RE-ATTACK SIMULATION NOW", type="primary", use_container_width=True, key="resp_top_re_sim"):
+                with st.spinner("Executing post-defense attack simulation..."):
+                    run_post_defense_re_simulation(G)
+                    st.toast("Post-defense simulation completed! Switching to verification...", icon="🛡️")
+                    st.rerun()
+
     tab_plan, tab_opt, tab_verify = st.tabs([
         "🛡️ Prioritized Action Plan",
         "💰 Budget Defense Optimizer",
-        "📏 Before / After Verification",
+        "📏 Before / After Verification & Ledger",
     ])
 
     # 1. Prioritized Action Plan
@@ -6393,23 +7235,43 @@ def render_response_page():
             for idx, act in enumerate(actions):
                 act_type = act.get("type", "PATCH").upper()
                 sev_cls = "critical" if act.get("risk_reduction", 0) > 15 else "high" if act.get("risk_reduction", 0) > 8 else "medium"
-                st.markdown(f"""
-                <div class="soc-action-card {sev_cls}">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-                        <div>
-                            <span class="badge-sev badge-sev-{sev_cls}">{act_type}</span>
-                            <b style="font-size:0.9rem;color:#F8FAFC;margin-left:8px">{act.get('node')}</b>
+                act_key = f"{act.get('node')}_{act.get('type')}_{idx}"
+
+                # Check if this action is already applied
+                already_applied = any(
+                    a.get("node") == act.get("node") and str(a.get("type")).lower() == str(act.get("type")).lower()
+                    for a in applied_defenses
+                )
+
+                c_card, c_btn = st.columns([9, 3])
+                with c_card:
+                    st.markdown(f"""
+                    <div class="soc-action-card {sev_cls}">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                            <div>
+                                <span class="badge-sev badge-sev-{sev_cls}">{act_type}</span>
+                                <b style="font-size:0.9rem;color:#F8FAFC;margin-left:8px">{act.get('node')}</b>
+                            </div>
+                            <span style="font-size:0.8rem;font-weight:700;color:#10B981">Estimated -{act.get('risk_reduction', 0):.1f} Risk Pts (Cost: {act.get('cost', 10)})</span>
                         </div>
-                        <span style="font-size:0.8rem;font-weight:700;color:#10B981">Estimated -{act.get('risk_reduction', 0):.1f} Risk Pts</span>
+                        <div style="font-size:0.8rem;color:#CBD5E1;margin-bottom:6px">
+                            <b>Action:</b> {act.get('description', act.get('action'))}
+                        </div>
+                        <div style="font-size:0.75rem;color:#94A3B8">
+                            <b>Implementation Rationale:</b> {act.get('rationale', 'Addresses active exposure path and stops potential lateral movement.')}
+                        </div>
                     </div>
-                    <div style="font-size:0.8rem;color:#CBD5E1;margin-bottom:6px">
-                        <b>Action:</b> {act.get('description', act.get('action'))}
-                    </div>
-                    <div style="font-size:0.75rem;color:#94A3B8">
-                        <b>Implementation Rationale:</b> {act.get('rationale', 'Addresses active exposure path and stops potential lateral movement.')}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
+                with c_btn:
+                    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+                    if already_applied:
+                        st.markdown("<div style='color:#10B981;font-size:0.8rem;font-weight:700;text-align:center;padding-top:8px'>✓ Fix Applied</div>", unsafe_allow_html=True)
+                    else:
+                        if st.button(f"⚡ Apply Fix", key=f"apply_{act_key}", use_container_width=True):
+                            applied, ids_dep, seg_app = apply_defense_actions(G, [act])
+                            st.session_state.overall_acds_risk = calculate_overall_acds_risk(G, st.session_state.get("risk_score", 0.0))
+                            st.toast(f"Applied {act.get('action')} to model!", icon="🔧")
+                            st.rerun()
         else:
             st.success("No critical defense actions pending. Posture is currently optimal.")
 
@@ -6434,7 +7296,7 @@ def render_response_page():
                 st.markdown(f"- **{a.get('type','DEFENSE').upper()}:** {a.get('node')} — {a.get('description')} *(Cost: {a.get('cost', 10)} pts · Reduction: -{a.get('risk_reduction',0):.1f})*")
             
             st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-            if st.button("⚡ APPLY OPTIMIZED DEFENSES TO MODEL", type="primary"):
+            if st.button("⚡ APPLY OPTIMIZED DEFENSES TO MODEL", type="primary", key="apply_opt_pkg"):
                 applied, ids_dep, seg_app = apply_defense_actions(G, selected_defenses)
                 st.session_state.applied_defenses = applied
                 st.session_state.ids_deployed = ids_dep
@@ -6449,7 +7311,7 @@ def render_response_page():
     # 3. Before/After Verification
     with tab_verify:
         st.markdown("### 📏 Before / After Security Posture Verification")
-        st.caption("Compares current observed posture against projected post-remediation posture.")
+        st.caption("Compares initial observed baseline against projected post-remediation posture to evaluate what was done better or worse.")
         render_before_after_verification()
 
 
@@ -6510,7 +7372,20 @@ def render_reports_page():
             <div style="font-size:0.75rem;color:#94A3B8;margin-bottom:14px">Professional multi-page security report suitable for management.</div>
         """, unsafe_allow_html=True)
         if REPORTLAB_AVAILABLE:
-            pdf_bytes = build_executive_report_pdf(G, risk_sc, blast_det, overall, scan_hist)
+            pdf_bytes = build_executive_report_pdf(
+                G, risk_sc, blast_det, overall, scan_hist,
+                defense_actions=st.session_state.get("recommended_actions", []),
+                applied_defenses=st.session_state.get("applied_defenses", []),
+                risk_before=st.session_state.get("risk_before"),
+                blast_before=st.session_state.get("blast_before"),
+                overall_before=st.session_state.get("overall_before"),
+                risk_after=st.session_state.get("risk_after"),
+                blast_after=st.session_state.get("blast_after"),
+                overall_after=st.session_state.get("overall_after"),
+                mitre_before=st.session_state.get("mitre_before"),
+                mitre_after=st.session_state.get("mitre_after"),
+                alerts=st.session_state.get("alerts", []),
+            )
             st.download_button(
                 "Download PDF Report",
                 data=pdf_bytes,
@@ -6743,21 +7618,51 @@ with st.sidebar:
 
     # Network Assessment Action Block
     st.markdown('<hr style="border-color:#1E293B;margin:14px 0 10px 0">', unsafe_allow_html=True)
-    st.markdown('<div style="font-size:0.72rem;font-weight:700;color:#94A3B8;text-transform:uppercase;margin-bottom:6px">ASSESSMENT SCOPE</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:0.72rem;font-weight:700;color:#94A3B8;text-transform:uppercase;margin-bottom:6px">ASSESSMENT SCOPE & INTERFACE</div>', unsafe_allow_html=True)
 
-    disc_mode = st.radio("Scope Mode", ["Subnet Auto", "Target Range/IP"], index=0, label_visibility="collapsed")
+    adapters_list = net_env.get('all_adapters') or []
+    adapter_labels = []
+    for a in adapters_list:
+        clean_name = a.get('name', 'Interface').replace('Ethernet adapter ', '').replace('Wireless LAN adapter ', '').replace('Unknown adapter ', '')
+        adapter_labels.append(f"{clean_name} ({a.get('ip')})")
+    adapter_labels.append("🎯 Custom Target Scope / IP")
+
+    default_ad_idx = 0
+    for idx, a in enumerate(adapters_list):
+        if a.get('is_default'):
+            default_ad_idx = idx
+            break
+
+    chosen_scope_idx = st.selectbox(
+        "Network Adapter / Target Scope",
+        range(len(adapter_labels)),
+        format_func=lambda i: adapter_labels[i],
+        index=st.session_state.get("selected_adapter_idx", default_ad_idx),
+        key="ad_scope_select",
+        label_visibility="collapsed"
+    )
+    st.session_state.selected_adapter_idx = chosen_scope_idx
+
     target_spec_ips = None
     base_ip = net_env.get('base_ip_prefix') or get_local_ip()
-    scan_limit = 254
+    scan_limit = 100
 
-    if disc_mode == "Subnet Auto":
-        scan_limit = st.slider("Host Scan Limit", 10, 254, 100, 10)
+    if chosen_scope_idx < len(adapters_list):
+        sel_ad = adapters_list[chosen_scope_idx]
+        base_ip = sel_ad.get('base_ip_prefix')
+        default_cidr = sel_ad.get('subnet_cidr')
+        st.markdown(f"<div style='font-size:0.72rem;color:#94A3B8;margin-bottom:6px'>Active Subnet: <code>{default_cidr}</code></div>", unsafe_allow_html=True)
+        scan_limit = st.slider("Host Scan Limit", 10, 254, 50, 10)
     else:
-        custom_target = st.text_input("Target IP / CIDR", value=net_env.get('subnet_cidr') or "192.168.1.0/24")
-        target_spec_ips = parse_target_ips(custom_target, net_env.get('base_ip_prefix'))
+        custom_target = st.text_input("Target IP or Subnet CIDR", value="192.168.93.129", placeholder="e.g. 192.168.93.129 or 192.168.93.0/24")
+        target_spec_ips = parse_target_ips(custom_target, base_ip)
+        st.markdown(f"<div style='font-size:0.72rem;color:#38BDF8;margin-bottom:6px'>Target scope: <b>{len(target_spec_ips) if target_spec_ips else 0} host(s)</b> parsed</div>", unsafe_allow_html=True)
 
     if st.button("📡 START ASSESSMENT", use_container_width=True, type="primary", disabled=st.session_state.get("scan_in_progress", False)):
         st.session_state["trigger_scan_now"] = True
+        st.session_state["scan_base_ip"] = base_ip
+        st.session_state["scan_limit"] = scan_limit
+        st.session_state["scan_target_ips"] = target_spec_ips
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────
@@ -6767,6 +7672,10 @@ if st.session_state.get("trigger_scan_now", False):
     st.session_state["trigger_scan_now"] = False
     st.session_state.scan_in_progress = True
     try:
+        cur_base_ip = st.session_state.get("scan_base_ip", base_ip)
+        cur_scan_limit = st.session_state.get("scan_limit", scan_limit)
+        cur_target_ips = st.session_state.get("scan_target_ips", target_spec_ips)
+
         progress_bar = st.progress(0, text="Initializing network assessment...")
         def _prog(done, total):
             if total > 0:
@@ -6775,12 +7684,13 @@ if st.session_state.get("trigger_scan_now", False):
         st.session_state.scan_started_at = datetime.now(timezone.utc)
         with st.spinner("Executing discovery, banner grabbing & NVD correlation..."):
             devices, scan_timeline = scan_network(
-                base_ip=base_ip if not target_spec_ips else None,
-                limit=scan_limit,
-                target_ips=target_spec_ips,
+                base_ip=cur_base_ip if not cur_target_ips else None,
+                limit=cur_scan_limit,
+                target_ips=cur_target_ips,
                 progress_cb=_prog,
             )
         st.session_state.scan_completed_at = datetime.now(timezone.utc)
+        progress_bar.empty()
         progress_bar.empty()
 
         if devices:

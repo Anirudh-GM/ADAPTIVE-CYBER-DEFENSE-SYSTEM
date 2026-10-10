@@ -198,48 +198,68 @@ def validate_service_banner(ip, port, expected_service=None, timeout=DEFAULT_BAN
 def validate_asset_state(asset_id, ip, expected_ports=None, version_map=None, banner_map=None, timeout=DEFAULT_SOCKET_TIMEOUT):
     """
     Performs comprehensive real-time validation of an authorized asset's live state.
-    Validates reachability and every previously observed or candidate port.
+    Concurrently rechecks previously observed ports AND scans for newly opened ports
+    across the entire standard assessment port catalog.
     """
-    expected_ports = list(expected_ports or [])
-    if not expected_ports:
-        expected_ports = [80, 443, 445, 135, 139, 22, 3389]
-    else:
-        # Include all discovered ports along with standard lateral candidate ports
-        expected_ports = sorted(list(set(expected_ports + [80, 443, 445, 135, 139, 22, 3389])))
+    prev_expected = list(expected_ports or [])
+    # Scan previously expected ports PLUS the entire standard assessment catalog
+    all_scan_ports = list(PORT_SERVICE_MAP.keys())
+    candidate_ports = sorted(list(set(prev_expected + all_scan_ports)))
 
-    reach_info = validate_host_reachability(ip, timeout=timeout, sample_ports=expected_ports)
+    reach_info = validate_host_reachability(ip, timeout=timeout, sample_ports=candidate_ports)
     is_reachable = reach_info["reachable"]
     
     ports_validated = {}
     open_ports = []
     closed_ports = []
+    detected_version_map = dict(version_map or {})
+    detected_banner_map = dict(banner_map or {})
 
     if is_reachable:
-        for port in expected_ports:
+        def _check_single_port(port):
             p_res = validate_tcp_port(ip, port, timeout=timeout)
+            b_res = None
             if p_res["open"]:
-                open_ports.append(port)
-                banner_res = validate_service_banner(ip, port, expected_service=p_res["service"])
-                ports_validated[port] = {
-                    "open": True,
-                    "status": "OPEN",
-                    "service": p_res["service"],
-                    "banner": banner_res.get("banner"),
-                    "latency_ms": p_res["latency_ms"],
-                    "validation_status": "✓ CURRENTLY EXPOSED"
-                }
-            else:
-                closed_ports.append(port)
-                ports_validated[port] = {
-                    "open": False,
-                    "status": "CLOSED",
-                    "service": p_res["service"],
-                    "banner": None,
-                    "latency_ms": p_res["latency_ms"],
-                    "validation_status": "✓ NOT EXPOSED"
-                }
+                b_res = validate_service_banner(ip, port, expected_service=p_res["service"])
+            return port, p_res, b_res
+
+        with ThreadPoolExecutor(max_workers=min(20, len(candidate_ports))) as executor:
+            futures = {executor.submit(_check_single_port, port): port for port in candidate_ports}
+            for future in as_completed(futures):
+                try:
+                    port, p_res, banner_res = future.result()
+                    s_name = p_res.get("service") or PORT_SERVICE_MAP.get(port, f"Port {port}")
+                    if p_res["open"]:
+                        open_ports.append(port)
+                        b_text = banner_res.get("banner") if banner_res else None
+                        if b_text:
+                            detected_banner_map[s_name] = b_text
+                            detected_banner_map[port] = b_text
+                            detected_banner_map[str(port)] = b_text
+                        ports_validated[port] = {
+                            "open": True,
+                            "status": "OPEN",
+                            "service": s_name,
+                            "banner": b_text,
+                            "latency_ms": p_res["latency_ms"],
+                            "validation_status": "✓ CURRENTLY EXPOSED"
+                        }
+                    else:
+                        closed_ports.append(port)
+                        ports_validated[port] = {
+                            "open": False,
+                            "status": "CLOSED",
+                            "service": s_name,
+                            "banner": None,
+                            "latency_ms": p_res["latency_ms"],
+                            "validation_status": "✓ NOT EXPOSED"
+                        }
+                except Exception:
+                    pass
+        open_ports.sort()
+        closed_ports.sort()
     else:
-        for port in expected_ports:
+        for port in candidate_ports:
             closed_ports.append(port)
             ports_validated[port] = {
                 "open": False,
@@ -249,6 +269,10 @@ def validate_asset_state(asset_id, ip, expected_ports=None, version_map=None, ba
                 "latency_ms": 0.0,
                 "validation_status": "✗ HOST OFFLINE"
             }
+
+    new_ports_detected = sorted([p for p in open_ports if p not in prev_expected])
+    closed_ports_detected = sorted([p for p in prev_expected if p not in open_ports])
+    active_services = sorted(list({PORT_SERVICE_MAP.get(p, f"Port {p}") for p in open_ports}))
 
     return {
         "asset_id": asset_id,
@@ -261,6 +285,11 @@ def validate_asset_state(asset_id, ip, expected_ports=None, version_map=None, ba
         "ports": ports_validated,
         "open_ports": open_ports,
         "closed_ports": closed_ports,
+        "new_ports_detected": new_ports_detected,
+        "closed_ports_detected": closed_ports_detected,
+        "services": active_services,
+        "version_map": detected_version_map,
+        "banner_map": detected_banner_map,
         "validation_source": "LIVE_REALTIME",
     }
 
